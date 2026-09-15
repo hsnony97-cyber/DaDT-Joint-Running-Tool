@@ -1692,12 +1692,20 @@ class BarPropertySolverTab:
             # below is just an alias for the first one - it used to be parsed
             # a SECOND time here on its own before this same loop parsed it
             # again as bdf_models[0], doubling the (already slow, pure-Python
-            # card-by-card + xref) parse time for that file.
+            # card-by-card) parse time for that file.
+            #
+            # xref=False: everything read from these models below (elem.pid,
+            # elem.type, prop.dim, prop.t) is a raw field pyNastran fills in
+            # at parse time regardless of xref - xref only additionally
+            # resolves *_ref object references (pid_ref, mid_ref, ...) and
+            # geometry methods like .Area()/.Centroid(), none of which this
+            # tool calls anymore. Skipping that whole extra cross-reference
+            # pass cuts a real chunk off every BDF load.
             self.bdf_models = []
             for bdf_path in self.bdf_paths:
                 self.log(f"\n  Loading: {os.path.basename(bdf_path)}")
                 model = BDF(debug=False)
-                model.read_bdf(bdf_path, validate=False, xref=True, read_includes=False, encoding='latin-1')
+                model.read_bdf(bdf_path, validate=False, xref=False, read_includes=False, encoding='latin-1')
                 self.bdf_models.append({'path': bdf_path, 'model': model, 'name': os.path.basename(bdf_path)})
 
             self.bdf_model = self.bdf_models[0]['model']

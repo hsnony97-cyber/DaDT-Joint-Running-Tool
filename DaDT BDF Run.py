@@ -1437,15 +1437,7 @@ class BarPropertySolverTab:
         self.original_skin_thicknesses = {} # PID -> raw PSHELL thickness from BDF (fallback only)
         self.original_bar_thicknesses = {} # PID -> original dim1 from BDF
         self.maneuver_base_path = None    # Excel-properties-applied maneuver (offset source) BDF, set by _build_base_model
-        self.material_densities = {}      # MID -> density
-        self.prop_to_material = {}        # PID -> MID
-        self.element_areas = {}
-        self.bar_lengths = {}
-        self.prop_elements = {}
-        self.elem_to_prop = {}
-        self.element_centroids = {}
-        self.bar_elements = []
-        self.shell_elements = []
+        self.elem_to_prop = {}            # EID -> PID, used by _extract_stresses
         self.landing_elem_ids = []
         self.bar_offset_elem_ids = []
 
@@ -1689,69 +1681,25 @@ class BarPropertySolverTab:
             self.log(f"  Properties: {len(self.bdf_model.properties)}")
             self.log(f"  Materials: {len(self.bdf_model.materials)}")
 
-            # Extract material densities
-            self.material_densities = {}
-            for mid, mat in self.bdf_model.materials.items():
-                rho = None
-                if hasattr(mat, 'rho') and mat.rho is not None:
-                    rho = mat.rho
-                elif hasattr(mat, 'Rho') and mat.Rho is not None:
-                    rho = mat.Rho()
-                if rho:
-                    self.material_densities[mid] = rho
-                    self.log(f"    Material {mid} ({mat.type}): density = {rho}")
-
-            # Property -> Material mapping
-            self.prop_to_material = {}
-            for pid, prop in self.bdf_model.properties.items():
-                mid = None
-                if hasattr(prop, 'mid') and prop.mid:
-                    mid = prop.mid if isinstance(prop.mid, int) else prop.mid.mid
-                elif hasattr(prop, 'mid1') and prop.mid1:
-                    mid = prop.mid1 if isinstance(prop.mid1, int) else prop.mid1.mid
-                elif hasattr(prop, 'mid_ref') and prop.mid_ref:
-                    mid = prop.mid_ref.mid
-                if mid:
-                    self.prop_to_material[pid] = mid
-
-            # Element geometry
-            self.element_areas = {}
-            self.bar_lengths = {}
-            self.prop_elements = {}
+            # Element -> Property mapping. This is the only per-element data
+            # actually used later (by _extract_stresses, to look up each bar
+            # element's Excel Dim1/Dim2 for its stress = axial/area). Material
+            # densities, prop->material mapping, and per-element Centroid()/
+            # Area()/Length() used to be computed here too, for the older
+            # sweep/optimization tabs' weight and RF calculations - none of
+            # that survived the simplification to a single base-model solve,
+            # so skip that (slow, one Python call per element) work entirely.
             self.elem_to_prop = {}
-            self.element_centroids = {}
-            self.bar_elements = []
-            self.shell_elements = []
-
             shell_count = bar_count = 0
             for eid, elem in self.bdf_model.elements.items():
                 pid = elem.pid if hasattr(elem, 'pid') else None
                 if pid:
                     self.elem_to_prop[eid] = pid
-                    if pid not in self.prop_elements:
-                        self.prop_elements[pid] = []
-                    self.prop_elements[pid].append(eid)
-
-                try:
-                    centroid = elem.Centroid()
-                    self.element_centroids[eid] = centroid
-                except:
-                    pass
 
                 if elem.type in ['CQUAD4', 'CTRIA3', 'CQUAD8', 'CTRIA6']:
                     shell_count += 1
-                    self.shell_elements.append(eid)
-                    try:
-                        self.element_areas[eid] = elem.Area()
-                    except:
-                        self.element_areas[eid] = 0
                 elif elem.type in ['CBAR', 'CBEAM']:
                     bar_count += 1
-                    self.bar_elements.append(eid)
-                    try:
-                        self.bar_lengths[eid] = elem.Length()
-                    except:
-                        self.bar_lengths[eid] = 0
 
             # Extract PBARL dimensions from BDF
             self.pbarl_dims = {}
@@ -1790,7 +1738,6 @@ class BarPropertySolverTab:
             self._refresh_effective_skin_thicknesses()
 
             self.log(f"  Shells: {shell_count}, Bars: {bar_count}")
-            self.log(f"  Centroids calculated: {len(self.element_centroids)}")
             self.log(f"\n  Total BDF models loaded: {len(self.bdf_models)}")
 
             self.root.after(0, lambda: self.bdf_status.config(

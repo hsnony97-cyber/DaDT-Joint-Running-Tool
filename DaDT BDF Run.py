@@ -2149,7 +2149,7 @@ class BarPropertySolverTab:
 
         try:
             bdf = BDF(debug=False)
-            bdf.read_bdf(maneuver_path, validate=False, xref=True, read_includes=True, encoding='latin-1')
+            bdf.read_bdf(maneuver_path, validate=False, xref=True, read_includes=False, encoding='latin-1')
         except Exception as e:
             self.log(f"    {label}Offset calc error reading maneuver BDF: {e}")
             return None

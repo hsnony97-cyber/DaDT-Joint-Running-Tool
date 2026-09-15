@@ -1422,6 +1422,8 @@ class BarPropertySolverTab:
         self.nastran_memory = tk.StringVar(value="")
         self.scratch_folder = tk.StringVar(value="")  # optional; blank = each run's own output folder (still collision-free)
         self.output_folder = tk.StringVar()
+        self.cases_per_split = tk.StringVar(value="")   # optional; blank/0 = solve as a single BDF (no split)
+        self.max_parallel_runs = tk.StringVar(value="1")  # 1 = sequential
 
         # Default bar thickness used only when a property has no Excel/BDF value
         self.default_bar_thickness = 2.0
@@ -1574,8 +1576,28 @@ class BarPropertySolverTab:
             filedialog.askdirectory()
         )).pack(side=tk.LEFT)
 
-        # ---- Section 2: Actions ----
-        f3 = ttk.LabelFrame(main, text="▶  2. Actions", padding=10)
+        # ---- Section 2: Parallel Run Splitting ----
+        f2 = ttk.LabelFrame(main, text="\U0001F500  2. Parallel Run Splitting", padding=10)
+        f2.pack(fill=tk.X, pady=5, padx=10)
+
+        split_frame = ttk.Frame(f2)
+        split_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(split_frame, text="Cases per Split:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(split_frame, textvariable=self.cases_per_split, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(split_frame, text="(blank/0 = solve as one BDF; e.g. 100 with 500 SUBCASEs -> "
+                                     "run1..run5, same header/bulk data, 100 cases each)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        parallel_frame = ttk.Frame(f2)
+        parallel_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(parallel_frame, text="Max Parallel Runs:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(parallel_frame, textvariable=self.max_parallel_runs, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(parallel_frame, text="(1 = one Nastran run at a time; e.g. 5 = up to 5 runN files at once - "
+                                        "check available Nastran licenses/CPU/RAM first)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        # ---- Section 3: Actions ----
+        f3 = ttk.LabelFrame(main, text="▶  3. Actions", padding=10)
         f3.pack(fill=tk.X, pady=5, padx=10)
 
         btn_row = ttk.Frame(f3)
@@ -1589,8 +1611,8 @@ class BarPropertySolverTab:
         self.progress_bar = ttk.Progressbar(f3, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(fill=tk.X, pady=5)
 
-        # ---- Section 3: Log ----
-        f5 = ttk.LabelFrame(main, text="\U0001F4DC  3. Log", padding=10)
+        # ---- Section 4: Log ----
+        f5 = ttk.LabelFrame(main, text="\U0001F4DC  4. Log", padding=10)
         f5.pack(fill=tk.BOTH, expand=True, pady=5, padx=10)
 
         self.log_text = scrolledtext.ScrolledText(f5, height=20, width=100, font=('Consolas', 10),
@@ -2322,13 +2344,19 @@ class BarPropertySolverTab:
         """Write every bdf_model's BDF at thickness_overrides (layered on its
         Excel-properties base), compute a FRESH offsets.csv from the maneuver
         (source) BDF at this same thickness_overrides, and apply those offsets
-        to every written BDF. Used for both the baseline run and every sweep
-        iteration, so offsets are always recomputed from the current thickness
-        - never frozen from a one-time base-model calculation. Returns a list
-        of {'name', 'subfolder', 'bdf_path', 'run_ok'} dicts, one per bdf_model."""
+        to every written BDF. If Cases per Split is set, each prop-updated +
+        offseted BDF is then split into run1/run2/... files by SUBCASE count
+        (see _split_bdf_by_cases). Returns a list of {'name', 'subfolder',
+        'run_paths', 'run_ok'} dicts, one per bdf_model - 'run_paths' has one
+        entry unless splitting produced more."""
         n_bdfs = len(self.bdf_models) if self.bdf_models else 1
 
         offset_csv = self._calculate_offset_csv(thickness_overrides, iter_folder, label=label)
+
+        try:
+            cases_per_split = int(float(self.cases_per_split.get())) if self.cases_per_split.get().strip() else 0
+        except (ValueError, TypeError):
+            cases_per_split = 0
 
         per_bdf = []
         for bdf_idx, bdf_info in enumerate(self.bdf_models):
@@ -2340,8 +2368,64 @@ class BarPropertySolverTab:
             if offset_csv:
                 bdf_path = self._apply_offsets_from_csv(bdf_path, offset_csv, bdf_subfolder, label=label)
             self._write_structure_only_bdf(bdf_path, bdf_subfolder, label=label)
-            per_bdf.append({'name': bdf_name, 'subfolder': bdf_subfolder, 'bdf_path': bdf_path, 'run_ok': False})
+
+            run_paths = self._split_bdf_by_cases(bdf_path, cases_per_split, label=label)
+            per_bdf.append({'name': bdf_name, 'subfolder': bdf_subfolder, 'run_paths': run_paths, 'run_ok': False})
         return per_bdf
+
+    # ==================== CASE SPLITTING (FOR PARALLEL RUNS) ====================
+    def _split_bdf_by_cases(self, bdf_path, cases_per_split, label=""):
+        """Split bdf_path's SUBCASEs into separate run1.bdf/run2.bdf/... files
+        of up to cases_per_split SUBCASEs each, written next to bdf_path. Every
+        run file keeps the EXACT same format: the same header (everything
+        before the first SUBCASE - SOL/CEND/TITLE/SET/output-request lines)
+        and the exact same BEGIN BULK...ENDDATA section (bulk data + includes)
+        as the source BDF - only which SUBCASE blocks are present differs.
+        Returns [bdf_path] unchanged if cases_per_split is 0/blank, there are
+        no SUBCASEs, or there are already <= cases_per_split of them (nothing
+        to split)."""
+        if not cases_per_split or cases_per_split <= 0:
+            return [bdf_path]
+
+        try:
+            with open(bdf_path, 'r', encoding='latin-1') as f:
+                lines = f.readlines()
+        except Exception as e:
+            self.log(f"    {label}Split error reading {os.path.basename(bdf_path)}: {e}")
+            return [bdf_path]
+
+        subcase_idxs = [i for i, l in enumerate(lines) if l.strip().upper().startswith('SUBCASE')]
+        if len(subcase_idxs) <= cases_per_split:
+            return [bdf_path]
+
+        bulk_idx = next((i for i, l in enumerate(lines) if l.strip().upper().startswith('BEGIN BULK')), len(lines))
+
+        header_lines = lines[:subcase_idxs[0]]
+        bulk_lines = lines[bulk_idx:]
+        block_bounds = subcase_idxs + [bulk_idx]
+
+        base, ext = os.path.splitext(bdf_path)
+        n_subcases = len(subcase_idxs)
+        n_runs = (n_subcases + cases_per_split - 1) // cases_per_split
+        run_paths = []
+
+        for run_idx in range(n_runs):
+            start_sc = run_idx * cases_per_split
+            end_sc = min(start_sc + cases_per_split, n_subcases)
+            chunk_lines = []
+            for sc_i in range(start_sc, end_sc):
+                chunk_lines.extend(lines[block_bounds[sc_i]:block_bounds[sc_i + 1]])
+
+            out_path = f"{base}_run{run_idx + 1}{ext}"
+            with open(out_path, 'w', encoding='latin-1') as f:
+                f.writelines(header_lines)
+                f.writelines(chunk_lines)
+                f.writelines(bulk_lines)
+            run_paths.append(out_path)
+
+        self.log(f"    {label}Split {n_subcases} cases into {n_runs} run file(s) "
+                  f"of up to {cases_per_split} cases each (same header/bulk data in every run)")
+        return run_paths
 
     # ==================== STRUCTURE-ONLY BDF (NO INCLUDES) ====================
     def _write_structure_only_bdf(self, bdf_path, folder, label=""):
@@ -2646,36 +2730,75 @@ class BarPropertySolverTab:
 
     # ==================== SOLVE BASE MODEL ====================
     def _run_single_iteration(self, folder, thickness_overrides, label=""):
-        """Write every BDF + fresh offsets for thickness_overrides, run Nastran,
-        and extract stresses. thickness_overrides is {} for the base model's
-        own solve. Offsets are recomputed here every call (see
-        _prepare_iteration_bdfs / _calculate_offset_csv) from the maneuver BDF
-        at this same thickness_overrides."""
+        """Write every BDF + fresh offsets for thickness_overrides (splitting
+        into run1/run2/... files per Cases per Split), run Nastran on every
+        resulting run file - up to Max Parallel Runs at a time - and extract
+        stresses. thickness_overrides is {} for the base model's own solve.
+        Offsets are recomputed here every call (see _prepare_iteration_bdfs /
+        _calculate_offset_csv) from the maneuver BDF at this same
+        thickness_overrides."""
         try:
             per_bdf = self._prepare_iteration_bdfs(folder, thickness_overrides, label=label)
-            n_bdfs = len(per_bdf)
-            all_stresses = []
 
+            # Flatten every bdf_model's run file(s) into one job list, so a
+            # single Max Parallel Runs cap governs all of them together -
+            # whether they came from splitting one bdf_model or from having
+            # several bdf_models.
+            jobs = []
             for pb in per_bdf:
-                if n_bdfs > 1:
-                    self.log(f"    {label}--- BDF: {pb['name']} ---")
+                multi = len(pb['run_paths']) > 1
+                for run_idx, run_path in enumerate(pb['run_paths']):
+                    run_folder = os.path.join(pb['subfolder'], f"run{run_idx + 1}") if multi else pb['subfolder']
+                    os.makedirs(run_folder, exist_ok=True)
+                    jobs.append({
+                        'name': pb['name'], 'bdf_path': run_path, 'folder': run_folder,
+                        'label': f"{label}[{pb['name']} run{run_idx + 1}] " if multi else label,
+                        'run_ok': False,
+                    })
 
-                # Run Nastran and WAIT for it to actually finish (incl. the
-                # .op2 being fully written)
-                self.log(f"    {label}Running Nastran...")
-                ok = self._run_nastran(pb['bdf_path'], pb['subfolder'], label=label)
-                if not ok:
-                    self.log(f"    {label}Nastran run failed/incomplete for {pb['name']} - skipping stress extraction for it")
+            try:
+                max_parallel = max(1, int(float(self.max_parallel_runs.get())))
+            except (ValueError, TypeError):
+                max_parallel = 1
+
+            self.log(f"    {label}Running {len(jobs)} Nastran job(s), max {max_parallel} at a time...")
+
+            # Run Nastran and WAIT for every job to actually finish (incl.
+            # each .op2 being fully written) before extracting anything.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
+                future_to_job = {
+                    executor.submit(self._run_nastran, j['bdf_path'], j['folder'], j['label']): j
+                    for j in jobs
+                }
+                done = 0
+                for future in concurrent.futures.as_completed(future_to_job):
+                    j = future_to_job[future]
+                    done += 1
+                    try:
+                        j['run_ok'] = future.result()
+                    except Exception as e:
+                        self.log(f"    {label}Nastran run raised an exception for "
+                                  f"{os.path.basename(j['bdf_path'])}: {e}")
+                        j['run_ok'] = False
+                    if len(jobs) > 1:
+                        self.log(f"    {label}{done}/{len(jobs)} Nastran run(s) finished "
+                                  f"({'OK' if j['run_ok'] else 'FAILED'}: {os.path.basename(j['bdf_path'])})")
+
+            all_stresses = []
+            for j in jobs:
+                if not j['run_ok']:
+                    self.log(f"    {label}Nastran run failed/incomplete for "
+                              f"{os.path.basename(j['bdf_path'])} - skipping stress extraction for it")
                     continue
 
-                # Extract stresses (only once the run above is confirmed done)
-                stresses = self._extract_stresses(pb['subfolder'], thickness_overrides)
+                stresses = self._extract_stresses(j['folder'], thickness_overrides)
                 all_stresses.extend(stresses)
 
                 if stresses:
                     bar_s = [s for s in stresses if s['type'] == 'bar']
                     shell_s = [s for s in stresses if s['type'] == 'shell']
-                    self.log(f"    {label}Extracted: {len(bar_s)} bar, {len(shell_s)} shell stresses")
+                    self.log(f"    {label}Extracted: {len(bar_s)} bar, {len(shell_s)} shell stresses "
+                              f"({os.path.basename(j['bdf_path'])})")
 
             return all_stresses
 
@@ -2721,6 +2844,8 @@ class BarPropertySolverTab:
             self.log("SOLVING BASE MODEL")
             self.log("=" * 70)
             self.log(f"  Bar properties: {len(self.bar_properties)}, Skin properties: {len(self.skin_properties)}")
+            split = self.cases_per_split.get().strip()
+            self.log(f"  Cases per split: {split if split else 'off (single BDF)'}, Max parallel runs: {self.max_parallel_runs.get()}")
             self.log(f"  Output: {run_folder}")
 
             self.root.after(0, lambda: self.progress_var.set(10))

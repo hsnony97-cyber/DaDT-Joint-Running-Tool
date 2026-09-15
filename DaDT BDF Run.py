@@ -1793,19 +1793,20 @@ class BarPropertySolverTab:
             self.log(f"  Centroids calculated: {len(self.element_centroids)}")
             self.log(f"\n  Total BDF models loaded: {len(self.bdf_models)}")
 
-            self.bdf_status.config(
+            self.root.after(0, lambda: self.bdf_status.config(
                 text=f"Loaded: {len(self.bdf_models)} BDFs, {len(self.bdf_model.elements)} elements",
                 foreground="green"
-            )
+            ))
 
             if not self.output_folder.get():
-                self.output_folder.set(os.path.dirname(path))
+                out_dir = os.path.dirname(path)
+                self.root.after(0, lambda: self.output_folder.set(out_dir))
 
         except Exception as e:
             self.log(f"ERROR: {e}")
             import traceback
             self.log(traceback.format_exc())
-            self.bdf_status.config(text="Error", foreground="red")
+            self.root.after(0, lambda: self.bdf_status.config(text="Error", foreground="red"))
 
     # ==================== PROPERTY LOADING ====================
     def load_properties(self):
@@ -2741,10 +2742,6 @@ class BarPropertySolverTab:
         if not self.bdf_paths:
             messagebox.showerror("Error", "Add at least one BDF file")
             return
-        if not self.bdf_model:
-            self.load_bdf()
-        if not self.bdf_model:
-            return
         if not self.properties_loaded:
             messagebox.showerror("Error", "Load Property Excel first")
             return
@@ -2757,6 +2754,17 @@ class BarPropertySolverTab:
     def _run_solve(self):
         """Process the property excel, apply offsets, and solve the base model once."""
         try:
+            # BDF loading (pyNastran parsing every node/element/property) is
+            # the slow part and used to run synchronously in start_solve(),
+            # freezing the whole GUI until it finished. There is no separate
+            # "Load BDF" button, so it happens here instead - on this
+            # background thread - the first time SOLVE BASE MODEL is pressed.
+            if not self.bdf_model:
+                self.load_bdf()
+            if not self.bdf_model:
+                self.log("\nSOLVE ERROR: BDF loading failed - see log above.")
+                return
+
             output_base = self.output_folder.get()
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             run_folder = os.path.join(output_base, f"BaseModel_{ts}")

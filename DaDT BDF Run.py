@@ -1682,6 +1682,7 @@ class BarPropertySolverTab:
         for i, p in enumerate(self.bdf_paths):
             self.log(f"    {i + 1}. {os.path.basename(p)}")
 
+        t_load_start = time.time()
         try:
             path = self.bdf_paths[0]
 
@@ -1701,8 +1702,11 @@ class BarPropertySolverTab:
             self.bdf_models = []
             for bdf_path in self.bdf_paths:
                 self.log(f"\n  Loading: {os.path.basename(bdf_path)}")
+                t_file_start = time.time()
                 model = BDF(debug=False)
                 model.read_bdf(bdf_path, validate=False, xref=False, read_includes=False, encoding='latin-1')
+                self.log(f"    ...parsed in {time.time() - t_file_start:.1f}s "
+                          f"({len(model.nodes)} nodes, {len(model.elements)} elements)")
                 self.bdf_models.append({'path': bdf_path, 'model': model, 'name': os.path.basename(bdf_path)})
 
             self.bdf_model = self.bdf_models[0]['model']
@@ -1761,7 +1765,8 @@ class BarPropertySolverTab:
             self._refresh_effective_skin_thicknesses()
 
             self.log(f"  Shells: {shell_count}, Bars: {bar_count}")
-            self.log(f"\n  Total BDF models loaded: {len(self.bdf_models)}")
+            self.log(f"\n  Total BDF models loaded: {len(self.bdf_models)} "
+                      f"(took {time.time() - t_load_start:.1f}s total)")
 
             self.root.after(0, lambda: self.bdf_status.config(
                 text=f"Loaded: {len(self.bdf_models)} BDFs, {len(self.bdf_model.elements)} elements",
@@ -1773,7 +1778,7 @@ class BarPropertySolverTab:
                 self.root.after(0, lambda: self.output_folder.set(out_dir))
 
         except Exception as e:
-            self.log(f"ERROR: {e}")
+            self.log(f"ERROR after {time.time() - t_load_start:.1f}s: {e}")
             import traceback
             self.log(traceback.format_exc())
             self.root.after(0, lambda: self.bdf_status.config(text="Error", foreground="red"))
@@ -1793,6 +1798,7 @@ class BarPropertySolverTab:
         self.log("LOADING PROPERTIES")
         self.log("=" * 70)
 
+        t_start = time.time()
         try:
             xl = pd.ExcelFile(path)
             self.log(f"  Sheets: {xl.sheet_names}")
@@ -1856,6 +1862,7 @@ class BarPropertySolverTab:
             self._refresh_effective_skin_thicknesses()
 
             total = len(self.bar_properties)
+            self.log(f"\n  Properties loaded in {time.time() - t_start:.1f}s")
             self.prop_status.config(
                 text=f"Loaded: {total} bar props, {len(self.skin_properties)} skin props",
                 foreground="green"
@@ -1864,7 +1871,7 @@ class BarPropertySolverTab:
             self.btn_start.config(state=tk.NORMAL)
 
         except Exception as e:
-            self.log(f"ERROR: {e}")
+            self.log(f"ERROR after {time.time() - t_start:.1f}s: {e}")
             import traceback
             self.log(traceback.format_exc())
             self.prop_status.config(text="Error", foreground="red")
@@ -2067,6 +2074,9 @@ class BarPropertySolverTab:
         self.log("BUILDING BASE MODEL (Excel Bar/Skin Property thicknesses)")
         self.log("=" * 70)
 
+        t_build_start = time.time()
+        t_props_start = time.time()
+
         self.maneuver_base_path = None
         if self.maneuver_bdfs:
             man_folder = os.path.join(base_folder, "maneuver")
@@ -2083,20 +2093,26 @@ class BarPropertySolverTab:
             bdf_info['base_path'] = base_path
             self.log(f"  Base model ready for {bdf_info['name']}: {os.path.basename(base_path)}")
 
+        self.log(f"  Properties applied in {time.time() - t_props_start:.1f}s")
+
         # Run Nastran on the base model. thickness_overrides={} means every
         # PID uses its self.bar_properties base value - offsets get computed
         # fresh from the maneuver BDF at that same base thickness.
         self.log("\n  Running Nastran on the BASE MODEL...")
+        t_nastran_start = time.time()
         n_ok, n_total = self._run_single_iteration(base_folder, {}, label="[BASE] ")
+        nastran_elapsed = time.time() - t_nastran_start
         if n_total == 0:
-            self.log("  WARNING: no Nastran runs were produced (check Nastran path/BDF files).")
+            self.log(f"  WARNING: no Nastran runs were produced (check Nastran path/BDF files). "
+                      f"({nastran_elapsed:.1f}s)")
         elif n_ok == n_total:
-            self.log(f"  All {n_total} Nastran run(s) completed successfully.")
+            self.log(f"  All {n_total} Nastran run(s) completed successfully in {nastran_elapsed:.1f}s.")
         else:
-            self.log(f"  WARNING: {n_total - n_ok}/{n_total} Nastran run(s) failed - check the log above.")
+            self.log(f"  WARNING: {n_total - n_ok}/{n_total} Nastran run(s) failed after "
+                      f"{nastran_elapsed:.1f}s - check the log above.")
         self.log(f"  Base model results saved under: {base_folder}")
 
-        self.log("BASE MODEL SOLVE COMPLETE.\n")
+        self.log(f"BASE MODEL SOLVE COMPLETE (total {time.time() - t_build_start:.1f}s).\n")
 
     # ==================== OFFSET CALCULATION / APPLICATION ====================
     def _calculate_offset_csv(self, thickness_overrides, folder, label=""):
@@ -2113,13 +2129,16 @@ class BarPropertySolverTab:
         if not self.landing_elem_ids and not self.bar_offset_elem_ids:
             return None
 
+        t_offset_start = time.time()
         man_folder = os.path.join(folder, "maneuver_for_offset")
         os.makedirs(man_folder, exist_ok=True)
         maneuver_path = self._write_bdf_for_model(man_folder, None, self.maneuver_base_path, thickness_overrides)
 
         try:
+            t_parse_start = time.time()
             bdf = BDF(debug=False)
             bdf.read_bdf(maneuver_path, validate=False, xref=True, read_includes=False, encoding='latin-1')
+            self.log(f"    {label}Maneuver BDF parsed for offsets in {time.time() - t_parse_start:.1f}s")
         except Exception as e:
             self.log(f"    {label}Offset calc error reading maneuver BDF: {e}")
             return None
@@ -2211,7 +2230,8 @@ class BarPropertySolverTab:
                 w = csv.DictWriter(f, fieldnames=['Type', 'Element', 'ZOffset', 'WA_X', 'WA_Y', 'WA_Z'])
                 w.writeheader()
                 w.writerows(rows)
-            self.log(f"    {label}Offset CSV: {n_landing} landing, {n_bar} bar -> {csv_path}")
+            self.log(f"    {label}Offset CSV: {n_landing} landing, {n_bar} bar -> {csv_path} "
+                      f"(total {time.time() - t_offset_start:.1f}s)")
             return csv_path
 
         except Exception as e:
@@ -2387,6 +2407,7 @@ class BarPropertySolverTab:
         if not cases_per_split or cases_per_split <= 0:
             return [bdf_path]
 
+        t_split_start = time.time()
         try:
             with open(bdf_path, 'r', encoding='latin-1') as f:
                 lines = f.readlines()
@@ -2424,7 +2445,8 @@ class BarPropertySolverTab:
             run_paths.append(out_path)
 
         self.log(f"    {label}Split {n_subcases} cases into {n_runs} run file(s) "
-                  f"of up to {cases_per_split} cases each (same header/bulk data in every run)")
+                  f"of up to {cases_per_split} cases each (same header/bulk data in every run) "
+                  f"in {time.time() - t_split_start:.1f}s")
         return run_paths
 
     # ==================== STRUCTURE-ONLY BDF (NO INCLUDES) ====================
@@ -2457,6 +2479,8 @@ class BarPropertySolverTab:
         if not nastran or not os.path.exists(nastran):
             self.log(f"    {label}WARNING: Nastran exe not found!")
             return False
+
+        t_run_start = time.time()
 
         # Neither of the two earlier approaches to scratch isolation actually
         # redirected where Nastran puts its scratch files. Confirmed on real
@@ -2511,11 +2535,13 @@ class BarPropertySolverTab:
             # combination. Still confirm the .op2 as a safety net in case some
             # install's launcher detaches a child process anyway.
             if not self._wait_for_op2(bdf_path, folder, scratch_dir=run_scratch_dir, label=label):
-                self.log(f"    {label}WARNING: .op2 never appeared/finished writing - treating run as failed")
+                self.log(f"    {label}WARNING: .op2 never appeared/finished writing - "
+                          f"treating run as failed (after {time.time() - t_run_start:.1f}s)")
                 return False
+            self.log(f"    {label}Nastran run finished in {time.time() - t_run_start:.1f}s")
             return True
         except Exception as e:
-            self.log(f"    {label}Nastran run error: {e}")
+            self.log(f"    {label}Nastran run error after {time.time() - t_run_start:.1f}s: {e}")
             return False
         finally:
             # Scratch files are pure intermediates, never needed once the run is
@@ -2644,7 +2670,9 @@ class BarPropertySolverTab:
         from the maneuver BDF at this same thickness_overrides. Returns
         (n_ok, n_total) Nastran job counts."""
         try:
+            t_prep_start = time.time()
             per_bdf = self._prepare_iteration_bdfs(folder, thickness_overrides, label=label)
+            self.log(f"    {label}BDF prep (write + offsets + split) took {time.time() - t_prep_start:.1f}s")
 
             # Flatten every bdf_model's run file(s) into one job list, so a
             # single Max Parallel Runs cap governs all of them together -
@@ -2668,6 +2696,7 @@ class BarPropertySolverTab:
                 max_parallel = 1
 
             self.log(f"    {label}Running {len(jobs)} Nastran job(s), max {max_parallel} at a time...")
+            t_jobs_start = time.time()
 
             # Run Nastran and WAIT for every job to actually finish (incl.
             # each .op2 being fully written).
@@ -2689,6 +2718,8 @@ class BarPropertySolverTab:
                     self.log(f"    {label}{done}/{len(jobs)} Nastran run(s) finished "
                               f"({'OK' if j['run_ok'] else 'FAILED'}: {os.path.basename(j['bdf_path'])})")
 
+            self.log(f"    {label}All {len(jobs)} Nastran job(s) done - wall time "
+                      f"{time.time() - t_jobs_start:.1f}s (max {max_parallel} at a time)")
             n_ok = sum(1 for j in jobs if j['run_ok'])
             return n_ok, len(jobs)
 
@@ -2713,6 +2744,7 @@ class BarPropertySolverTab:
 
     def _run_solve(self):
         """Process the property excel, apply offsets, and solve the base model once."""
+        t_solve_start = time.time()
         try:
             # BDF loading (pyNastran parsing every node/element/property) is
             # the slow part and used to run synchronously in start_solve(),
@@ -2745,10 +2777,11 @@ class BarPropertySolverTab:
             self.log(f"\n{'=' * 70}")
             self.log("BASE MODEL SOLVE COMPLETE")
             self.log(f"  Output folder: {run_folder}")
+            self.log(f"  Total time (incl. BDF load): {time.time() - t_solve_start:.1f}s")
             self.log(f"{'=' * 70}")
 
         except Exception as e:
-            self.log(f"\nSOLVE ERROR: {e}")
+            self.log(f"\nSOLVE ERROR after {time.time() - t_solve_start:.1f}s: {e}")
             import traceback
             self.log(traceback.format_exc())
 

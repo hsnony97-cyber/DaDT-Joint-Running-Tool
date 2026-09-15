@@ -20,7 +20,6 @@ import concurrent.futures
 from datetime import datetime
 import pandas as pd
 from pyNastran.bdf.bdf import BDF
-from pyNastran.op2.op2 import OP2
 import numpy as np
 
 _APP_COLORS = {}  # populated by _configure_app_style(); shared palette for both tabs
@@ -1439,14 +1438,12 @@ class BarPropertySolverTab:
         self.original_skin_thicknesses = {} # PID -> raw PSHELL thickness from BDF (fallback only)
         self.original_bar_thicknesses = {} # PID -> original dim1 from BDF
         self.maneuver_base_path = None    # Excel-properties-applied maneuver (offset source) BDF, set by _build_base_model
-        self.elem_to_prop = {}            # EID -> PID, used by _extract_stresses
         self.landing_elem_ids = []
         self.bar_offset_elem_ids = []
 
         # Run state
         self.is_running = False
         self.properties_loaded = False
-        self.base_stresses = None          # Raw stresses from the base model solve
 
         self.setup_ui()
 
@@ -1716,21 +1713,12 @@ class BarPropertySolverTab:
             self.log(f"  Properties: {len(self.bdf_model.properties)}")
             self.log(f"  Materials: {len(self.bdf_model.materials)}")
 
-            # Element -> Property mapping. This is the only per-element data
-            # actually used later (by _extract_stresses, to look up each bar
-            # element's Excel Dim1/Dim2 for its stress = axial/area). Material
-            # densities, prop->material mapping, and per-element Centroid()/
-            # Area()/Length() used to be computed here too, for the older
-            # sweep/optimization tabs' weight and RF calculations - none of
-            # that survived the simplification to a single base-model solve,
-            # so skip that (slow, one Python call per element) work entirely.
-            self.elem_to_prop = {}
+            # Just a shell/bar count for the log - nothing here (element ->
+            # property mapping, material densities, Centroid()/Area()/
+            # Length()) is read by anything downstream anymore now that
+            # there's no stress extraction/reporting left, only Nastran runs.
             shell_count = bar_count = 0
-            for eid, elem in self.bdf_model.elements.items():
-                pid = elem.pid if hasattr(elem, 'pid') else None
-                if pid:
-                    self.elem_to_prop[eid] = pid
-
+            for elem in self.bdf_model.elements.values():
                 if elem.type in ['CQUAD4', 'CTRIA3', 'CQUAD8', 'CTRIA6']:
                     shell_count += 1
                 elif elem.type in ['CBAR', 'CBEAM']:
@@ -2095,18 +2083,17 @@ class BarPropertySolverTab:
             bdf_info['base_path'] = base_path
             self.log(f"  Base model ready for {bdf_info['name']}: {os.path.basename(base_path)}")
 
-        # Run Nastran + extract stresses on the base model. thickness_overrides={}
-        # means every PID uses its self.bar_properties base value - offsets get
-        # computed fresh from the maneuver BDF at that same base thickness.
-        self.log("\n  Running Nastran + stress extraction on the BASE MODEL...")
-        base_stresses = self._run_single_iteration(base_folder, {}, label="[BASE] ")
-        self.base_stresses = base_stresses
-        if base_stresses:
-            bar_s = [s for s in base_stresses if s['type'] == 'bar']
-            shell_s = [s for s in base_stresses if s['type'] == 'shell']
-            self.log(f"  Base model stresses: {len(bar_s)} bar, {len(shell_s)} shell")
+        # Run Nastran on the base model. thickness_overrides={} means every
+        # PID uses its self.bar_properties base value - offsets get computed
+        # fresh from the maneuver BDF at that same base thickness.
+        self.log("\n  Running Nastran on the BASE MODEL...")
+        n_ok, n_total = self._run_single_iteration(base_folder, {}, label="[BASE] ")
+        if n_total == 0:
+            self.log("  WARNING: no Nastran runs were produced (check Nastran path/BDF files).")
+        elif n_ok == n_total:
+            self.log(f"  All {n_total} Nastran run(s) completed successfully.")
         else:
-            self.log("  WARNING: no stresses extracted from the base model (check Nastran path/run).")
+            self.log(f"  WARNING: {n_total - n_ok}/{n_total} Nastran run(s) failed - check the log above.")
         self.log(f"  Base model results saved under: {base_folder}")
 
         self.log("BASE MODEL SOLVE COMPLETE.\n")
@@ -2645,111 +2632,17 @@ class BarPropertySolverTab:
         _, op2_path = _find_op2()
         return op2_path is not None
 
-    # ==================== STRESS EXTRACTION ====================
-    def _extract_stresses(self, folder, thickness_overrides):
-        """thickness_overrides: {pid: dim1} for the group actively swept in this
-        iteration (empty for the base model run). PIDs not in it use their base
-        self.bar_properties dim1 - same explicit-argument approach as
-        _write_bdf_for_model, so concurrent iterations don't race on shared state."""
-        results = []
-        bar_stress_rows = []
-
-        for f in os.listdir(folder):
-            if f.lower().endswith('.op2'):
-                op2_name = f
-                try:
-                    op2 = OP2(debug=False)
-                    op2.read_op2(os.path.join(folder, f))
-
-                    # BAR STRESS from cbar_force
-                    if hasattr(op2, 'cbar_force') and op2.cbar_force:
-                        for sc_id, force in op2.cbar_force.items():
-                            for i, eid in enumerate(force.element):
-                                axial = force.data[0, i, 6] if len(force.data.shape) == 3 else force.data[i, 6]
-                                pid = self.elem_to_prop.get(int(eid))
-                                d1 = d2 = area = stress = None
-
-                                if pid and pid in self.bar_properties:
-                                    d1 = thickness_overrides.get(pid, self.bar_properties[pid].get('dim1', 0))
-                                    # dim2 must come from self.bar_properties (the Excel 'Bar
-                                    # Property' sheet, with BDF as its own fallback - see
-                                    # load_properties) - NOT self.pbarl_dims directly, which is
-                                    # always the raw original BDF value and previously overrode
-                                    # the Excel dim2 here even when Excel provided one, making
-                                    # the reported stress use the wrong area.
-                                    d2 = self.bar_properties[pid].get('dim2', d1)
-                                    area = d1 * d2
-                                    if area > 0:
-                                        stress = axial / area
-
-                                results.append({
-                                    'eid': int(eid), 'type': 'bar',
-                                    'stress': float(stress) if stress else 0,
-                                    'subcase': int(sc_id)
-                                })
-
-                                bar_stress_rows.append({
-                                    'OP2': op2_name, 'Subcase': int(sc_id), 'Element': int(eid),
-                                    'Property': pid,
-                                    'Axial': float(axial) if axial else 0,
-                                    'Dim1': d1, 'Dim2': d2, 'Area': area,
-                                    'Stress': float(stress) if stress else None
-                                })
-
-                    # SHELL STRESS
-                    shell_stress_attrs = [
-                        ('cquad4_stress', 'CQUAD4'),
-                        ('ctria3_stress', 'CTRIA3'),
-                        ('cquad8_stress', 'CQUAD8'),
-                        ('ctria6_stress', 'CTRIA6'),
-                        ('cquad4_composite_stress', 'CQUAD4_COMP'),
-                        ('ctria3_composite_stress', 'CTRIA3_COMP'),
-                    ]
-
-                    for attr_name, stress_type in shell_stress_attrs:
-                        if hasattr(op2, attr_name):
-                            stress_data = getattr(op2, attr_name)
-                            if stress_data:
-                                for sc_id, data in stress_data.items():
-                                    for i, eid in enumerate(data.element):
-                                        try:
-                                            if len(data.data.shape) == 3:
-                                                stress = data.data[0, i, -1]
-                                            else:
-                                                stress = data.data[i, -1]
-                                            results.append({
-                                                'eid': int(eid), 'type': 'shell',
-                                                'stress': float(abs(stress)),
-                                                'subcase': int(sc_id)
-                                            })
-                                        except:
-                                            pass
-
-                except Exception as e:
-                    self.log(f"    OP2 read error: {e}")
-
-        # Save bar stress CSV
-        if bar_stress_rows:
-            csv_path = os.path.join(folder, 'bar_stress_results.csv')
-            with open(csv_path, 'w', newline='') as f:
-                w = csv.DictWriter(f, fieldnames=[
-                    'OP2', 'Subcase', 'Element', 'Property', 'Axial', 'Dim1', 'Dim2', 'Area', 'Stress'
-                ])
-                w.writeheader()
-                w.writerows(bar_stress_rows)
-            self.log(f"    Saved: bar_stress_results.csv ({len(bar_stress_rows)} rows)")
-
-        return results
-
     # ==================== SOLVE BASE MODEL ====================
     def _run_single_iteration(self, folder, thickness_overrides, label=""):
         """Write every BDF + fresh offsets for thickness_overrides (splitting
-        into run1/run2/... files per Cases per Split), run Nastran on every
-        resulting run file - up to Max Parallel Runs at a time - and extract
-        stresses. thickness_overrides is {} for the base model's own solve.
-        Offsets are recomputed here every call (see _prepare_iteration_bdfs /
-        _calculate_offset_csv) from the maneuver BDF at this same
-        thickness_overrides."""
+        into run1/run2/... files per Cases per Split), and run Nastran on
+        every resulting run file - up to Max Parallel Runs at a time. No
+        stress extraction/reporting happens anymore - this tool's job ends
+        at producing the .op2/.f06 results themselves. thickness_overrides
+        is {} for the base model's own solve. Offsets are recomputed here
+        every call (see _prepare_iteration_bdfs / _calculate_offset_csv)
+        from the maneuver BDF at this same thickness_overrides. Returns
+        (n_ok, n_total) Nastran job counts."""
         try:
             per_bdf = self._prepare_iteration_bdfs(folder, thickness_overrides, label=label)
 
@@ -2777,7 +2670,7 @@ class BarPropertySolverTab:
             self.log(f"    {label}Running {len(jobs)} Nastran job(s), max {max_parallel} at a time...")
 
             # Run Nastran and WAIT for every job to actually finish (incl.
-            # each .op2 being fully written) before extracting anything.
+            # each .op2 being fully written).
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
                 future_to_job = {
                     executor.submit(self._run_nastran, j['bdf_path'], j['folder'], j['label']): j
@@ -2793,33 +2686,17 @@ class BarPropertySolverTab:
                         self.log(f"    {label}Nastran run raised an exception for "
                                   f"{os.path.basename(j['bdf_path'])}: {e}")
                         j['run_ok'] = False
-                    if len(jobs) > 1:
-                        self.log(f"    {label}{done}/{len(jobs)} Nastran run(s) finished "
-                                  f"({'OK' if j['run_ok'] else 'FAILED'}: {os.path.basename(j['bdf_path'])})")
+                    self.log(f"    {label}{done}/{len(jobs)} Nastran run(s) finished "
+                              f"({'OK' if j['run_ok'] else 'FAILED'}: {os.path.basename(j['bdf_path'])})")
 
-            all_stresses = []
-            for j in jobs:
-                if not j['run_ok']:
-                    self.log(f"    {label}Nastran run failed/incomplete for "
-                              f"{os.path.basename(j['bdf_path'])} - skipping stress extraction for it")
-                    continue
-
-                stresses = self._extract_stresses(j['folder'], thickness_overrides)
-                all_stresses.extend(stresses)
-
-                if stresses:
-                    bar_s = [s for s in stresses if s['type'] == 'bar']
-                    shell_s = [s for s in stresses if s['type'] == 'shell']
-                    self.log(f"    {label}Extracted: {len(bar_s)} bar, {len(shell_s)} shell stresses "
-                              f"({os.path.basename(j['bdf_path'])})")
-
-            return all_stresses
+            n_ok = sum(1 for j in jobs if j['run_ok'])
+            return n_ok, len(jobs)
 
         except Exception as e:
             self.log(f"  {label}Iteration ERROR: {e}")
             import traceback
             self.log(traceback.format_exc())
-            return []
+            return 0, 0
 
     def start_solve(self):
         if not self.bdf_paths:

@@ -1687,17 +1687,22 @@ class BarPropertySolverTab:
 
         try:
             path = self.bdf_paths[0]
-            self.log(f"\n  Loading main BDF: {os.path.basename(path)}")
-            self.bdf_model = BDF(debug=False)
-            self.bdf_model.read_bdf(path, validate=False, xref=True, read_includes=False, encoding='latin-1')
 
+            # Parse every file in All BDF Files exactly once. self.bdf_model
+            # below is just an alias for the first one - it used to be parsed
+            # a SECOND time here on its own before this same loop parsed it
+            # again as bdf_models[0], doubling the (already slow, pure-Python
+            # card-by-card + xref) parse time for that file.
             self.bdf_models = []
             for bdf_path in self.bdf_paths:
-                self.log(f"  Loading: {os.path.basename(bdf_path)}")
+                self.log(f"\n  Loading: {os.path.basename(bdf_path)}")
                 model = BDF(debug=False)
                 model.read_bdf(bdf_path, validate=False, xref=True, read_includes=False, encoding='latin-1')
                 self.bdf_models.append({'path': bdf_path, 'model': model, 'name': os.path.basename(bdf_path)})
 
+            self.bdf_model = self.bdf_models[0]['model']
+
+            self.log(f"\n  Main BDF: {os.path.basename(path)}")
             self.log(f"  Nodes: {len(self.bdf_model.nodes)}")
             self.log(f"  Elements: {len(self.bdf_model.elements)}")
             self.log(f"  Properties: {len(self.bdf_model.properties)}")

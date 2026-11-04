@@ -4,6 +4,7 @@ DaDT Structure Definition Tool v16.0
 =====================================
 Tab 1: BDF Merge Preparation
 Tab 2: Understanding Structure Type (apply 'Bar Property'/'Skin Property' + offsets, solve base model)
+Tab 3: Post Processing (OP2 -> H5 batch conversion, Load Extraction folder prep)
 """
 
 import tkinter as tk
@@ -21,6 +22,7 @@ from datetime import datetime
 import pandas as pd
 from pyNastran.bdf.bdf import BDF
 import numpy as np
+import openpyxl
 
 _APP_COLORS = {}  # populated by _configure_app_style(); shared palette for both tabs
 
@@ -2811,6 +2813,15 @@ class PostProcessingTab:
         self.output_folder = tk.StringVar()
         self.op2_files = []
 
+        # ---- Load Extraction prep ----
+        self.le_input_excel_path = tk.StringVar()    # settings excel with the 'Load_Extraction' sheet
+        self.le_example_folder = tk.StringVar()      # template folder (Load_Ext_H5 + TF-X_Load_Extraction.xlsx)
+        self.le_maneuver_bdf_path = tk.StringVar()
+        self.le_thermal_bdf_path = tk.StringVar()
+        self.le_pickle_path = tk.StringVar()
+        self.le_split_count = tk.StringVar(value="10")
+        self.le_output_folder = tk.StringVar()       # where the split LoadExtraction_NN folders are created
+
         self.is_running = False
 
         self.setup_ui()
@@ -2903,8 +2914,101 @@ class PostProcessingTab:
         self.progress_bar = ttk.Progressbar(f2, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(fill=tk.X, pady=5)
 
-        # ---- Section 3: Log ----
-        f3 = ttk.LabelFrame(main, text="\U0001F4DC  3. Log", padding=10)
+        # ---- Section 3: Load Extraction Input Files ----
+        f4 = ttk.LabelFrame(main, text="\U0001F4C1  3. Load Extraction Input Files", padding=10)
+        f4.pack(fill=tk.X, pady=5, padx=10)
+
+        # Settings Excel (reads the 'Load_Extraction' sheet)
+        le_xl_frame = ttk.Frame(f4)
+        le_xl_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(le_xl_frame, text="Input Excel:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(le_xl_frame, textvariable=self.le_input_excel_path, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(le_xl_frame, text="Browse", command=lambda: self.le_input_excel_path.set(
+            filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
+        )).pack(side=tk.LEFT)
+        le_xl_hint = ttk.Frame(f4)
+        le_xl_hint.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(le_xl_hint, text="(the settings excel with the 'Load_Extraction' sheet: Bar Element ID, "
+                                    "..., Set)", font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        # Example Load Extraction template folder
+        le_ex_frame = ttk.Frame(f4)
+        le_ex_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(le_ex_frame, text="Example LE Folder:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(le_ex_frame, textvariable=self.le_example_folder, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(le_ex_frame, text="Browse", command=lambda: self.le_example_folder.set(
+            filedialog.askdirectory()
+        )).pack(side=tk.LEFT)
+        le_ex_hint = ttk.Frame(f4)
+        le_ex_hint.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(le_ex_hint, text="(template folder, e.g. Example_LE - contains Load_Ext_H5 and "
+                                    "TF-X_Load_Extraction.xlsx; copied once per split)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        # Maneuver BDF
+        le_man_frame = ttk.Frame(f4)
+        le_man_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(le_man_frame, text="BDF (Maneuver):", width=18).pack(side=tk.LEFT)
+        ttk.Entry(le_man_frame, textvariable=self.le_maneuver_bdf_path, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(le_man_frame, text="Browse", command=lambda: self.le_maneuver_bdf_path.set(
+            filedialog.askopenfilename(filetypes=[("BDF", "*.bdf *.dat *.nas"), ("All", "*.*")])
+        )).pack(side=tk.LEFT)
+
+        # Thermal BDF
+        le_thm_frame = ttk.Frame(f4)
+        le_thm_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(le_thm_frame, text="BDF (Thermal):", width=18).pack(side=tk.LEFT)
+        ttk.Entry(le_thm_frame, textvariable=self.le_thermal_bdf_path, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(le_thm_frame, text="Browse", command=lambda: self.le_thermal_bdf_path.set(
+            filedialog.askopenfilename(filetypes=[("BDF", "*.bdf *.dat *.nas"), ("All", "*.*")])
+        )).pack(side=tk.LEFT)
+
+        # Pickle file
+        le_pkl_frame = ttk.Frame(f4)
+        le_pkl_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(le_pkl_frame, text="Pickle File:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(le_pkl_frame, textvariable=self.le_pickle_path, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(le_pkl_frame, text="Browse", command=lambda: self.le_pickle_path.set(
+            filedialog.askopenfilename(filetypes=[("Pickle", "*.pickle *.pkl"), ("All", "*.*")])
+        )).pack(side=tk.LEFT)
+
+        # Split count
+        le_split_frame = ttk.Frame(f4)
+        le_split_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(le_split_frame, text="Split Into:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(le_split_frame, textvariable=self.le_split_count, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(le_split_frame, text="(number of structure groups - rows are grouped by the 'Set' "
+                                        "column and split across this many folders)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        # Output folder for the split LoadExtraction_NN folders
+        le_out_frame = ttk.Frame(f4)
+        le_out_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(le_out_frame, text="Output Folder:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(le_out_frame, textvariable=self.le_output_folder, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(le_out_frame, text="Browse", command=lambda: self.le_output_folder.set(
+            filedialog.askdirectory()
+        )).pack(side=tk.LEFT)
+
+        # ---- Section 4: Load Extraction Actions ----
+        f5 = ttk.LabelFrame(main, text="▶  4. Load Extraction Actions", padding=10)
+        f5.pack(fill=tk.X, pady=5, padx=10)
+
+        le_btn_row = ttk.Frame(f5)
+        le_btn_row.pack(fill=tk.X)
+        self.btn_le_prepare = ttk.Button(le_btn_row, text="▶  PREPARE LOAD EXTRACTION",
+                                          command=self.start_prepare_load_extraction, style='Accent.TButton')
+        self.btn_le_prepare.pack(side=tk.LEFT, padx=5)
+        ttk.Label(le_btn_row, text="(run OP2 -> H5 conversion above first - the H5 list below "
+                                    "is read from its Output Folder)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        self.le_progress_var = tk.DoubleVar()
+        self.le_progress_bar = ttk.Progressbar(f5, variable=self.le_progress_var, maximum=100)
+        self.le_progress_bar.pack(fill=tk.X, pady=5)
+
+        # ---- Section 5: Log ----
+        f3 = ttk.LabelFrame(main, text="\U0001F4DC  5. Log", padding=10)
         f3.pack(fill=tk.BOTH, expand=True, pady=5, padx=10)
 
         self.log_text = scrolledtext.ScrolledText(f3, height=20, width=100, font=('Consolas', 10),
@@ -3033,6 +3137,217 @@ class PostProcessingTab:
         finally:
             self.is_running = False
             self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
+
+    # ==================== LOAD EXTRACTION PREP ====================
+    @staticmethod
+    def _chunk_list(items, n):
+        """Split items into n contiguous, as-equal-as-possible chunks (same
+        balanced partition as numpy.array_split), preserving order."""
+        n = max(1, n)
+        k, m = divmod(len(items), n)
+        chunks = []
+        start = 0
+        for i in range(n):
+            size = k + (1 if i < m else 0)
+            chunks.append(items[start:start + size])
+            start += size
+        return chunks
+
+    @staticmethod
+    def _find_data_sheet(wb):
+        """The worksheet whose header row contains 'Bar Element ID' - same
+        headers as the source Load_Extraction sheet, where that sheet's rows
+        get pasted."""
+        for ws in wb.worksheets:
+            try:
+                row1 = next(ws.iter_rows(min_row=1, max_row=1))
+            except StopIteration:
+                continue
+            for cell in row1:
+                if cell.value and str(cell.value).strip().lower() == 'bar element id':
+                    return ws
+        return None
+
+    @staticmethod
+    def _find_control_sheet(wb, marker_text):
+        """The worksheet containing marker_text anywhere in its first ~40
+        rows - the control panel sheet with the BDF/Pickle/HDF file fields."""
+        marker_lower = marker_text.lower()
+        for ws in wb.worksheets:
+            for row in ws.iter_rows(min_row=1, max_row=40, max_col=10):
+                for cell in row:
+                    if cell.value and marker_lower in str(cell.value).lower():
+                        return ws
+        return None
+
+    def start_prepare_load_extraction(self):
+        if not self.le_input_excel_path.get().strip() or not os.path.exists(self.le_input_excel_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Input Excel")
+            return
+        if not self.le_example_folder.get().strip() or not os.path.isdir(self.le_example_folder.get().strip()):
+            messagebox.showerror("Error", "Select a valid Example LE Folder")
+            return
+        if not self.le_output_folder.get().strip():
+            messagebox.showerror("Error", "Select an Output Folder for the split")
+            return
+        try:
+            n = int(float(self.le_split_count.get()))
+            if n <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            messagebox.showerror("Error", "Split Into must be a positive number")
+            return
+
+        self.is_running = True
+        self.btn_le_prepare.config(state=tk.DISABLED)
+        threading.Thread(target=self._prepare_load_extraction, daemon=True).start()
+
+    def _prepare_load_extraction(self):
+        t_start = time.time()
+        try:
+            input_excel = self.le_input_excel_path.get().strip()
+            example_folder = self.le_example_folder.get().strip()
+            out_base = self.le_output_folder.get().strip()
+            n = int(float(self.le_split_count.get()))
+            os.makedirs(out_base, exist_ok=True)
+
+            self.log("\n" + "=" * 70)
+            self.log("PREPARING LOAD EXTRACTION")
+            self.log("=" * 70)
+
+            # ---- 1. Read the 'Load_Extraction' sheet ----
+            xl = pd.ExcelFile(input_excel)
+            le_sheet = None
+            for sheet in xl.sheet_names:
+                sl = sheet.lower().replace('_', '').replace(' ', '')
+                if 'load' in sl and 'extraction' in sl:
+                    le_sheet = sheet
+                    break
+            if not le_sheet:
+                self.log("  ERROR: No 'Load_Extraction' sheet found in the Input Excel.")
+                return
+
+            df = pd.read_excel(xl, sheet_name=le_sheet)
+            self.log(f"  Read '{le_sheet}': {len(df)} rows, columns: {list(df.columns)}")
+
+            set_col = next((c for c in df.columns if str(c).strip().lower() == 'set'), None)
+            if not set_col:
+                self.log("  ERROR: No 'Set' column found in the Load_Extraction sheet.")
+                return
+
+            # ---- 2. Group by Set (first-seen order), split into n chunks ----
+            unique_sets = list(dict.fromkeys(df[set_col].tolist()))
+            set_chunks = self._chunk_list(unique_sets, n)
+            self.log(f"  {len(unique_sets)} unique Set(s) -> split into {n} group(s)")
+            empty_chunks = sum(1 for c in set_chunks if not c)
+            if empty_chunks:
+                self.log(f"  NOTE: {empty_chunks} group(s) have no Sets (fewer unique Sets than the split count)")
+
+            # ---- 3. H5 files from the OP2->H5 conversion's own Output Folder ----
+            h5_folder = self.output_folder.get().strip()
+            h5_files = []
+            if h5_folder and os.path.isdir(h5_folder):
+                for dirpath, _, filenames in os.walk(h5_folder):
+                    for fn in filenames:
+                        if fn.lower().endswith('.h5'):
+                            h5_files.append(os.path.join(dirpath, fn))
+                h5_files.sort()
+            self.log(f"  H5 files found under Output Folder ({h5_folder or 'not set'}): {len(h5_files)}")
+            if not h5_files:
+                self.log("  WARNING: no H5 files found - run OP2 -> H5 conversion first (Section 1/2 above).")
+
+            man_bdf = self.le_maneuver_bdf_path.get().strip()
+            thm_bdf = self.le_thermal_bdf_path.get().strip()
+            pickle_path = self.le_pickle_path.get().strip()
+
+            # ---- 4. One split folder per chunk ----
+            n_done = 0
+            for i, chunk_sets in enumerate(set_chunks):
+                idx = i + 1
+                self.log(f"\n  --- Group {idx}/{n}: {len(chunk_sets)} Set(s) ---")
+                dest_folder = os.path.join(out_base, f"LoadExtraction_{idx:02d}")
+                shutil.copytree(example_folder, dest_folder, dirs_exist_ok=True)
+                self.log(f"    Template copied to: {dest_folder}")
+
+                tfx_path = None
+                for dirpath, _, filenames in os.walk(dest_folder):
+                    for fn in filenames:
+                        fnl = fn.lower()
+                        if 'load_extraction' in fnl.replace(' ', '_') and fnl.endswith(('.xlsx', '.xlsm', '.xls', '.xlsb')):
+                            tfx_path = os.path.join(dirpath, fn)
+                            break
+                    if tfx_path:
+                        break
+
+                if not tfx_path:
+                    self.log("    ERROR: No '...Load_Extraction....xls*' file found in the copied template - skipping.")
+                    continue
+                if tfx_path.lower().endswith('.xlsb'):
+                    self.log(f"    ERROR: {os.path.basename(tfx_path)} is a binary .xlsb workbook - "
+                              f"openpyxl can't edit it. Skipping.")
+                    continue
+
+                keep_vba = tfx_path.lower().endswith(('.xlsm', '.xltm', '.xlam'))
+                wb = openpyxl.load_workbook(tfx_path, keep_vba=keep_vba)
+
+                data_ws = self._find_data_sheet(wb)
+                if data_ws is None:
+                    self.log(f"    WARNING: no sheet with a 'Bar Element ID' header found in "
+                              f"{os.path.basename(tfx_path)} - structure rows not written.")
+                else:
+                    header_map = {}
+                    for cell in next(data_ws.iter_rows(min_row=1, max_row=1)):
+                        if cell.value:
+                            header_map[str(cell.value).strip().lower()] = cell.column
+
+                    subset_df = df[df[set_col].isin(chunk_sets)]
+
+                    # Clear stale example rows under the header before pasting
+                    for col_idx in header_map.values():
+                        for r in range(2, 2002):
+                            data_ws.cell(row=r, column=col_idx).value = None
+
+                    for r_off, (_, row) in enumerate(subset_df.iterrows()):
+                        r = r_off + 2
+                        for col_name in subset_df.columns:
+                            col_idx = header_map.get(str(col_name).strip().lower())
+                            if col_idx:
+                                val = row[col_name]
+                                data_ws.cell(row=r, column=col_idx).value = None if pd.isna(val) else val
+                    self.log(f"    Wrote {len(subset_df)} row(s) into '{data_ws.title}'")
+
+                control_ws = self._find_control_sheet(wb, "BDF File for Sprung System")
+                if control_ws is None:
+                    self.log(f"    WARNING: no control sheet (with 'BDF File for Sprung System') found in "
+                              f"{os.path.basename(tfx_path)} - C9/C10/C11/C17+ not written.")
+                else:
+                    control_ws['C9'] = man_bdf
+                    control_ws['C10'] = thm_bdf
+                    control_ws['C11'] = pickle_path
+                    for r in range(17, 2017):
+                        control_ws.cell(row=r, column=3).value = None
+                    for r_off, p in enumerate(h5_files):
+                        control_ws.cell(row=17 + r_off, column=3).value = p
+                    self.log(f"    Wrote C9/C10/C11 (maneuver/thermal/pickle) and {len(h5_files)} "
+                              f"H5 path(s) from C17 into '{control_ws.title}'")
+
+                wb.save(tfx_path)
+                n_done += 1
+                self.root.after(0, lambda p=(idx / n) * 100: self.le_progress_var.set(p))
+
+            self.log(f"\n{'=' * 70}")
+            self.log(f"LOAD EXTRACTION PREP COMPLETE: {n_done}/{n} group(s) "
+                      f"(took {time.time() - t_start:.1f}s)")
+            self.log(f"{'=' * 70}")
+
+        except Exception as e:
+            self.log(f"\nERROR after {time.time() - t_start:.1f}s: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: self.btn_le_prepare.config(state=tk.NORMAL))
 
 
 def main():

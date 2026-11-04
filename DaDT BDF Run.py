@@ -2822,7 +2822,12 @@ class PostProcessingTab:
         self.le_split_count = tk.StringVar(value="10")
         self.le_output_folder = tk.StringVar()       # where the split LoadExtraction_NN folders are created
 
-        self.is_running = False
+        # Separate run-state flags: Load Extraction prep must never start
+        # while a conversion is still in flight, and must be able to tell
+        # whether a conversion finished at all before trusting the H5 folder.
+        self.is_converting = False
+        self.is_preparing_le = False
+        self.last_conversion_ok = None     # (n_ok, n_total) from the most recent _run_conversion, or None if never run
 
         self.setup_ui()
 
@@ -3069,7 +3074,7 @@ class PostProcessingTab:
             messagebox.showerror("Error", "Select an Output Folder")
             return
 
-        self.is_running = True
+        self.is_converting = True
         self.btn_run.config(state=tk.DISABLED)
         threading.Thread(target=self._run_conversion, daemon=True).start()
 
@@ -3120,6 +3125,7 @@ class PostProcessingTab:
                 self.log(f"  stderr: {result.stderr.strip()[:2000]}")
 
             n_ok = sum(1 for p in expected_h5 if os.path.exists(p))
+            self.last_conversion_ok = (n_ok, len(expected_h5))
             self.log(f"\n  {n_ok}/{len(expected_h5)} H5 file(s) produced (took {time.time() - t_start:.1f}s)")
             if n_ok < len(expected_h5):
                 missing = [os.path.basename(p) for p in expected_h5 if not os.path.exists(p)]
@@ -3135,7 +3141,7 @@ class PostProcessingTab:
             self.log(traceback.format_exc())
 
         finally:
-            self.is_running = False
+            self.is_converting = False
             self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
 
     # ==================== LOAD EXTRACTION PREP ====================
@@ -3181,6 +3187,10 @@ class PostProcessingTab:
         return None
 
     def start_prepare_load_extraction(self):
+        if self.is_converting:
+            messagebox.showerror("Error", "OP2 -> H5 conversion is still running - "
+                                           "wait for it to finish before preparing Load Extraction")
+            return
         if not self.le_input_excel_path.get().strip() or not os.path.exists(self.le_input_excel_path.get().strip()):
             messagebox.showerror("Error", "Select a valid Input Excel")
             return
@@ -3198,7 +3208,33 @@ class PostProcessingTab:
             messagebox.showerror("Error", "Split Into must be a positive number")
             return
 
-        self.is_running = True
+        # Make sure the H5 conversion has actually finished before trusting its
+        # output - a live count on disk, not just a flag, so this still works
+        # correctly even if conversion ran in an earlier session of the app.
+        h5_folder = self.output_folder.get().strip()
+        h5_count = 0
+        if h5_folder and os.path.isdir(h5_folder):
+            for _, _, filenames in os.walk(h5_folder):
+                h5_count += sum(1 for fn in filenames if fn.lower().endswith('.h5'))
+
+        if self.op2_files:
+            if h5_count < len(self.op2_files):
+                messagebox.showerror(
+                    "Error",
+                    f"H5 conversion looks incomplete: only {h5_count}/{len(self.op2_files)} H5 file(s) "
+                    f"found in Output Folder. Run OP2 -> H5 conversion (Section 1/2) and make sure it "
+                    f"finishes before preparing Load Extraction."
+                )
+                return
+        elif h5_count == 0:
+            messagebox.showerror(
+                "Error",
+                "No H5 files found in Output Folder yet. List OP2 files and run the OP2 -> H5 "
+                "conversion (Section 1/2) first."
+            )
+            return
+
+        self.is_preparing_le = True
         self.btn_le_prepare.config(state=tk.DISABLED)
         threading.Thread(target=self._prepare_load_extraction, daemon=True).start()
 
@@ -3346,7 +3382,7 @@ class PostProcessingTab:
             self.log(traceback.format_exc())
 
         finally:
-            self.is_running = False
+            self.is_preparing_le = False
             self.root.after(0, lambda: self.btn_le_prepare.config(state=tk.NORMAL))
 
 

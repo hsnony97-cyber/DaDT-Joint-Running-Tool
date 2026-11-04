@@ -144,7 +144,11 @@ class IntegratedBDFRFTool:
         self.notebook.add(self.tab3, text="\U0001F9EE  Understanding Structure Type")
         self.tab3_tool = BarPropertySolverTab(self.tab3, self.root)
 
-    
+        self.tab4 = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab4, text="\U0001F4E6  Post Processing")
+        self.tab4_tool = PostProcessingTab(self.tab4, self.root)
+
+
     def setup_tab1(self):
         main = ttk.Frame(self.tab1, padding="10")
         main.pack(fill=tk.BOTH, expand=True)
@@ -2790,6 +2794,245 @@ class BarPropertySolverTab:
             self.root.after(0, lambda: self.btn_start.config(state=tk.NORMAL))
 
 
+class PostProcessingTab:
+    """OP2 -> H5 batch conversion. Lists every .op2 under a chosen folder
+    (recursively, since the Understanding Structure Type tab's split/
+    parallel runs nest them under per-run subfolders), then writes a
+    Batch_Run.bat next to the chosen converter exe - one line per OP2,
+    "<exe> "<op2_path>" "<h5_path>"" - and runs it exactly as if it had
+    been pasted into that folder and double-clicked by hand."""
+
+    def __init__(self, parent_frame, root):
+        self.root = root
+        self.parent_frame = parent_frame
+
+        self.op2_folder = tk.StringVar()
+        self.converter_exe_path = tk.StringVar()
+        self.output_folder = tk.StringVar()
+        self.op2_files = []
+
+        self.is_running = False
+
+        self.setup_ui()
+
+    # ==================== GUI ====================
+    def setup_ui(self):
+        canvas = tk.Canvas(self.parent_frame)
+        scrollbar = ttk.Scrollbar(self.parent_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        main = scrollable_frame
+
+        ttk.Label(main, text="Post Processing", style='Header.TLabel').pack(pady=10)
+        ttk.Label(main, text="Convert OP2 results to H5 via a batch-generated converter run",
+                 style='Subtitle.TLabel').pack()
+
+        # ---- Section 1: Input Files ----
+        f1 = ttk.LabelFrame(main, text="\U0001F4C1  1. Input Files", padding=10)
+        f1.pack(fill=tk.X, pady=5, padx=10)
+
+        # OP2 Folder
+        op2_frame = ttk.Frame(f1)
+        op2_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(op2_frame, text="OP2 Folder:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(op2_frame, textvariable=self.op2_folder, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(op2_frame, text="Browse", command=lambda: self.op2_folder.set(
+            filedialog.askdirectory()
+        )).pack(side=tk.LEFT, padx=2)
+        ttk.Button(op2_frame, text="List", command=self.list_op2_files).pack(side=tk.LEFT, padx=2)
+
+        # OP2 files found (read-only listing, searched recursively)
+        list_frame = ttk.Frame(f1)
+        list_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(list_frame, text="OP2 Files Found:", width=18).pack(side=tk.LEFT, anchor=tk.N)
+        op2_list_frame = ttk.Frame(list_frame)
+        op2_list_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.op2_listbox = tk.Listbox(op2_list_frame, height=8, width=70, selectmode=tk.EXTENDED,
+                                       font=('Consolas', 9), bg=_APP_COLORS['surface'], fg=_APP_COLORS['text'],
+                                       selectbackground=_APP_COLORS['primary'], selectforeground='white',
+                                       relief='flat', highlightthickness=1,
+                                       highlightbackground=_APP_COLORS['border'],
+                                       highlightcolor=_APP_COLORS['primary'])
+        self.op2_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        op2_scroll = ttk.Scrollbar(op2_list_frame, orient="vertical", command=self.op2_listbox.yview)
+        op2_scroll.pack(side=tk.LEFT, fill=tk.Y)
+        self.op2_listbox.configure(yscrollcommand=op2_scroll.set)
+
+        self.op2_status = ttk.Label(f1, text="No OP2 files listed", foreground="gray")
+        self.op2_status.pack(anchor=tk.W)
+
+        # Converter Exe
+        exe_frame = ttk.Frame(f1)
+        exe_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(exe_frame, text="Converter Exe:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(exe_frame, textvariable=self.converter_exe_path, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(exe_frame, text="Browse", command=lambda: self.converter_exe_path.set(
+            filedialog.askopenfilename(filetypes=[("Executable", "*.exe"), ("All", "*.*")])
+        )).pack(side=tk.LEFT)
+        exe_hint = ttk.Frame(f1)
+        exe_hint.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(exe_hint, text="(e.g. op2hdf5_standalone.exe - Batch_Run.bat is written next to this "
+                                  "exe and run from there, same as pasting/running it by hand)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        # Output Folder
+        out_frame = ttk.Frame(f1)
+        out_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(out_frame, text="Output Folder (H5):", width=18).pack(side=tk.LEFT)
+        ttk.Entry(out_frame, textvariable=self.output_folder, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(out_frame, text="Browse", command=lambda: self.output_folder.set(
+            filedialog.askdirectory()
+        )).pack(side=tk.LEFT)
+
+        # ---- Section 2: Actions ----
+        f2 = ttk.LabelFrame(main, text="▶  2. Actions", padding=10)
+        f2.pack(fill=tk.X, pady=5, padx=10)
+
+        btn_row = ttk.Frame(f2)
+        btn_row.pack(fill=tk.X)
+        self.btn_run = ttk.Button(btn_row, text="▶  RUN", command=self.start_run, style='Accent.TButton')
+        self.btn_run.pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="Clear Log", command=self.clear_log).pack(side=tk.LEFT, padx=5)
+
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(f2, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, pady=5)
+
+        # ---- Section 3: Log ----
+        f3 = ttk.LabelFrame(main, text="\U0001F4DC  3. Log", padding=10)
+        f3.pack(fill=tk.BOTH, expand=True, pady=5, padx=10)
+
+        self.log_text = scrolledtext.ScrolledText(f3, height=20, width=100, font=('Consolas', 10),
+                                                    bg=_APP_COLORS['log_bg'], fg=_APP_COLORS['log_fg'],
+                                                    insertbackground=_APP_COLORS['log_fg'], relief='flat',
+                                                    borderwidth=0)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def log(self, msg):
+        def _do():
+            self.log_text.insert(tk.END, msg + "\n")
+            self.log_text.see(tk.END)
+        self.root.after(0, _do)
+
+    def clear_log(self):
+        self.log_text.delete(1.0, tk.END)
+
+    # ==================== OP2 LISTING ====================
+    def list_op2_files(self):
+        folder = self.op2_folder.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Error", "Select a valid OP2 folder")
+            return
+
+        self.log("\n" + "=" * 70)
+        self.log("LISTING OP2 FILES")
+        self.log("=" * 70)
+        self.log(f"  Searching (recursively): {folder}")
+
+        t_start = time.time()
+        self.op2_files = []
+        for dirpath, _, filenames in os.walk(folder):
+            for fn in filenames:
+                if fn.lower().endswith('.op2'):
+                    self.op2_files.append(os.path.join(dirpath, fn))
+        self.op2_files.sort()
+
+        self.op2_listbox.delete(0, tk.END)
+        for p in self.op2_files:
+            self.op2_listbox.insert(tk.END, os.path.relpath(p, folder))
+
+        self.log(f"  Found {len(self.op2_files)} OP2 file(s) in {time.time() - t_start:.1f}s")
+        self.op2_status.config(
+            text=f"{len(self.op2_files)} OP2 file(s) found" if self.op2_files else "No OP2 files found",
+            foreground="green" if self.op2_files else "gray"
+        )
+
+    # ==================== RUN (BAT GENERATION + EXECUTION) ====================
+    def start_run(self):
+        if not self.op2_files:
+            messagebox.showerror("Error", "List OP2 files first")
+            return
+        exe_path = self.converter_exe_path.get().strip()
+        if not exe_path or not os.path.exists(exe_path):
+            messagebox.showerror("Error", "Select a valid Converter Exe")
+            return
+        if not self.output_folder.get().strip():
+            messagebox.showerror("Error", "Select an Output Folder")
+            return
+
+        self.is_running = True
+        self.btn_run.config(state=tk.DISABLED)
+        threading.Thread(target=self._run_conversion, daemon=True).start()
+
+    def _run_conversion(self):
+        t_start = time.time()
+        try:
+            exe_path = self.converter_exe_path.get().strip()
+            exe_dir = os.path.dirname(exe_path) or None
+            exe_name = os.path.basename(exe_path)
+            out_dir = self.output_folder.get().strip()
+            os.makedirs(out_dir, exist_ok=True)
+
+            self.log("\n" + "=" * 70)
+            self.log("OP2 -> H5 BATCH CONVERSION")
+            self.log("=" * 70)
+            self.log(f"  OP2 files: {len(self.op2_files)}")
+            self.log(f"  Converter: {exe_path}")
+            self.log(f"  Output folder: {out_dir}")
+
+            # One line per OP2: "<exe_name>" "<op2_path>" "<h5_path>" - written
+            # into the exe's own folder and run from there (cwd=exe_dir), so
+            # referencing the exe by its bare name resolves exactly the way it
+            # does when this bat file is pasted there and run by hand.
+            bat_folder = exe_dir or os.getcwd()
+            bat_path = os.path.join(bat_folder, "Batch_Run.bat")
+            expected_h5 = []
+            lines = []
+            for op2_path in self.op2_files:
+                base = os.path.splitext(os.path.basename(op2_path))[0]
+                h5_path = os.path.join(out_dir, base + ".h5")
+                lines.append(f'{exe_name} "{op2_path}" "{h5_path}"')
+                expected_h5.append(h5_path)
+
+            with open(bat_path, 'w', encoding='latin-1') as f:
+                f.write('\n'.join(lines) + '\n')
+            self.log(f"  Batch file written: {bat_path}")
+
+            self.root.after(0, lambda: self.progress_var.set(10))
+            self.log(f"\n  Running batch ({len(lines)} conversion(s))...")
+            result = subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, capture_output=True, text=True)
+            self.root.after(0, lambda: self.progress_var.set(90))
+
+            if result.returncode != 0:
+                self.log(f"  WARNING: batch exited with code {result.returncode}")
+            if result.stdout:
+                self.log(f"  stdout: {result.stdout.strip()[:2000]}")
+            if result.stderr:
+                self.log(f"  stderr: {result.stderr.strip()[:2000]}")
+
+            n_ok = sum(1 for p in expected_h5 if os.path.exists(p))
+            self.log(f"\n  {n_ok}/{len(expected_h5)} H5 file(s) produced (took {time.time() - t_start:.1f}s)")
+            if n_ok < len(expected_h5):
+                missing = [os.path.basename(p) for p in expected_h5 if not os.path.exists(p)]
+                shown = ', '.join(missing[:20]) + (" ..." if len(missing) > 20 else "")
+                self.log(f"  Missing: {shown}")
+
+            self.root.after(0, lambda: self.progress_var.set(100))
+            self.log("\nCONVERSION COMPLETE")
+
+        except Exception as e:
+            self.log(f"\nERROR after {time.time() - t_start:.1f}s: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
 
 
 def main():

@@ -2990,8 +2990,9 @@ class PostProcessingTab:
         self.btn_run = ttk.Button(btn_row, text="▶  RUN", command=self.start_run, style='Accent.TButton')
         self.btn_run.pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_row, text="Clear Log", command=self.clear_log).pack(side=tk.LEFT, padx=5)
-        ttk.Label(btn_row, text="(OP2 -> H5 conversion runs first; Load Extraction prep starts "
-                                 "automatically only once every H5 file is confirmed on disk)",
+        ttk.Label(btn_row, text="(1. OP2 -> H5 conversion  2. Load Extraction prep (only once every "
+                                 "H5 is confirmed on disk)  3. Run Analysis triggered in every TF-X "
+                                 "workbook, 20s apart, Excel left open)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         self.progress_var = tk.DoubleVar()
@@ -3107,10 +3108,10 @@ class PostProcessingTab:
             f.write('\n'.join(lines) + '\n')
         self.log(f"  Batch file written: {bat_path}")
 
-        self.root.after(0, lambda: self.progress_var.set(5))
+        self.root.after(0, lambda: self.progress_var.set(2))
         self.log(f"\n  Running batch ({len(lines)} conversion(s))...")
         result = subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, capture_output=True, text=True)
-        self.root.after(0, lambda: self.progress_var.set(45))
+        self.root.after(0, lambda: self.progress_var.set(30))
 
         if result.returncode != 0:
             self.log(f"  WARNING: batch exited with code {result.returncode}")
@@ -3126,7 +3127,7 @@ class PostProcessingTab:
             shown = ', '.join(missing[:20]) + (" ..." if len(missing) > 20 else "")
             self.log(f"  Missing: {shown}")
 
-        self.root.after(0, lambda: self.progress_var.set(50))
+        self.root.after(0, lambda: self.progress_var.set(33))
         return n_ok, len(expected_h5)
 
     # ==================== LOAD EXTRACTION PREP ====================
@@ -3161,6 +3162,17 @@ class PostProcessingTab:
             for cell in row1:
                 if cell.value and str(cell.value).strip().lower() == 'bar element id':
                     return ws
+        return None
+
+    @staticmethod
+    def _find_tfx_workbook_path(dest_folder):
+        """The '...Load_Extraction....xls*' workbook inside a copied
+        LoadExtraction_NN folder, or None if none is found."""
+        for dirpath, _, filenames in os.walk(dest_folder):
+            for fn in filenames:
+                fnl = fn.lower()
+                if 'load_extraction' in fnl.replace(' ', '_') and fnl.endswith(('.xlsx', '.xlsm', '.xls', '.xlsb')):
+                    return os.path.join(dirpath, fn)
         return None
 
     @staticmethod
@@ -3243,16 +3255,7 @@ class PostProcessingTab:
             shutil.copytree(example_folder, dest_folder, dirs_exist_ok=True)
             self.log(f"    Template copied to: {dest_folder}")
 
-            tfx_path = None
-            for dirpath, _, filenames in os.walk(dest_folder):
-                for fn in filenames:
-                    fnl = fn.lower()
-                    if 'load_extraction' in fnl.replace(' ', '_') and fnl.endswith(('.xlsx', '.xlsm', '.xls', '.xlsb')):
-                        tfx_path = os.path.join(dirpath, fn)
-                        break
-                if tfx_path:
-                    break
-
+            tfx_path = self._find_tfx_workbook_path(dest_folder)
             if not tfx_path:
                 self.log("    ERROR: No '...Load_Extraction....xls*' file found in the copied template - skipping.")
                 continue
@@ -3307,10 +3310,143 @@ class PostProcessingTab:
 
             wb.save(tfx_path)
             n_done += 1
-            self.root.after(0, lambda p=50 + (idx / n) * 50: self.progress_var.set(p))
+            self.root.after(0, lambda p=33 + (idx / n) * 33: self.progress_var.set(p))
 
         self.log(f"\n  LOAD EXTRACTION PREP: {n_done}/{n} group(s) (took {time.time() - t_start:.1f}s)")
         return n_done, n
+
+    # ==================== RUN TF-X ANALYSES (EXCEL/VBA AUTOMATION) ====================
+    def _find_le_groups_folders(self):
+        """Every LoadExtraction_NN folder under the LE Output Folder,
+        sorted by name (zero-padded, so plain alphabetical sort is correct
+        for up to 99 groups)."""
+        base = self.le_output_folder.get().strip()
+        if not base or not os.path.isdir(base):
+            return []
+        folders = [
+            os.path.join(base, name) for name in os.listdir(base)
+            if os.path.isdir(os.path.join(base, name)) and name.lower().startswith('loadextraction_')
+        ]
+        folders.sort(key=lambda p: os.path.basename(p).lower())
+        return folders
+
+    @staticmethod
+    def _find_run_button_macro(wb):
+        """Search every worksheet's Shapes for one captioned 'Run Analysis'
+        and return (on_action, sheet_name, shape_name), or (None, None,
+        None) if no such button (or no macro assigned to it) is found."""
+        for ws in wb.Worksheets:
+            try:
+                shapes = ws.Shapes
+            except Exception:
+                continue
+            for i in range(1, shapes.Count + 1):
+                shp = shapes.Item(i)
+                caption = ""
+                try:
+                    caption = shp.TextFrame.Characters().Text
+                except Exception:
+                    try:
+                        caption = shp.TextFrame2.TextRange.Text
+                    except Exception:
+                        caption = ""
+                if caption and 'run analysis' in caption.strip().lower():
+                    on_action = None
+                    try:
+                        on_action = shp.OnAction
+                    except Exception:
+                        on_action = None
+                    if on_action:
+                        return on_action, ws.Name, shp.Name
+        return None, None, None
+
+    def _run_tfx_analyses_core(self):
+        """Open every LoadExtraction_NN TF-X workbook in Excel (left
+        visible/open so progress can be watched) and trigger its 'Run
+        Analysis' button's macro, staggering the start of each one by 20s
+        so all N analyses aren't kicked off at the same instant. Returns
+        (n_started, n_total)."""
+        t_start = time.time()
+        self.log("\n" + "=" * 70)
+        self.log("RUNNING TF-X ANALYSES")
+        self.log("=" * 70)
+
+        group_folders = self._find_le_groups_folders()
+        if not group_folders:
+            self.log("  No LoadExtraction_NN folders found - nothing to run.")
+            return 0, 0
+        n = len(group_folders)
+        self.log(f"  {n} Load Extraction group(s) found")
+
+        try:
+            import pythoncom
+            import win32com.client as win32
+        except ImportError:
+            self.log("  ERROR: pywin32 is not installed - cannot drive Excel. "
+                      "Install it with: pip install pywin32")
+            return 0, n
+
+        pythoncom.CoInitialize()
+        n_started = 0
+        try:
+            try:
+                app = win32.Dispatch("Excel.Application")
+            except Exception as e:
+                self.log(f"  ERROR: could not start Excel via COM: {e}")
+                return 0, n
+            app.Visible = True
+            app.DisplayAlerts = False
+            try:
+                app.AskToUpdateLinks = False
+            except Exception:
+                pass
+            try:
+                app.AutomationSecurity = 1  # msoAutomationSecurityLow - run macros without prompting
+            except Exception:
+                pass
+
+            for i, dest_folder in enumerate(group_folders):
+                idx = i + 1
+                self.log(f"\n  --- Group {idx}/{n}: {os.path.basename(dest_folder)} ---")
+                tfx_path = self._find_tfx_workbook_path(dest_folder)
+                if not tfx_path:
+                    self.log("    ERROR: No '...Load_Extraction....xls*' file found in this folder - skipping.")
+                    self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
+                    continue
+
+                try:
+                    wb = app.Workbooks.Open(tfx_path)
+                except Exception as e:
+                    self.log(f"    ERROR opening {os.path.basename(tfx_path)}: {e}")
+                    self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
+                    continue
+
+                on_action, sheet_name, shape_name = self._find_run_button_macro(wb)
+                if not on_action:
+                    self.log(f"    WARNING: no 'Run Analysis' button/macro found in "
+                              f"{os.path.basename(tfx_path)} - left open, not triggered.")
+                else:
+                    macro_part = on_action.split('!', 1)[1] if '!' in on_action else on_action
+                    qualified = f"'{wb.Name}'!{macro_part}"
+                    try:
+                        app.Run(qualified)
+                        self.log(f"    Triggered Run Analysis macro ({qualified}) on sheet '{sheet_name}'")
+                        n_started += 1
+                    except Exception as e:
+                        self.log(f"    ERROR running macro {qualified}: {e}")
+
+                self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
+
+                if idx < n:
+                    self.log("    Waiting 20s before starting the next one...")
+                    time.sleep(20)
+
+            self.log(f"\n  TF-X ANALYSES: {n_started}/{n} started (took {time.time() - t_start:.1f}s). "
+                      f"Excel windows left open so you can monitor progress.")
+            return n_started, n
+
+        finally:
+            pythoncom.CoUninitialize()
 
     # ==================== RUN (FULL PIPELINE) ====================
     def start_run(self):
@@ -3351,11 +3487,13 @@ class PostProcessingTab:
 
     def _run_pipeline(self):
         """OP2 -> H5 conversion, then (only if every H5 came out OK) Load
-        Extraction prep - one call after another, no separate button."""
+        Extraction prep, then (only if at least one group was prepared)
+        launching every TF-X workbook's Run Analysis macro - one stage
+        after another, end to end, from this one button."""
         t_start = time.time()
         try:
             self.log("\n" + "#" * 70)
-            self.log("RUN: OP2 -> H5 CONVERSION, THEN LOAD EXTRACTION PREP")
+            self.log("RUN: OP2 -> H5 CONVERSION -> LOAD EXTRACTION PREP -> TF-X ANALYSES")
             self.log("#" * 70)
 
             n_ok, n_total = self._convert_op2_to_h5()
@@ -3370,10 +3508,17 @@ class PostProcessingTab:
 
             n_done, n_groups = self._prepare_load_extraction_core()
 
+            if n_done == 0:
+                self.log("\nSTOPPED: no Load Extraction group was prepared - TF-X analyses not started.")
+                return
+
+            n_started, n_analyses = self._run_tfx_analyses_core()
+
             self.root.after(0, lambda: self.progress_var.set(100))
             self.log(f"\n{'#' * 70}")
             self.log(f"RUN COMPLETE: {n_total} H5 file(s) converted, {n_done}/{n_groups} Load "
-                      f"Extraction group(s) prepared (total {time.time() - t_start:.1f}s)")
+                      f"Extraction group(s) prepared, {n_started}/{n_analyses} TF-X analysis "
+                      f"run(s) started (total {time.time() - t_start:.1f}s)")
             self.log(f"{'#' * 70}")
 
         except Exception as e:

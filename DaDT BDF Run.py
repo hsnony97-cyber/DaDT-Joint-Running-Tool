@@ -3146,9 +3146,13 @@ class PostProcessingTab:
 
     @staticmethod
     def _find_data_sheet(wb):
-        """The worksheet whose header row contains 'Bar Element ID' - same
-        headers as the source Load_Extraction sheet, where that sheet's rows
-        get pasted."""
+        """The worksheet named 'Joint_Input' - that is where the Load_
+        Extraction sheet's rows (Bar Element ID, ...) get pasted in the
+        TF-X workbook. Falls back to searching for a sheet whose header
+        row contains 'Bar Element ID' if no 'Joint_Input' sheet exists."""
+        for ws in wb.worksheets:
+            if ws.title.strip().lower().replace(' ', '_') == 'joint_input':
+                return ws
         for ws in wb.worksheets:
             try:
                 row1 = next(ws.iter_rows(min_row=1, max_row=1))
@@ -3262,7 +3266,7 @@ class PostProcessingTab:
 
             data_ws = self._find_data_sheet(wb)
             if data_ws is None:
-                self.log(f"    WARNING: no sheet with a 'Bar Element ID' header found in "
+                self.log(f"    WARNING: no 'Joint_Input' sheet (or 'Bar Element ID' header) found in "
                           f"{os.path.basename(tfx_path)} - structure rows not written.")
             else:
                 header_map = {}

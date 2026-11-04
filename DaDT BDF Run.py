@@ -2797,12 +2797,15 @@ class BarPropertySolverTab:
 
 
 class PostProcessingTab:
-    """OP2 -> H5 batch conversion. Lists every .op2 under a chosen folder
-    (recursively, since the Understanding Structure Type tab's split/
-    parallel runs nest them under per-run subfolders), then writes a
-    Batch_Run.bat next to the chosen converter exe - one line per OP2,
+    """OP2 -> H5 batch conversion, then Load Extraction folder prep - one
+    RUN button runs both stages back to back. Lists every .op2 under a
+    chosen folder (recursively, since the Understanding Structure Type
+    tab's split/parallel runs nest them under per-run subfolders), writes
+    a Batch_Run.bat next to the chosen converter exe - one line per OP2,
     "<exe> "<op2_path>" "<h5_path>"" - and runs it exactly as if it had
-    been pasted into that folder and double-clicked by hand."""
+    been pasted into that folder and double-clicked by hand. Only once
+    every expected H5 file is confirmed on disk does it move on to
+    splitting the Load_Extraction sheet and writing the TF-X workbooks."""
 
     def __init__(self, parent_frame, root):
         self.root = root
@@ -2822,12 +2825,7 @@ class PostProcessingTab:
         self.le_split_count = tk.StringVar(value="10")
         self.le_output_folder = tk.StringVar()       # where the split LoadExtraction_NN folders are created
 
-        # Separate run-state flags: Load Extraction prep must never start
-        # while a conversion is still in flight, and must be able to tell
-        # whether a conversion finished at all before trusting the H5 folder.
-        self.is_converting = False
-        self.is_preparing_le = False
-        self.last_conversion_ok = None     # (n_ok, n_total) from the most recent _run_conversion, or None if never run
+        self.is_running = False
 
         self.setup_ui()
 
@@ -2845,7 +2843,7 @@ class PostProcessingTab:
         main = scrollable_frame
 
         ttk.Label(main, text="Post Processing", style='Header.TLabel').pack(pady=10)
-        ttk.Label(main, text="Convert OP2 results to H5 via a batch-generated converter run",
+        ttk.Label(main, text="OP2 -> H5 conversion, then Load Extraction prep - one RUN, start to finish",
                  style='Subtitle.TLabel').pack()
 
         # ---- Section 1: Input Files ----
@@ -2862,7 +2860,8 @@ class PostProcessingTab:
         )).pack(side=tk.LEFT, padx=2)
         ttk.Button(op2_frame, text="List", command=self.list_op2_files).pack(side=tk.LEFT, padx=2)
 
-        # OP2 files found (read-only listing, searched recursively)
+        # OP2 files found (read-only listing, searched recursively). This is
+        # just a preview - RUN always re-scans the folder fresh on its own.
         list_frame = ttk.Frame(f1)
         list_frame.pack(fill=tk.X, pady=2)
         ttk.Label(list_frame, text="OP2 Files Found:", width=18).pack(side=tk.LEFT, anchor=tk.N)
@@ -2905,53 +2904,39 @@ class PostProcessingTab:
             filedialog.askdirectory()
         )).pack(side=tk.LEFT)
 
-        # ---- Section 2: Actions ----
-        f2 = ttk.LabelFrame(main, text="▶  2. Actions", padding=10)
+        # ---- Section 2: Load Extraction Input Files ----
+        f2 = ttk.LabelFrame(main, text="\U0001F4C1  2. Load Extraction Input Files", padding=10)
         f2.pack(fill=tk.X, pady=5, padx=10)
 
-        btn_row = ttk.Frame(f2)
-        btn_row.pack(fill=tk.X)
-        self.btn_run = ttk.Button(btn_row, text="▶  RUN", command=self.start_run, style='Accent.TButton')
-        self.btn_run.pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_row, text="Clear Log", command=self.clear_log).pack(side=tk.LEFT, padx=5)
-
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(f2, variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(fill=tk.X, pady=5)
-
-        # ---- Section 3: Load Extraction Input Files ----
-        f4 = ttk.LabelFrame(main, text="\U0001F4C1  3. Load Extraction Input Files", padding=10)
-        f4.pack(fill=tk.X, pady=5, padx=10)
-
         # Settings Excel (reads the 'Load_Extraction' sheet)
-        le_xl_frame = ttk.Frame(f4)
+        le_xl_frame = ttk.Frame(f2)
         le_xl_frame.pack(fill=tk.X, pady=2)
         ttk.Label(le_xl_frame, text="Input Excel:", width=18).pack(side=tk.LEFT)
         ttk.Entry(le_xl_frame, textvariable=self.le_input_excel_path, width=45).pack(side=tk.LEFT, padx=5)
         ttk.Button(le_xl_frame, text="Browse", command=lambda: self.le_input_excel_path.set(
             filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
         )).pack(side=tk.LEFT)
-        le_xl_hint = ttk.Frame(f4)
+        le_xl_hint = ttk.Frame(f2)
         le_xl_hint.pack(fill=tk.X, pady=(0, 2))
         ttk.Label(le_xl_hint, text="(the settings excel with the 'Load_Extraction' sheet: Bar Element ID, "
                                     "..., Set)", font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         # Example Load Extraction template folder
-        le_ex_frame = ttk.Frame(f4)
+        le_ex_frame = ttk.Frame(f2)
         le_ex_frame.pack(fill=tk.X, pady=2)
         ttk.Label(le_ex_frame, text="Example LE Folder:", width=18).pack(side=tk.LEFT)
         ttk.Entry(le_ex_frame, textvariable=self.le_example_folder, width=45).pack(side=tk.LEFT, padx=5)
         ttk.Button(le_ex_frame, text="Browse", command=lambda: self.le_example_folder.set(
             filedialog.askdirectory()
         )).pack(side=tk.LEFT)
-        le_ex_hint = ttk.Frame(f4)
+        le_ex_hint = ttk.Frame(f2)
         le_ex_hint.pack(fill=tk.X, pady=(0, 2))
         ttk.Label(le_ex_hint, text="(template folder, e.g. Example_LE - contains Load_Ext_H5 and "
                                     "TF-X_Load_Extraction.xlsx; copied once per split)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         # Maneuver BDF
-        le_man_frame = ttk.Frame(f4)
+        le_man_frame = ttk.Frame(f2)
         le_man_frame.pack(fill=tk.X, pady=2)
         ttk.Label(le_man_frame, text="BDF (Maneuver):", width=18).pack(side=tk.LEFT)
         ttk.Entry(le_man_frame, textvariable=self.le_maneuver_bdf_path, width=45).pack(side=tk.LEFT, padx=5)
@@ -2960,7 +2945,7 @@ class PostProcessingTab:
         )).pack(side=tk.LEFT)
 
         # Thermal BDF
-        le_thm_frame = ttk.Frame(f4)
+        le_thm_frame = ttk.Frame(f2)
         le_thm_frame.pack(fill=tk.X, pady=2)
         ttk.Label(le_thm_frame, text="BDF (Thermal):", width=18).pack(side=tk.LEFT)
         ttk.Entry(le_thm_frame, textvariable=self.le_thermal_bdf_path, width=45).pack(side=tk.LEFT, padx=5)
@@ -2969,7 +2954,7 @@ class PostProcessingTab:
         )).pack(side=tk.LEFT)
 
         # Pickle file
-        le_pkl_frame = ttk.Frame(f4)
+        le_pkl_frame = ttk.Frame(f2)
         le_pkl_frame.pack(fill=tk.X, pady=2)
         ttk.Label(le_pkl_frame, text="Pickle File:", width=18).pack(side=tk.LEFT)
         ttk.Entry(le_pkl_frame, textvariable=self.le_pickle_path, width=45).pack(side=tk.LEFT, padx=5)
@@ -2978,7 +2963,7 @@ class PostProcessingTab:
         )).pack(side=tk.LEFT)
 
         # Split count
-        le_split_frame = ttk.Frame(f4)
+        le_split_frame = ttk.Frame(f2)
         le_split_frame.pack(fill=tk.X, pady=2)
         ttk.Label(le_split_frame, text="Split Into:", width=18).pack(side=tk.LEFT)
         ttk.Entry(le_split_frame, textvariable=self.le_split_count, width=10).pack(side=tk.LEFT, padx=5)
@@ -2987,7 +2972,7 @@ class PostProcessingTab:
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         # Output folder for the split LoadExtraction_NN folders
-        le_out_frame = ttk.Frame(f4)
+        le_out_frame = ttk.Frame(f2)
         le_out_frame.pack(fill=tk.X, pady=2)
         ttk.Label(le_out_frame, text="Output Folder:", width=18).pack(side=tk.LEFT)
         ttk.Entry(le_out_frame, textvariable=self.le_output_folder, width=45).pack(side=tk.LEFT, padx=5)
@@ -2995,28 +2980,29 @@ class PostProcessingTab:
             filedialog.askdirectory()
         )).pack(side=tk.LEFT)
 
-        # ---- Section 4: Load Extraction Actions ----
-        f5 = ttk.LabelFrame(main, text="▶  4. Load Extraction Actions", padding=10)
-        f5.pack(fill=tk.X, pady=5, padx=10)
+        # ---- Section 3: Actions (RUN sits at the very bottom, after every
+        # input above - both stages run back to back from this one button) ----
+        f3 = ttk.LabelFrame(main, text="▶  3. Actions", padding=10)
+        f3.pack(fill=tk.X, pady=5, padx=10)
 
-        le_btn_row = ttk.Frame(f5)
-        le_btn_row.pack(fill=tk.X)
-        self.btn_le_prepare = ttk.Button(le_btn_row, text="▶  PREPARE LOAD EXTRACTION",
-                                          command=self.start_prepare_load_extraction, style='Accent.TButton')
-        self.btn_le_prepare.pack(side=tk.LEFT, padx=5)
-        ttk.Label(le_btn_row, text="(run OP2 -> H5 conversion above first - the H5 list below "
-                                    "is read from its Output Folder)",
+        btn_row = ttk.Frame(f3)
+        btn_row.pack(fill=tk.X)
+        self.btn_run = ttk.Button(btn_row, text="▶  RUN", command=self.start_run, style='Accent.TButton')
+        self.btn_run.pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="Clear Log", command=self.clear_log).pack(side=tk.LEFT, padx=5)
+        ttk.Label(btn_row, text="(OP2 -> H5 conversion runs first; Load Extraction prep starts "
+                                 "automatically only once every H5 file is confirmed on disk)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
-        self.le_progress_var = tk.DoubleVar()
-        self.le_progress_bar = ttk.Progressbar(f5, variable=self.le_progress_var, maximum=100)
-        self.le_progress_bar.pack(fill=tk.X, pady=5)
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(f3, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, pady=5)
 
-        # ---- Section 5: Log ----
-        f3 = ttk.LabelFrame(main, text="\U0001F4DC  5. Log", padding=10)
-        f3.pack(fill=tk.BOTH, expand=True, pady=5, padx=10)
+        # ---- Section 4: Log ----
+        f4 = ttk.LabelFrame(main, text="\U0001F4DC  4. Log", padding=10)
+        f4.pack(fill=tk.BOTH, expand=True, pady=5, padx=10)
 
-        self.log_text = scrolledtext.ScrolledText(f3, height=20, width=100, font=('Consolas', 10),
+        self.log_text = scrolledtext.ScrolledText(f4, height=20, width=100, font=('Consolas', 10),
                                                     bg=_APP_COLORS['log_bg'], fg=_APP_COLORS['log_fg'],
                                                     insertbackground=_APP_COLORS['log_fg'], relief='flat',
                                                     borderwidth=0)
@@ -3032,7 +3018,30 @@ class PostProcessingTab:
         self.log_text.delete(1.0, tk.END)
 
     # ==================== OP2 LISTING ====================
+    @staticmethod
+    def _scan_op2_files(folder):
+        files = []
+        for dirpath, _, filenames in os.walk(folder):
+            for fn in filenames:
+                if fn.lower().endswith('.op2'):
+                    files.append(os.path.join(dirpath, fn))
+        files.sort()
+        return files
+
+    def _refresh_op2_listbox(self):
+        folder = self.op2_folder.get().strip()
+        self.op2_listbox.delete(0, tk.END)
+        for p in self.op2_files:
+            self.op2_listbox.insert(tk.END, os.path.relpath(p, folder) if folder else p)
+        self.op2_status.config(
+            text=f"{len(self.op2_files)} OP2 file(s) found" if self.op2_files else "No OP2 files found",
+            foreground="green" if self.op2_files else "gray"
+        )
+
     def list_op2_files(self):
+        """Manual preview only - just fills the listbox above. RUN below
+        always re-scans the OP2 Folder fresh on its own, so this is not a
+        required step before pressing RUN."""
         folder = self.op2_folder.get().strip()
         if not folder or not os.path.isdir(folder):
             messagebox.showerror("Error", "Select a valid OP2 folder")
@@ -3044,105 +3053,81 @@ class PostProcessingTab:
         self.log(f"  Searching (recursively): {folder}")
 
         t_start = time.time()
-        self.op2_files = []
-        for dirpath, _, filenames in os.walk(folder):
-            for fn in filenames:
-                if fn.lower().endswith('.op2'):
-                    self.op2_files.append(os.path.join(dirpath, fn))
-        self.op2_files.sort()
-
-        self.op2_listbox.delete(0, tk.END)
-        for p in self.op2_files:
-            self.op2_listbox.insert(tk.END, os.path.relpath(p, folder))
-
+        self.op2_files = self._scan_op2_files(folder)
+        self._refresh_op2_listbox()
         self.log(f"  Found {len(self.op2_files)} OP2 file(s) in {time.time() - t_start:.1f}s")
-        self.op2_status.config(
-            text=f"{len(self.op2_files)} OP2 file(s) found" if self.op2_files else "No OP2 files found",
-            foreground="green" if self.op2_files else "gray"
-        )
 
-    # ==================== RUN (BAT GENERATION + EXECUTION) ====================
-    def start_run(self):
-        if not self.op2_files:
-            messagebox.showerror("Error", "List OP2 files first")
-            return
-        exe_path = self.converter_exe_path.get().strip()
-        if not exe_path or not os.path.exists(exe_path):
-            messagebox.showerror("Error", "Select a valid Converter Exe")
-            return
-        if not self.output_folder.get().strip():
-            messagebox.showerror("Error", "Select an Output Folder")
-            return
-
-        self.is_converting = True
-        self.btn_run.config(state=tk.DISABLED)
-        threading.Thread(target=self._run_conversion, daemon=True).start()
-
-    def _run_conversion(self):
+    # ==================== OP2 -> H5 CONVERSION ====================
+    def _convert_op2_to_h5(self):
+        """Scan OP2 Folder fresh, write Batch_Run.bat, run it, and verify
+        every expected H5 file is on disk. Returns (n_ok, n_total)."""
         t_start = time.time()
-        try:
-            exe_path = self.converter_exe_path.get().strip()
-            exe_dir = os.path.dirname(exe_path) or None
-            exe_name = os.path.basename(exe_path)
-            out_dir = self.output_folder.get().strip()
-            os.makedirs(out_dir, exist_ok=True)
+        folder = self.op2_folder.get().strip()
 
-            self.log("\n" + "=" * 70)
-            self.log("OP2 -> H5 BATCH CONVERSION")
-            self.log("=" * 70)
-            self.log(f"  OP2 files: {len(self.op2_files)}")
-            self.log(f"  Converter: {exe_path}")
-            self.log(f"  Output folder: {out_dir}")
+        self.log("\n" + "=" * 70)
+        self.log("LISTING OP2 FILES")
+        self.log("=" * 70)
+        self.log(f"  Searching (recursively): {folder}")
+        self.op2_files = self._scan_op2_files(folder)
+        self.root.after(0, self._refresh_op2_listbox)
+        self.log(f"  Found {len(self.op2_files)} OP2 file(s) in {time.time() - t_start:.1f}s")
 
-            # One line per OP2: "<exe_name>" "<op2_path>" "<h5_path>" - written
-            # into the exe's own folder and run from there (cwd=exe_dir), so
-            # referencing the exe by its bare name resolves exactly the way it
-            # does when this bat file is pasted there and run by hand.
-            bat_folder = exe_dir or os.getcwd()
-            bat_path = os.path.join(bat_folder, "Batch_Run.bat")
-            expected_h5 = []
-            lines = []
-            for op2_path in self.op2_files:
-                base = os.path.splitext(os.path.basename(op2_path))[0]
-                h5_path = os.path.join(out_dir, base + ".h5")
-                lines.append(f'{exe_name} "{op2_path}" "{h5_path}"')
-                expected_h5.append(h5_path)
+        if not self.op2_files:
+            self.log("  No OP2 files found - nothing to convert.")
+            return 0, 0
 
-            with open(bat_path, 'w', encoding='latin-1') as f:
-                f.write('\n'.join(lines) + '\n')
-            self.log(f"  Batch file written: {bat_path}")
+        exe_path = self.converter_exe_path.get().strip()
+        exe_dir = os.path.dirname(exe_path) or None
+        exe_name = os.path.basename(exe_path)
+        out_dir = self.output_folder.get().strip()
+        os.makedirs(out_dir, exist_ok=True)
 
-            self.root.after(0, lambda: self.progress_var.set(10))
-            self.log(f"\n  Running batch ({len(lines)} conversion(s))...")
-            result = subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, capture_output=True, text=True)
-            self.root.after(0, lambda: self.progress_var.set(90))
+        self.log("\n" + "=" * 70)
+        self.log("OP2 -> H5 BATCH CONVERSION")
+        self.log("=" * 70)
+        self.log(f"  OP2 files: {len(self.op2_files)}")
+        self.log(f"  Converter: {exe_path}")
+        self.log(f"  Output folder: {out_dir}")
 
-            if result.returncode != 0:
-                self.log(f"  WARNING: batch exited with code {result.returncode}")
-            if result.stdout:
-                self.log(f"  stdout: {result.stdout.strip()[:2000]}")
-            if result.stderr:
-                self.log(f"  stderr: {result.stderr.strip()[:2000]}")
+        # One line per OP2: "<exe_name>" "<op2_path>" "<h5_path>" - written
+        # into the exe's own folder and run from there (cwd=exe_dir), so
+        # referencing the exe by its bare name resolves exactly the way it
+        # does when this bat file is pasted there and run by hand.
+        bat_folder = exe_dir or os.getcwd()
+        bat_path = os.path.join(bat_folder, "Batch_Run.bat")
+        expected_h5 = []
+        lines = []
+        for op2_path in self.op2_files:
+            base = os.path.splitext(os.path.basename(op2_path))[0]
+            h5_path = os.path.join(out_dir, base + ".h5")
+            lines.append(f'{exe_name} "{op2_path}" "{h5_path}"')
+            expected_h5.append(h5_path)
 
-            n_ok = sum(1 for p in expected_h5 if os.path.exists(p))
-            self.last_conversion_ok = (n_ok, len(expected_h5))
-            self.log(f"\n  {n_ok}/{len(expected_h5)} H5 file(s) produced (took {time.time() - t_start:.1f}s)")
-            if n_ok < len(expected_h5):
-                missing = [os.path.basename(p) for p in expected_h5 if not os.path.exists(p)]
-                shown = ', '.join(missing[:20]) + (" ..." if len(missing) > 20 else "")
-                self.log(f"  Missing: {shown}")
+        with open(bat_path, 'w', encoding='latin-1') as f:
+            f.write('\n'.join(lines) + '\n')
+        self.log(f"  Batch file written: {bat_path}")
 
-            self.root.after(0, lambda: self.progress_var.set(100))
-            self.log("\nCONVERSION COMPLETE")
+        self.root.after(0, lambda: self.progress_var.set(5))
+        self.log(f"\n  Running batch ({len(lines)} conversion(s))...")
+        result = subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, capture_output=True, text=True)
+        self.root.after(0, lambda: self.progress_var.set(45))
 
-        except Exception as e:
-            self.log(f"\nERROR after {time.time() - t_start:.1f}s: {e}")
-            import traceback
-            self.log(traceback.format_exc())
+        if result.returncode != 0:
+            self.log(f"  WARNING: batch exited with code {result.returncode}")
+        if result.stdout:
+            self.log(f"  stdout: {result.stdout.strip()[:2000]}")
+        if result.stderr:
+            self.log(f"  stderr: {result.stderr.strip()[:2000]}")
 
-        finally:
-            self.is_converting = False
-            self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
+        n_ok = sum(1 for p in expected_h5 if os.path.exists(p))
+        self.log(f"\n  {n_ok}/{len(expected_h5)} H5 file(s) produced (took {time.time() - t_start:.1f}s)")
+        if n_ok < len(expected_h5):
+            missing = [os.path.basename(p) for p in expected_h5 if not os.path.exists(p)]
+            shown = ', '.join(missing[:20]) + (" ..." if len(missing) > 20 else "")
+            self.log(f"  Missing: {shown}")
+
+        self.root.after(0, lambda: self.progress_var.set(50))
+        return n_ok, len(expected_h5)
 
     # ==================== LOAD EXTRACTION PREP ====================
     @staticmethod
@@ -3186,11 +3171,158 @@ class PostProcessingTab:
                         return ws
         return None
 
-    def start_prepare_load_extraction(self):
-        if self.is_converting:
-            messagebox.showerror("Error", "OP2 -> H5 conversion is still running - "
-                                           "wait for it to finish before preparing Load Extraction")
+    def _prepare_load_extraction_core(self):
+        """Split the Load_Extraction sheet and write every TF-X workbook.
+        Assumes validation already happened in start_run() and that the H5
+        Output Folder is now complete (only called after a fully-successful
+        _convert_op2_to_h5()). Returns (n_done, n_total_groups)."""
+        t_start = time.time()
+        input_excel = self.le_input_excel_path.get().strip()
+        example_folder = self.le_example_folder.get().strip()
+        out_base = self.le_output_folder.get().strip()
+        n = int(float(self.le_split_count.get()))
+        os.makedirs(out_base, exist_ok=True)
+
+        self.log("\n" + "=" * 70)
+        self.log("PREPARING LOAD EXTRACTION")
+        self.log("=" * 70)
+
+        # ---- 1. Read the 'Load_Extraction' sheet ----
+        xl = pd.ExcelFile(input_excel)
+        le_sheet = None
+        for sheet in xl.sheet_names:
+            sl = sheet.lower().replace('_', '').replace(' ', '')
+            if 'load' in sl and 'extraction' in sl:
+                le_sheet = sheet
+                break
+        if not le_sheet:
+            self.log("  ERROR: No 'Load_Extraction' sheet found in the Input Excel.")
+            return 0, n
+
+        df = pd.read_excel(xl, sheet_name=le_sheet)
+        self.log(f"  Read '{le_sheet}': {len(df)} rows, columns: {list(df.columns)}")
+
+        set_col = next((c for c in df.columns if str(c).strip().lower() == 'set'), None)
+        if not set_col:
+            self.log("  ERROR: No 'Set' column found in the Load_Extraction sheet.")
+            return 0, n
+
+        # ---- 2. Group by Set (first-seen order), split into n chunks ----
+        unique_sets = list(dict.fromkeys(df[set_col].tolist()))
+        set_chunks = self._chunk_list(unique_sets, n)
+        self.log(f"  {len(unique_sets)} unique Set(s) -> split into {n} group(s)")
+        empty_chunks = sum(1 for c in set_chunks if not c)
+        if empty_chunks:
+            self.log(f"  NOTE: {empty_chunks} group(s) have no Sets (fewer unique Sets than the split count)")
+
+        # ---- 3. H5 files from the OP2->H5 conversion's own Output Folder ----
+        h5_folder = self.output_folder.get().strip()
+        h5_files = []
+        if h5_folder and os.path.isdir(h5_folder):
+            for dirpath, _, filenames in os.walk(h5_folder):
+                for fn in filenames:
+                    if fn.lower().endswith('.h5'):
+                        h5_files.append(os.path.join(dirpath, fn))
+            h5_files.sort()
+        self.log(f"  H5 files found under Output Folder ({h5_folder or 'not set'}): {len(h5_files)}")
+
+        man_bdf = self.le_maneuver_bdf_path.get().strip()
+        thm_bdf = self.le_thermal_bdf_path.get().strip()
+        pickle_path = self.le_pickle_path.get().strip()
+
+        # ---- 4. One split folder per chunk ----
+        n_done = 0
+        for i, chunk_sets in enumerate(set_chunks):
+            idx = i + 1
+            self.log(f"\n  --- Group {idx}/{n}: {len(chunk_sets)} Set(s) ---")
+            dest_folder = os.path.join(out_base, f"LoadExtraction_{idx:02d}")
+            shutil.copytree(example_folder, dest_folder, dirs_exist_ok=True)
+            self.log(f"    Template copied to: {dest_folder}")
+
+            tfx_path = None
+            for dirpath, _, filenames in os.walk(dest_folder):
+                for fn in filenames:
+                    fnl = fn.lower()
+                    if 'load_extraction' in fnl.replace(' ', '_') and fnl.endswith(('.xlsx', '.xlsm', '.xls', '.xlsb')):
+                        tfx_path = os.path.join(dirpath, fn)
+                        break
+                if tfx_path:
+                    break
+
+            if not tfx_path:
+                self.log("    ERROR: No '...Load_Extraction....xls*' file found in the copied template - skipping.")
+                continue
+            if tfx_path.lower().endswith('.xlsb'):
+                self.log(f"    ERROR: {os.path.basename(tfx_path)} is a binary .xlsb workbook - "
+                          f"openpyxl can't edit it. Skipping.")
+                continue
+
+            keep_vba = tfx_path.lower().endswith(('.xlsm', '.xltm', '.xlam'))
+            wb = openpyxl.load_workbook(tfx_path, keep_vba=keep_vba)
+
+            data_ws = self._find_data_sheet(wb)
+            if data_ws is None:
+                self.log(f"    WARNING: no sheet with a 'Bar Element ID' header found in "
+                          f"{os.path.basename(tfx_path)} - structure rows not written.")
+            else:
+                header_map = {}
+                for cell in next(data_ws.iter_rows(min_row=1, max_row=1)):
+                    if cell.value:
+                        header_map[str(cell.value).strip().lower()] = cell.column
+
+                subset_df = df[df[set_col].isin(chunk_sets)]
+
+                # Clear stale example rows under the header before pasting
+                for col_idx in header_map.values():
+                    for r in range(2, 2002):
+                        data_ws.cell(row=r, column=col_idx).value = None
+
+                for r_off, (_, row) in enumerate(subset_df.iterrows()):
+                    r = r_off + 2
+                    for col_name in subset_df.columns:
+                        col_idx = header_map.get(str(col_name).strip().lower())
+                        if col_idx:
+                            val = row[col_name]
+                            data_ws.cell(row=r, column=col_idx).value = None if pd.isna(val) else val
+                self.log(f"    Wrote {len(subset_df)} row(s) into '{data_ws.title}'")
+
+            control_ws = self._find_control_sheet(wb, "BDF File for Sprung System")
+            if control_ws is None:
+                self.log(f"    WARNING: no control sheet (with 'BDF File for Sprung System') found in "
+                          f"{os.path.basename(tfx_path)} - C9/C10/C11/C17+ not written.")
+            else:
+                control_ws['C9'] = man_bdf
+                control_ws['C10'] = thm_bdf
+                control_ws['C11'] = pickle_path
+                for r in range(17, 2017):
+                    control_ws.cell(row=r, column=3).value = None
+                for r_off, p in enumerate(h5_files):
+                    control_ws.cell(row=17 + r_off, column=3).value = p
+                self.log(f"    Wrote C9/C10/C11 (maneuver/thermal/pickle) and {len(h5_files)} "
+                          f"H5 path(s) from C17 into '{control_ws.title}'")
+
+            wb.save(tfx_path)
+            n_done += 1
+            self.root.after(0, lambda p=50 + (idx / n) * 50: self.progress_var.set(p))
+
+        self.log(f"\n  LOAD EXTRACTION PREP: {n_done}/{n} group(s) (took {time.time() - t_start:.1f}s)")
+        return n_done, n
+
+    # ==================== RUN (FULL PIPELINE) ====================
+    def start_run(self):
+        # OP2 -> H5 inputs
+        if not self.op2_folder.get().strip() or not os.path.isdir(self.op2_folder.get().strip()):
+            messagebox.showerror("Error", "Select a valid OP2 Folder")
             return
+        exe_path = self.converter_exe_path.get().strip()
+        if not exe_path or not os.path.exists(exe_path):
+            messagebox.showerror("Error", "Select a valid Converter Exe")
+            return
+        if not self.output_folder.get().strip():
+            messagebox.showerror("Error", "Select an Output Folder (H5)")
+            return
+
+        # Load Extraction inputs
         if not self.le_input_excel_path.get().strip() or not os.path.exists(self.le_input_excel_path.get().strip()):
             messagebox.showerror("Error", "Select a valid Input Excel")
             return
@@ -3208,173 +3340,37 @@ class PostProcessingTab:
             messagebox.showerror("Error", "Split Into must be a positive number")
             return
 
-        # Make sure the H5 conversion has actually finished before trusting its
-        # output - a live count on disk, not just a flag, so this still works
-        # correctly even if conversion ran in an earlier session of the app.
-        h5_folder = self.output_folder.get().strip()
-        h5_count = 0
-        if h5_folder and os.path.isdir(h5_folder):
-            for _, _, filenames in os.walk(h5_folder):
-                h5_count += sum(1 for fn in filenames if fn.lower().endswith('.h5'))
+        self.is_running = True
+        self.btn_run.config(state=tk.DISABLED)
+        self.root.after(0, lambda: self.progress_var.set(0))
+        threading.Thread(target=self._run_pipeline, daemon=True).start()
 
-        if self.op2_files:
-            if h5_count < len(self.op2_files):
-                messagebox.showerror(
-                    "Error",
-                    f"H5 conversion looks incomplete: only {h5_count}/{len(self.op2_files)} H5 file(s) "
-                    f"found in Output Folder. Run OP2 -> H5 conversion (Section 1/2) and make sure it "
-                    f"finishes before preparing Load Extraction."
-                )
-                return
-        elif h5_count == 0:
-            messagebox.showerror(
-                "Error",
-                "No H5 files found in Output Folder yet. List OP2 files and run the OP2 -> H5 "
-                "conversion (Section 1/2) first."
-            )
-            return
-
-        self.is_preparing_le = True
-        self.btn_le_prepare.config(state=tk.DISABLED)
-        threading.Thread(target=self._prepare_load_extraction, daemon=True).start()
-
-    def _prepare_load_extraction(self):
+    def _run_pipeline(self):
+        """OP2 -> H5 conversion, then (only if every H5 came out OK) Load
+        Extraction prep - one call after another, no separate button."""
         t_start = time.time()
         try:
-            input_excel = self.le_input_excel_path.get().strip()
-            example_folder = self.le_example_folder.get().strip()
-            out_base = self.le_output_folder.get().strip()
-            n = int(float(self.le_split_count.get()))
-            os.makedirs(out_base, exist_ok=True)
+            self.log("\n" + "#" * 70)
+            self.log("RUN: OP2 -> H5 CONVERSION, THEN LOAD EXTRACTION PREP")
+            self.log("#" * 70)
 
-            self.log("\n" + "=" * 70)
-            self.log("PREPARING LOAD EXTRACTION")
-            self.log("=" * 70)
+            n_ok, n_total = self._convert_op2_to_h5()
 
-            # ---- 1. Read the 'Load_Extraction' sheet ----
-            xl = pd.ExcelFile(input_excel)
-            le_sheet = None
-            for sheet in xl.sheet_names:
-                sl = sheet.lower().replace('_', '').replace(' ', '')
-                if 'load' in sl and 'extraction' in sl:
-                    le_sheet = sheet
-                    break
-            if not le_sheet:
-                self.log("  ERROR: No 'Load_Extraction' sheet found in the Input Excel.")
+            if n_total == 0:
+                self.log("\nSTOPPED: no OP2 files were converted - Load Extraction prep not started.")
+                return
+            if n_ok < n_total:
+                self.log(f"\nSTOPPED: only {n_ok}/{n_total} H5 file(s) were produced - Load "
+                          f"Extraction prep not started. Fix the issue above, then press RUN again.")
                 return
 
-            df = pd.read_excel(xl, sheet_name=le_sheet)
-            self.log(f"  Read '{le_sheet}': {len(df)} rows, columns: {list(df.columns)}")
+            n_done, n_groups = self._prepare_load_extraction_core()
 
-            set_col = next((c for c in df.columns if str(c).strip().lower() == 'set'), None)
-            if not set_col:
-                self.log("  ERROR: No 'Set' column found in the Load_Extraction sheet.")
-                return
-
-            # ---- 2. Group by Set (first-seen order), split into n chunks ----
-            unique_sets = list(dict.fromkeys(df[set_col].tolist()))
-            set_chunks = self._chunk_list(unique_sets, n)
-            self.log(f"  {len(unique_sets)} unique Set(s) -> split into {n} group(s)")
-            empty_chunks = sum(1 for c in set_chunks if not c)
-            if empty_chunks:
-                self.log(f"  NOTE: {empty_chunks} group(s) have no Sets (fewer unique Sets than the split count)")
-
-            # ---- 3. H5 files from the OP2->H5 conversion's own Output Folder ----
-            h5_folder = self.output_folder.get().strip()
-            h5_files = []
-            if h5_folder and os.path.isdir(h5_folder):
-                for dirpath, _, filenames in os.walk(h5_folder):
-                    for fn in filenames:
-                        if fn.lower().endswith('.h5'):
-                            h5_files.append(os.path.join(dirpath, fn))
-                h5_files.sort()
-            self.log(f"  H5 files found under Output Folder ({h5_folder or 'not set'}): {len(h5_files)}")
-            if not h5_files:
-                self.log("  WARNING: no H5 files found - run OP2 -> H5 conversion first (Section 1/2 above).")
-
-            man_bdf = self.le_maneuver_bdf_path.get().strip()
-            thm_bdf = self.le_thermal_bdf_path.get().strip()
-            pickle_path = self.le_pickle_path.get().strip()
-
-            # ---- 4. One split folder per chunk ----
-            n_done = 0
-            for i, chunk_sets in enumerate(set_chunks):
-                idx = i + 1
-                self.log(f"\n  --- Group {idx}/{n}: {len(chunk_sets)} Set(s) ---")
-                dest_folder = os.path.join(out_base, f"LoadExtraction_{idx:02d}")
-                shutil.copytree(example_folder, dest_folder, dirs_exist_ok=True)
-                self.log(f"    Template copied to: {dest_folder}")
-
-                tfx_path = None
-                for dirpath, _, filenames in os.walk(dest_folder):
-                    for fn in filenames:
-                        fnl = fn.lower()
-                        if 'load_extraction' in fnl.replace(' ', '_') and fnl.endswith(('.xlsx', '.xlsm', '.xls', '.xlsb')):
-                            tfx_path = os.path.join(dirpath, fn)
-                            break
-                    if tfx_path:
-                        break
-
-                if not tfx_path:
-                    self.log("    ERROR: No '...Load_Extraction....xls*' file found in the copied template - skipping.")
-                    continue
-                if tfx_path.lower().endswith('.xlsb'):
-                    self.log(f"    ERROR: {os.path.basename(tfx_path)} is a binary .xlsb workbook - "
-                              f"openpyxl can't edit it. Skipping.")
-                    continue
-
-                keep_vba = tfx_path.lower().endswith(('.xlsm', '.xltm', '.xlam'))
-                wb = openpyxl.load_workbook(tfx_path, keep_vba=keep_vba)
-
-                data_ws = self._find_data_sheet(wb)
-                if data_ws is None:
-                    self.log(f"    WARNING: no sheet with a 'Bar Element ID' header found in "
-                              f"{os.path.basename(tfx_path)} - structure rows not written.")
-                else:
-                    header_map = {}
-                    for cell in next(data_ws.iter_rows(min_row=1, max_row=1)):
-                        if cell.value:
-                            header_map[str(cell.value).strip().lower()] = cell.column
-
-                    subset_df = df[df[set_col].isin(chunk_sets)]
-
-                    # Clear stale example rows under the header before pasting
-                    for col_idx in header_map.values():
-                        for r in range(2, 2002):
-                            data_ws.cell(row=r, column=col_idx).value = None
-
-                    for r_off, (_, row) in enumerate(subset_df.iterrows()):
-                        r = r_off + 2
-                        for col_name in subset_df.columns:
-                            col_idx = header_map.get(str(col_name).strip().lower())
-                            if col_idx:
-                                val = row[col_name]
-                                data_ws.cell(row=r, column=col_idx).value = None if pd.isna(val) else val
-                    self.log(f"    Wrote {len(subset_df)} row(s) into '{data_ws.title}'")
-
-                control_ws = self._find_control_sheet(wb, "BDF File for Sprung System")
-                if control_ws is None:
-                    self.log(f"    WARNING: no control sheet (with 'BDF File for Sprung System') found in "
-                              f"{os.path.basename(tfx_path)} - C9/C10/C11/C17+ not written.")
-                else:
-                    control_ws['C9'] = man_bdf
-                    control_ws['C10'] = thm_bdf
-                    control_ws['C11'] = pickle_path
-                    for r in range(17, 2017):
-                        control_ws.cell(row=r, column=3).value = None
-                    for r_off, p in enumerate(h5_files):
-                        control_ws.cell(row=17 + r_off, column=3).value = p
-                    self.log(f"    Wrote C9/C10/C11 (maneuver/thermal/pickle) and {len(h5_files)} "
-                              f"H5 path(s) from C17 into '{control_ws.title}'")
-
-                wb.save(tfx_path)
-                n_done += 1
-                self.root.after(0, lambda p=(idx / n) * 100: self.le_progress_var.set(p))
-
-            self.log(f"\n{'=' * 70}")
-            self.log(f"LOAD EXTRACTION PREP COMPLETE: {n_done}/{n} group(s) "
-                      f"(took {time.time() - t_start:.1f}s)")
-            self.log(f"{'=' * 70}")
+            self.root.after(0, lambda: self.progress_var.set(100))
+            self.log(f"\n{'#' * 70}")
+            self.log(f"RUN COMPLETE: {n_total} H5 file(s) converted, {n_done}/{n_groups} Load "
+                      f"Extraction group(s) prepared (total {time.time() - t_start:.1f}s)")
+            self.log(f"{'#' * 70}")
 
         except Exception as e:
             self.log(f"\nERROR after {time.time() - t_start:.1f}s: {e}")
@@ -3382,8 +3378,8 @@ class PostProcessingTab:
             self.log(traceback.format_exc())
 
         finally:
-            self.is_preparing_le = False
-            self.root.after(0, lambda: self.btn_le_prepare.config(state=tk.NORMAL))
+            self.is_running = False
+            self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
 
 
 def main():

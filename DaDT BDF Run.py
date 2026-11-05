@@ -150,6 +150,10 @@ class IntegratedBDFRFTool:
         self.notebook.add(self.tab4, text="\U0001F4E6  Post Processing")
         self.tab4_tool = PostProcessingTab(self.tab4, self.root)
 
+        self.tab5 = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab5, text="\U0001F517  Joint Run")
+        self.tab5_tool = JointRunTab(self.tab5, self.root)
+
 
     def setup_tab1(self):
         main = ttk.Frame(self.tab1, padding="10")
@@ -3501,6 +3505,621 @@ class PostProcessingTab:
             self.log(f"RUN COMPLETE: {n_total} H5 file(s) converted, {n_done}/{n_groups} Load "
                       f"Extraction group(s) prepared, {n_started}/{n_analyses} TF-X analysis "
                       f"run(s) launched (total {time.time() - t_start:.1f}s)")
+            self.log(f"{'#' * 70}")
+
+        except Exception as e:
+            self.log(f"\nERROR after {time.time() - t_start:.1f}s: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
+
+
+class JointRunTab:
+    """Joint Run: groups every Joint_Loads_<SetName>.h5 into its own Set
+    folder, copies the Example Joint Input Excel template into each one
+    (renamed to <SetName>.<ext>) and fills its 'Spectrum Joint Input' sheet
+    from the Main Input Excel's DTCG_Input_Excel_Data rows whose Structure
+    Name matches that Set. Then runs the RSS Case Finding exe in every Set
+    folder (it finds the H5 on its own, cwd'd into that folder), and once
+    every run has finished, reads the Cap/Skin Joint Loads CSVs it produced
+    and writes the matching Bar Element ID rows into each workbook's own
+    'Limit Stress Check' sheet."""
+
+    def __init__(self, parent_frame, root):
+        self.root = root
+        self.parent_frame = parent_frame
+
+        self.h5_folder = tk.StringVar()
+        self.main_input_excel_path = tk.StringVar()
+        self.example_joint_excel_path = tk.StringVar()
+        self.rss_exe_path = tk.StringVar()
+        self.joint_run_exe_path = tk.StringVar()   # selected now; not used by this stage yet
+        self.output_folder = tk.StringVar()
+        self.max_parallel_runs = tk.StringVar(value="4")
+        self.h5_files = []
+
+        self.is_running = False
+
+        self.setup_ui()
+
+    # ==================== GUI ====================
+    def setup_ui(self):
+        canvas = tk.Canvas(self.parent_frame)
+        scrollbar = ttk.Scrollbar(self.parent_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        main = scrollable_frame
+
+        ttk.Label(main, text="Joint Run", style='Header.TLabel').pack(pady=10)
+        ttk.Label(main, text="Group Joint Loads H5s by Set, fill each Joint Input Excel, run RSS "
+                              "Case Finding, then write Limit Stress Check",
+                 style='Subtitle.TLabel').pack()
+
+        # ---- Section 1: Input Files ----
+        f1 = ttk.LabelFrame(main, text="\U0001F4C1  1. Input Files", padding=10)
+        f1.pack(fill=tk.X, pady=5, padx=10)
+
+        # Joint Load H5 Folder
+        h5_frame = ttk.Frame(f1)
+        h5_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(h5_frame, text="Joint Load H5 Folder:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(h5_frame, textvariable=self.h5_folder, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(h5_frame, text="Browse", command=lambda: self.h5_folder.set(
+            filedialog.askdirectory()
+        )).pack(side=tk.LEFT, padx=2)
+        ttk.Button(h5_frame, text="List", command=self.list_joint_h5_files).pack(side=tk.LEFT, padx=2)
+
+        list_frame = ttk.Frame(f1)
+        list_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(list_frame, text="H5 Files Found:", width=20).pack(side=tk.LEFT, anchor=tk.N)
+        h5_list_frame = ttk.Frame(list_frame)
+        h5_list_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.h5_listbox = tk.Listbox(h5_list_frame, height=8, width=70, selectmode=tk.EXTENDED,
+                                      font=('Consolas', 9), bg=_APP_COLORS['surface'], fg=_APP_COLORS['text'],
+                                      selectbackground=_APP_COLORS['primary'], selectforeground='white',
+                                      relief='flat', highlightthickness=1,
+                                      highlightbackground=_APP_COLORS['border'],
+                                      highlightcolor=_APP_COLORS['primary'])
+        self.h5_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        h5_scroll = ttk.Scrollbar(h5_list_frame, orient="vertical", command=self.h5_listbox.yview)
+        h5_scroll.pack(side=tk.LEFT, fill=tk.Y)
+        self.h5_listbox.configure(yscrollcommand=h5_scroll.set)
+
+        self.h5_status = ttk.Label(f1, text="No H5 files listed", foreground="gray")
+        self.h5_status.pack(anchor=tk.W)
+        ttk.Label(f1, text="(Joint_Loads_<SetName>.h5 - every match is processed; this list is just "
+                            "a preview, RUN always re-scans)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+
+        # Main Input Excel
+        main_xl_frame = ttk.Frame(f1)
+        main_xl_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(main_xl_frame, text="Main Input Excel:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(main_xl_frame, textvariable=self.main_input_excel_path, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(main_xl_frame, text="Browse", command=lambda: self.main_input_excel_path.set(
+            filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
+        )).pack(side=tk.LEFT)
+        ttk.Label(f1, text="(the 'DTCG_Input_Excel_Data' sheet - filtered by 'Structure Name' per Set)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+
+        # Example Joint Input Excel
+        ex_xl_frame = ttk.Frame(f1)
+        ex_xl_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(ex_xl_frame, text="Example Joint Input Excel:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(ex_xl_frame, textvariable=self.example_joint_excel_path, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(ex_xl_frame, text="Browse", command=lambda: self.example_joint_excel_path.set(
+            filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
+        )).pack(side=tk.LEFT)
+        ttk.Label(f1, text="(template with 'Spectrum Joint Input' and 'Limit Stress Check' sheets - "
+                            "copied into every Set folder, renamed to <SetName>)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+
+        # RSS Case Finding Exe
+        rss_frame = ttk.Frame(f1)
+        rss_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(rss_frame, text="RSS Case Finding Exe:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(rss_frame, textvariable=self.rss_exe_path, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(rss_frame, text="Browse", command=lambda: self.rss_exe_path.set(
+            filedialog.askopenfilename(filetypes=[("Executable", "*.exe"), ("All", "*.*")])
+        )).pack(side=tk.LEFT)
+        ttk.Label(f1, text="(run with no arguments, cwd'd into each Set folder - it finds the H5 "
+                            "there on its own and writes the Cap/Skin Joint Loads CSVs)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+
+        # Joint Run Exe (selected now; not used by this stage yet)
+        jr_frame = ttk.Frame(f1)
+        jr_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(jr_frame, text="Joint Run Exe:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(jr_frame, textvariable=self.joint_run_exe_path, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(jr_frame, text="Browse", command=lambda: self.joint_run_exe_path.set(
+            filedialog.askopenfilename(filetypes=[("Executable", "*.exe"), ("All", "*.*")])
+        )).pack(side=tk.LEFT)
+        ttk.Label(f1, text="(selected now for the next stage - not used by RUN yet)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+
+        # Output Folder
+        out_frame = ttk.Frame(f1)
+        out_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(out_frame, text="Output Folder:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(out_frame, textvariable=self.output_folder, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(out_frame, text="Browse", command=lambda: self.output_folder.set(
+            filedialog.askdirectory()
+        )).pack(side=tk.LEFT)
+        ttk.Label(f1, text="(every Set gets its own <Output Folder>/<SetName> folder)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+
+        # Max Parallel Runs
+        par_frame = ttk.Frame(f1)
+        par_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(par_frame, text="Max Parallel Runs:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(par_frame, textvariable=self.max_parallel_runs, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(par_frame, text="(how many RSS Case Finding runs execute at the same time)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        # ---- Section 2: Actions (RUN sits at the very bottom) ----
+        f2 = ttk.LabelFrame(main, text="▶  2. Actions", padding=10)
+        f2.pack(fill=tk.X, pady=5, padx=10)
+
+        btn_row = ttk.Frame(f2)
+        btn_row.pack(fill=tk.X)
+        self.btn_run = ttk.Button(btn_row, text="▶  RUN", command=self.start_run, style='Accent.TButton')
+        self.btn_run.pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="Clear Log", command=self.clear_log).pack(side=tk.LEFT, padx=5)
+        ttk.Label(btn_row, text="(1. Group H5s + fill Spectrum Joint Input  2. Run RSS Case Finding "
+                                 "(parallel, waits for all)  3. Write Limit Stress Check from the CSVs)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(f2, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, pady=5)
+
+        # ---- Section 3: Log ----
+        f3 = ttk.LabelFrame(main, text="\U0001F4DC  3. Log", padding=10)
+        f3.pack(fill=tk.BOTH, expand=True, pady=5, padx=10)
+
+        self.log_text = scrolledtext.ScrolledText(f3, height=20, width=100, font=('Consolas', 10),
+                                                    bg=_APP_COLORS['log_bg'], fg=_APP_COLORS['log_fg'],
+                                                    insertbackground=_APP_COLORS['log_fg'], relief='flat',
+                                                    borderwidth=0)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def log(self, msg):
+        def _do():
+            self.log_text.insert(tk.END, msg + "\n")
+            self.log_text.see(tk.END)
+        self.root.after(0, _do)
+
+    def clear_log(self):
+        self.log_text.delete(1.0, tk.END)
+
+    # ==================== H5 LISTING ====================
+    @staticmethod
+    def _scan_joint_h5_files(folder):
+        files = []
+        for dirpath, _, filenames in os.walk(folder):
+            for fn in filenames:
+                fnl = fn.lower()
+                if fnl.startswith('joint_loads_') and fnl.endswith('.h5'):
+                    files.append(os.path.join(dirpath, fn))
+        files.sort()
+        return files
+
+    @staticmethod
+    def _set_name_from_h5(h5_path):
+        base = os.path.splitext(os.path.basename(h5_path))[0]
+        return base[len('Joint_Loads_'):] if base.lower().startswith('joint_loads_') else base
+
+    def _refresh_h5_listbox(self):
+        folder = self.h5_folder.get().strip()
+        self.h5_listbox.delete(0, tk.END)
+        for p in self.h5_files:
+            self.h5_listbox.insert(tk.END, os.path.relpath(p, folder) if folder else p)
+        self.h5_status.config(
+            text=f"{len(self.h5_files)} H5 file(s) found" if self.h5_files else "No H5 files found",
+            foreground="green" if self.h5_files else "gray"
+        )
+
+    def list_joint_h5_files(self):
+        """Manual preview only - RUN below always re-scans fresh."""
+        folder = self.h5_folder.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Error", "Select a valid Joint Load H5 Folder")
+            return
+        self.log("\n" + "=" * 70)
+        self.log("LISTING JOINT LOAD H5 FILES")
+        self.log("=" * 70)
+        self.h5_files = self._scan_joint_h5_files(folder)
+        self._refresh_h5_listbox()
+        self.log(f"  Found {len(self.h5_files)} Joint_Loads_*.h5 file(s)")
+
+    # ==================== SHARED HELPERS ====================
+    @staticmethod
+    def _normalize_header(h):
+        return str(h).strip().lower().replace(' ', '').replace('_', '')
+
+    @staticmethod
+    def _find_sheet_by_name(wb, normalized_target):
+        for ws in wb.worksheets:
+            if JointRunTab._normalize_header(ws.title) == normalized_target:
+                return ws
+        return None
+
+    def _find_joint_set_folders(self):
+        """Every immediate subfolder of Output Folder that contains at
+        least one .h5 file - i.e. every Set folder this tab created."""
+        base = self.output_folder.get().strip()
+        if not base or not os.path.isdir(base):
+            return []
+        folders = []
+        for name in os.listdir(base):
+            full = os.path.join(base, name)
+            if os.path.isdir(full) and any(fn.lower().endswith('.h5') for fn in os.listdir(full)):
+                folders.append(full)
+        folders.sort(key=lambda p: os.path.basename(p).lower())
+        return folders
+
+    @staticmethod
+    def _find_joint_input_workbook_path(dest_folder, set_name):
+        """The '<SetName>.xls*' workbook inside a Set folder, or None."""
+        set_name_l = set_name.strip().lower()
+        for fn in os.listdir(dest_folder):
+            full = os.path.join(dest_folder, fn)
+            if not os.path.isfile(full):
+                continue
+            base, ext = os.path.splitext(fn)
+            if base.strip().lower() == set_name_l and ext.lower() in ('.xlsx', '.xlsm', '.xls', '.xlsb'):
+                return full
+        return None
+
+    @classmethod
+    def _read_csv_keyed(cls, path):
+        """Read a Cap/Skin Joint Loads CSV, normalize its headers, and key
+        it by Bar Element ID for lookup. Returns None if the file doesn't
+        exist or has no Bar Element ID column."""
+        if not os.path.exists(path):
+            return None
+        df = pd.read_csv(path)
+        df.columns = [cls._normalize_header(c) for c in df.columns]
+        if 'barelementid' not in df.columns:
+            return None
+        df['barelementid'] = df['barelementid'].astype(str).str.strip()
+        return df.set_index('barelementid')
+
+    # ==================== STAGE 1: GROUP H5s + FILL SPECTRUM JOINT INPUT ====================
+    def _prepare_joint_folders_core(self):
+        """Returns (n_done, n_total)."""
+        t_start = time.time()
+        h5_folder = self.h5_folder.get().strip()
+        main_excel = self.main_input_excel_path.get().strip()
+        example_excel = self.example_joint_excel_path.get().strip()
+        out_base = self.output_folder.get().strip()
+        os.makedirs(out_base, exist_ok=True)
+
+        self.log("\n" + "=" * 70)
+        self.log("PREPARING JOINT RUN FOLDERS")
+        self.log("=" * 70)
+
+        self.h5_files = self._scan_joint_h5_files(h5_folder)
+        self.root.after(0, self._refresh_h5_listbox)
+        self.log(f"  Found {len(self.h5_files)} Joint_Loads_*.h5 file(s) under {h5_folder}")
+        if not self.h5_files:
+            return 0, 0
+        n = len(self.h5_files)
+
+        xl = pd.ExcelFile(main_excel)
+        data_sheet = None
+        for sheet in xl.sheet_names:
+            sl = sheet.lower().replace('_', '').replace(' ', '')
+            if sl == 'dtcginputexceldata':
+                data_sheet = sheet
+                break
+        if not data_sheet:
+            self.log("  ERROR: No 'DTCG_Input_Excel_Data' sheet found in the Main Input Excel.")
+            return 0, n
+        main_df = pd.read_excel(xl, sheet_name=data_sheet)
+        self.log(f"  Read '{data_sheet}': {len(main_df)} rows")
+
+        struct_col = next((c for c in main_df.columns if str(c).strip().lower() == 'structure name'), None)
+        if not struct_col:
+            self.log("  ERROR: No 'Structure Name' column found in the DTCG_Input_Excel_Data sheet.")
+            return 0, n
+
+        example_ext = os.path.splitext(example_excel)[1]
+
+        n_done = 0
+        for i, h5_path in enumerate(self.h5_files):
+            idx = i + 1
+            set_name = self._set_name_from_h5(h5_path)
+            self.log(f"\n  --- {idx}/{n}: {set_name} ---")
+            dest_folder = os.path.join(out_base, set_name)
+            os.makedirs(dest_folder, exist_ok=True)
+
+            shutil.copy2(h5_path, os.path.join(dest_folder, os.path.basename(h5_path)))
+            self.log(f"    H5 copied to: {dest_folder}")
+
+            joint_xl_path = os.path.join(dest_folder, set_name + example_ext)
+            shutil.copy2(example_excel, joint_xl_path)
+
+            subset_df = main_df[main_df[struct_col].astype(str).str.strip() == set_name]
+            self.log(f"    {len(subset_df)} row(s) match Structure Name '{set_name}'")
+
+            keep_vba = joint_xl_path.lower().endswith(('.xlsm', '.xltm', '.xlam'))
+            wb = openpyxl.load_workbook(joint_xl_path, keep_vba=keep_vba)
+            spectrum_ws = self._find_sheet_by_name(wb, 'spectrumjointinput')
+            if spectrum_ws is None:
+                self.log("    WARNING: no 'Spectrum Joint Input' sheet found in the copied "
+                          "template - rows not written.")
+            else:
+                header_map = {}
+                for cell in next(spectrum_ws.iter_rows(min_row=1, max_row=1)):
+                    if cell.value:
+                        header_map[str(cell.value).strip().lower()] = cell.column
+
+                for col_idx in header_map.values():
+                    for r in range(2, 2002):
+                        spectrum_ws.cell(row=r, column=col_idx).value = None
+
+                for r_off, (_, row) in enumerate(subset_df.iterrows()):
+                    r = r_off + 2
+                    for col_name in subset_df.columns:
+                        col_idx = header_map.get(str(col_name).strip().lower())
+                        if col_idx:
+                            val = row[col_name]
+                            spectrum_ws.cell(row=r, column=col_idx).value = None if pd.isna(val) else val
+                self.log(f"    Wrote {len(subset_df)} row(s) into '{spectrum_ws.title}'")
+
+            wb.save(joint_xl_path)
+            n_done += 1
+            self.root.after(0, lambda p=(idx / n) * 33: self.progress_var.set(p))
+
+        self.log(f"\n  JOINT RUN FOLDER PREP: {n_done}/{n} Set folder(s) prepared "
+                  f"(took {time.time() - t_start:.1f}s)")
+        return n_done, n
+
+    # ==================== STAGE 2: RSS CASE FINDING (PARALLEL) ====================
+    def _run_rss_case_finding_core(self):
+        """Run the RSS Case Finding exe (no arguments - it finds the H5 in
+        its own cwd) in every Set folder, up to Max Parallel Runs at a
+        time, waiting for all of them to finish. Returns (n_ok, n_total)."""
+        t_start = time.time()
+        self.log("\n" + "=" * 70)
+        self.log("RUNNING RSS CASE FINDING")
+        self.log("=" * 70)
+
+        set_folders = self._find_joint_set_folders()
+        if not set_folders:
+            self.log("  No Set folders found - nothing to run.")
+            return 0, 0
+        n = len(set_folders)
+
+        exe_path = self.rss_exe_path.get().strip()
+        try:
+            max_workers = max(1, int(float(self.max_parallel_runs.get())))
+        except (ValueError, TypeError):
+            max_workers = 1
+        self.log(f"  {n} Set folder(s) found, running up to {max_workers} at a time")
+
+        def _run_one(dest_folder):
+            set_name = os.path.basename(dest_folder)
+            log_path = os.path.join(dest_folder, "rss_case_finding_log.txt")
+            try:
+                with open(log_path, 'w') as log_file:
+                    result = subprocess.run([exe_path], cwd=dest_folder, stdout=log_file,
+                                             stderr=subprocess.STDOUT)
+                return set_name, result.returncode == 0, None
+            except Exception as e:
+                return set_name, False, str(e)
+
+        n_ok = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_run_one, f) for f in set_folders]
+            done = 0
+            for future in concurrent.futures.as_completed(futures):
+                set_name, ok, err = future.result()
+                done += 1
+                if ok:
+                    n_ok += 1
+                    self.log(f"    [{done}/{n}] {set_name}: OK")
+                else:
+                    self.log(f"    [{done}/{n}] {set_name}: FAILED{(' - ' + err) if err else ''}")
+                self.root.after(0, lambda p=33 + (done / n) * 33: self.progress_var.set(p))
+
+        self.log(f"\n  RSS CASE FINDING: {n_ok}/{n} completed OK (took {time.time() - t_start:.1f}s)")
+        return n_ok, n
+
+    # ==================== STAGE 3: WRITE LIMIT STRESS CHECK ====================
+    def _write_limit_stress_check_core(self):
+        """For every Set folder, read Cap_Joint_Loads_<Set>.csv and
+        Skin_Joint_Loads_<Set>.csv, and for every Spectrum Joint Input row
+        (keyed by Bar Element ID, routed to Cap/Skin by Type of Element)
+        write the matching row into that workbook's own Limit Stress Check
+        sheet. Returns (n_done, n_total)."""
+        t_start = time.time()
+        self.log("\n" + "=" * 70)
+        self.log("WRITING LIMIT STRESS CHECK")
+        self.log("=" * 70)
+
+        set_folders = self._find_joint_set_folders()
+        if not set_folders:
+            self.log("  No Set folders found - nothing to write.")
+            return 0, 0
+        n = len(set_folders)
+
+        # CSV header (normalized) -> Limit Stress Check header (exact, as in the template)
+        col_map = {
+            'fbearingx': 'FX Bearing',
+            'fbearingy': 'FY Bearing',
+            'nxbypass': 'Nx Bypass',
+            'nybypass': 'Ny Bypass',
+            'nxybypass': 'Nxy Bypass',
+        }
+
+        n_done = 0
+        for i, dest_folder in enumerate(set_folders):
+            idx = i + 1
+            set_name = os.path.basename(dest_folder)
+            self.log(f"\n  --- {idx}/{n}: {set_name} ---")
+
+            joint_xl_path = self._find_joint_input_workbook_path(dest_folder, set_name)
+            if not joint_xl_path:
+                self.log(f"    ERROR: No '{set_name}.xls*' workbook found in this folder - skipping.")
+                self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
+                continue
+
+            cap_df = self._read_csv_keyed(os.path.join(dest_folder, f"Cap_Joint_Loads_{set_name}.csv"))
+            skin_df = self._read_csv_keyed(os.path.join(dest_folder, f"Skin_Joint_Loads_{set_name}.csv"))
+            if cap_df is None:
+                self.log(f"    WARNING: Cap_Joint_Loads_{set_name}.csv not found")
+            if skin_df is None:
+                self.log(f"    WARNING: Skin_Joint_Loads_{set_name}.csv not found")
+
+            keep_vba = joint_xl_path.lower().endswith(('.xlsm', '.xltm', '.xlam'))
+            wb = openpyxl.load_workbook(joint_xl_path, keep_vba=keep_vba)
+            spectrum_ws = self._find_sheet_by_name(wb, 'spectrumjointinput')
+            lsc_ws = self._find_sheet_by_name(wb, 'limitstresscheck')
+            if spectrum_ws is None or lsc_ws is None:
+                self.log("    ERROR: missing 'Spectrum Joint Input' or 'Limit Stress Check' "
+                          "sheet - skipping.")
+                self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
+                continue
+
+            sp_header = {}
+            for cell in next(spectrum_ws.iter_rows(min_row=1, max_row=1)):
+                if cell.value:
+                    sp_header[self._normalize_header(cell.value)] = cell.column
+            bar_id_col = sp_header.get('barelementid')
+            type_col = sp_header.get('typeofelement')
+            if not bar_id_col or not type_col:
+                self.log("    ERROR: 'Bar Element ID' / 'Type of Element' not found in "
+                          "Spectrum Joint Input - skipping.")
+                self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
+                continue
+
+            lsc_header = {}
+            for cell in next(lsc_ws.iter_rows(min_row=1, max_row=1)):
+                if cell.value:
+                    lsc_header[self._normalize_header(cell.value)] = cell.column
+            lsc_bar_id_col = lsc_header.get('barelementid')
+
+            for col_idx in lsc_header.values():
+                for r in range(2, 2002):
+                    lsc_ws.cell(row=r, column=col_idx).value = None
+
+            last_row = spectrum_ws.max_row
+            n_written = 0
+            n_missing = 0
+            out_row = 2
+            for r in range(2, last_row + 1):
+                bar_id = spectrum_ws.cell(row=r, column=bar_id_col).value
+                elem_type = spectrum_ws.cell(row=r, column=type_col).value
+                if bar_id is None:
+                    continue
+                key = str(bar_id).strip()
+                type_l = str(elem_type).strip().lower() if elem_type else ''
+                if 'cap' in type_l:
+                    src_df = cap_df
+                elif 'skin' in type_l:
+                    src_df = skin_df
+                else:
+                    src_df = None
+
+                row_data = src_df.loc[key] if (src_df is not None and key in src_df.index) else None
+                if row_data is None:
+                    n_missing += 1
+                    out_row += 1
+                    continue
+
+                if lsc_bar_id_col:
+                    lsc_ws.cell(row=out_row, column=lsc_bar_id_col).value = bar_id
+                for norm_name, lsc_name in col_map.items():
+                    col_idx = lsc_header.get(self._normalize_header(lsc_name))
+                    if not col_idx:
+                        continue
+                    val = row_data.get(norm_name)
+                    lsc_ws.cell(row=out_row, column=col_idx).value = (
+                        None if (val is None or (isinstance(val, float) and pd.isna(val))) else val
+                    )
+                n_written += 1
+                out_row += 1
+
+            wb.save(joint_xl_path)
+            extra = f", {n_missing} Bar Element ID(s) not found in CSV" if n_missing else ""
+            self.log(f"    Wrote {n_written} row(s) into 'Limit Stress Check'{extra}")
+            n_done += 1
+            self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
+
+        self.log(f"\n  LIMIT STRESS CHECK: {n_done}/{n} workbook(s) updated "
+                  f"(took {time.time() - t_start:.1f}s)")
+        return n_done, n
+
+    # ==================== RUN (FULL PIPELINE) ====================
+    def start_run(self):
+        if not self.h5_folder.get().strip() or not os.path.isdir(self.h5_folder.get().strip()):
+            messagebox.showerror("Error", "Select a valid Joint Load H5 Folder")
+            return
+        if not self.main_input_excel_path.get().strip() or not os.path.exists(self.main_input_excel_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Main Input Excel")
+            return
+        if not self.example_joint_excel_path.get().strip() or not os.path.exists(self.example_joint_excel_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Example Joint Input Excel")
+            return
+        if not self.rss_exe_path.get().strip() or not os.path.exists(self.rss_exe_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid RSS Case Finding Exe")
+            return
+        if not self.output_folder.get().strip():
+            messagebox.showerror("Error", "Select an Output Folder")
+            return
+        try:
+            if int(float(self.max_parallel_runs.get())) <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            messagebox.showerror("Error", "Max Parallel Runs must be a positive number")
+            return
+
+        self.is_running = True
+        self.btn_run.config(state=tk.DISABLED)
+        self.root.after(0, lambda: self.progress_var.set(0))
+        threading.Thread(target=self._run_pipeline, daemon=True).start()
+
+    def _run_pipeline(self):
+        """Group H5s + fill Spectrum Joint Input, then run RSS Case Finding
+        in every Set folder (waiting for all to finish), then write every
+        Limit Stress Check sheet from the CSVs - one stage after another,
+        end to end, from this one button."""
+        t_start = time.time()
+        try:
+            self.log("\n" + "#" * 70)
+            self.log("RUN: PREPARE JOINT FOLDERS -> RSS CASE FINDING -> LIMIT STRESS CHECK")
+            self.log("#" * 70)
+
+            n_done, n_total = self._prepare_joint_folders_core()
+            if n_total == 0:
+                self.log("\nSTOPPED: no Joint_Loads_*.h5 files found - nothing to run.")
+                return
+            if n_done == 0:
+                self.log("\nSTOPPED: no Set folder was prepared - RSS Case Finding not started.")
+                return
+
+            n_ok, n_rss = self._run_rss_case_finding_core()
+            if n_rss == 0:
+                self.log("\nSTOPPED: no Set folder found for RSS Case Finding.")
+                return
+
+            n_written, n_lsc = self._write_limit_stress_check_core()
+
+            self.root.after(0, lambda: self.progress_var.set(100))
+            self.log(f"\n{'#' * 70}")
+            self.log(f"RUN COMPLETE: {n_done}/{n_total} Set folder(s) prepared, {n_ok}/{n_rss} RSS "
+                      f"Case Finding run(s) OK, {n_written}/{n_lsc} Limit Stress Check sheet(s) "
+                      f"updated (total {time.time() - t_start:.1f}s)")
             self.log(f"{'#' * 70}")
 
         except Exception as e:

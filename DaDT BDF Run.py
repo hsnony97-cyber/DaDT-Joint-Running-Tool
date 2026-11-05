@@ -3519,14 +3519,16 @@ class PostProcessingTab:
 
 class JointRunTab:
     """Joint Run: groups every Joint_Loads_<SetName>.h5 into its own Set
-    folder, copies the Example Joint Input Excel template into each one
-    (renamed to <SetName>.<ext>) and fills its 'Spectrum Joint Input' sheet
-    from the Main Input Excel's DTCG_Input_Excel_Data rows whose Structure
-    Name matches that Set. Then runs the RSS Case Finding exe in every Set
-    folder (it finds the H5 on its own, cwd'd into that folder), and once
-    every run has finished, reads the Cap/Skin Joint Loads CSVs it produced
-    and writes the matching Bar Element ID rows into each workbook's own
-    'Limit Stress Check' sheet."""
+    folder, copies the Example Joint Input Excel template and the Util
+    Folder's contents into each one, and fills the excel's 'Spectrum Joint
+    Input' sheet from the Main Input Excel's DTCG_Input_Excel_Data rows
+    whose Structure Name matches that Set. Runs the License Checker exe
+    once, then per Set folder: writes a User_Log.csv, copies in and runs
+    the Load Modifying exe (which produces Joint_Loads_Arrangement.h5 -
+    the original Set-named H5 is then deleted), runs the RSS Case Finding
+    exe (finds the H5 on its own, cwd'd into that folder), writes the
+    matching Cap/Skin Joint Loads CSV rows (scaled by a user factor) into
+    the 'Limit Stress Check' sheet, and finally runs the Joint Run exe."""
 
     def __init__(self, parent_frame, root):
         self.root = root
@@ -3535,10 +3537,14 @@ class JointRunTab:
         self.h5_folder = tk.StringVar()
         self.main_input_excel_path = tk.StringVar()
         self.example_joint_excel_path = tk.StringVar()
+        self.util_folder = tk.StringVar()
+        self.license_checker_exe_path = tk.StringVar()
+        self.load_modifying_exe_path = tk.StringVar()
         self.rss_exe_path = tk.StringVar()
-        self.joint_run_exe_path = tk.StringVar()   # selected now; not used by this stage yet
+        self.joint_run_exe_path = tk.StringVar()
         self.output_folder = tk.StringVar()
         self.max_parallel_runs = tk.StringVar(value="4")
+        self.scale_factor = tk.StringVar(value="1")
         self.h5_files = []
 
         self.is_running = False
@@ -3622,6 +3628,40 @@ class JointRunTab:
                             "copied into every Set folder, renamed to <SetName>)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
 
+        # Util Folder
+        util_frame = ttk.Frame(f1)
+        util_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(util_frame, text="Util Folder:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(util_frame, textvariable=self.util_folder, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(util_frame, text="Browse", command=lambda: self.util_folder.set(
+            filedialog.askdirectory()
+        )).pack(side=tk.LEFT)
+        ttk.Label(f1, text="(its contents are copied into every Set folder)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+
+        # License Checker Exe
+        lic_frame = ttk.Frame(f1)
+        lic_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(lic_frame, text="License Checker Exe:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(lic_frame, textvariable=self.license_checker_exe_path, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(lic_frame, text="Browse", command=lambda: self.license_checker_exe_path.set(
+            filedialog.askopenfilename(filetypes=[("Executable", "*.exe"), ("All", "*.*")])
+        )).pack(side=tk.LEFT)
+        ttk.Label(f1, text="(run once at the very start of RUN, no arguments)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+
+        # Load Modifying Exe
+        lm_frame = ttk.Frame(f1)
+        lm_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(lm_frame, text="Load Modifying Exe:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(lm_frame, textvariable=self.load_modifying_exe_path, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(lm_frame, text="Browse", command=lambda: self.load_modifying_exe_path.set(
+            filedialog.askopenfilename(filetypes=[("Executable", "*.exe"), ("All", "*.*")])
+        )).pack(side=tk.LEFT)
+        ttk.Label(f1, text="(copied into every Set folder and run there, before RSS Case Finding - "
+                            "writes Joint_Loads_Arrangement.h5, after which the Set-named H5 is deleted)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+
         # RSS Case Finding Exe
         rss_frame = ttk.Frame(f1)
         rss_frame.pack(fill=tk.X, pady=2)
@@ -3634,7 +3674,7 @@ class JointRunTab:
                             "there on its own and writes the Cap/Skin Joint Loads CSVs)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
 
-        # Joint Run Exe (selected now; not used by this stage yet)
+        # Joint Run Exe
         jr_frame = ttk.Frame(f1)
         jr_frame.pack(fill=tk.X, pady=2)
         ttk.Label(jr_frame, text="Joint Run Exe:", width=20).pack(side=tk.LEFT)
@@ -3642,7 +3682,8 @@ class JointRunTab:
         ttk.Button(jr_frame, text="Browse", command=lambda: self.joint_run_exe_path.set(
             filedialog.askopenfilename(filetypes=[("Executable", "*.exe"), ("All", "*.*")])
         )).pack(side=tk.LEFT)
-        ttk.Label(f1, text="(selected now for the next stage - not used by RUN yet)",
+        ttk.Label(f1, text="(run last, cwd'd into each Set folder, up to Max Parallel Runs at a "
+                            "time - refills as soon as a slot frees up)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
 
         # Output Folder
@@ -3661,7 +3702,17 @@ class JointRunTab:
         par_frame.pack(fill=tk.X, pady=2)
         ttk.Label(par_frame, text="Max Parallel Runs:", width=20).pack(side=tk.LEFT)
         ttk.Entry(par_frame, textvariable=self.max_parallel_runs, width=10).pack(side=tk.LEFT, padx=5)
-        ttk.Label(par_frame, text="(how many RSS Case Finding runs execute at the same time)",
+        ttk.Label(par_frame, text="(how many Load Modifying / RSS Case Finding / Joint Run runs "
+                                   "execute at the same time)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        # Limit Stress Check scale factor
+        scale_frame = ttk.Frame(f1)
+        scale_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(scale_frame, text="LSC Scale Factor:", width=20).pack(side=tk.LEFT)
+        ttk.Entry(scale_frame, textvariable=self.scale_factor, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(scale_frame, text="(multiplies every F/N Bearing-Bypass value written into Limit "
+                                     "Stress Check)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         # ---- Section 2: Actions (RUN sits at the very bottom) ----
@@ -3673,8 +3724,9 @@ class JointRunTab:
         self.btn_run = ttk.Button(btn_row, text="▶  RUN", command=self.start_run, style='Accent.TButton')
         self.btn_run.pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_row, text="Clear Log", command=self.clear_log).pack(side=tk.LEFT, padx=5)
-        ttk.Label(btn_row, text="(1. Group H5s + fill Spectrum Joint Input  2. Run RSS Case Finding "
-                                 "(parallel, waits for all)  3. Write Limit Stress Check from the CSVs)",
+        ttk.Label(btn_row, text="(1. License Checker  2. Group H5s + Util Folder + fill Spectrum "
+                                 "Joint Input  3. Load Modifying  4. RSS Case Finding  5. Limit "
+                                 "Stress Check  6. Joint Run - parallel stages wait for all)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         self.progress_var = tk.DoubleVar()
@@ -3848,6 +3900,11 @@ class JointRunTab:
             joint_xl_path = os.path.join(dest_folder, set_name + example_ext)
             shutil.copy2(example_excel, joint_xl_path)
 
+            util_folder = self.util_folder.get().strip()
+            if util_folder:
+                shutil.copytree(util_folder, dest_folder, dirs_exist_ok=True)
+                self.log(f"    Util Folder contents copied into: {dest_folder}")
+
             subset_df = main_df[main_df[struct_col].astype(str).str.strip() == set_name]
             self.log(f"    {len(subset_df)} row(s) match Structure Name '{set_name}'")
 
@@ -3878,13 +3935,149 @@ class JointRunTab:
 
             wb.save(joint_xl_path)
             n_done += 1
-            self.root.after(0, lambda p=(idx / n) * 33: self.progress_var.set(p))
+            self.root.after(0, lambda p=5 + (idx / n) * 20: self.progress_var.set(p))
 
         self.log(f"\n  JOINT RUN FOLDER PREP: {n_done}/{n} Set folder(s) prepared "
                   f"(took {time.time() - t_start:.1f}s)")
         return n_done, n
 
-    # ==================== STAGE 2: RSS CASE FINDING (PARALLEL) ====================
+    # ==================== STAGE 2: LICENSE CHECKER (ONCE) ====================
+    def _run_license_checker_core(self):
+        """Run the License Checker exe exactly once, no arguments. Does
+        not gate the rest of the pipeline - just logs the outcome."""
+        t_start = time.time()
+        self.log("\n" + "=" * 70)
+        self.log("RUNNING LICENSE CHECKER")
+        self.log("=" * 70)
+        exe_path = self.license_checker_exe_path.get().strip()
+        try:
+            result = subprocess.run([exe_path], capture_output=True, text=True)
+            self.log(f"  License Checker exited with code {result.returncode} "
+                      f"(took {time.time() - t_start:.1f}s)")
+            if result.stdout:
+                self.log(f"  stdout: {result.stdout.strip()[:1000]}")
+            if result.stderr:
+                self.log(f"  stderr: {result.stderr.strip()[:1000]}")
+            return result.returncode == 0
+        except Exception as e:
+            self.log(f"  ERROR running License Checker: {e}")
+            return False
+
+    # ==================== STAGE 3: LOAD MODIFYING (PARALLEL) ====================
+    def _run_load_modifying_core(self):
+        """For every Set folder: write User_Log.csv, copy in the Load
+        Modifying exe, and run it (up to Max Parallel Runs at a time,
+        waiting for all to finish). Once a run produces
+        Joint_Loads_Arrangement.h5, the original Joint_Loads_<Set>.h5 is
+        deleted so only Joint_Loads_Arrangement.h5 remains. Returns
+        (n_ok, n_total)."""
+        t_start = time.time()
+        self.log("\n" + "=" * 70)
+        self.log("RUNNING LOAD MODIFYING")
+        self.log("=" * 70)
+
+        set_folders = self._find_joint_set_folders()
+        if not set_folders:
+            self.log("  No Set folders found - nothing to run.")
+            return 0, 0
+        n = len(set_folders)
+
+        exe_path = self.load_modifying_exe_path.get().strip()
+        main_excel = self.main_input_excel_path.get().strip()
+        example_ext = os.path.splitext(self.example_joint_excel_path.get().strip())[1]
+        try:
+            max_workers = max(1, int(float(self.max_parallel_runs.get())))
+        except (ValueError, TypeError):
+            max_workers = 1
+
+        direction_map = {}
+        try:
+            xl = pd.ExcelFile(main_excel)
+            lm_sheet = next((s for s in xl.sheet_names if s.strip().lower() == 'load_modify'), None)
+            if lm_sheet:
+                lm_df = pd.read_excel(xl, sheet_name=lm_sheet)
+                set_col = next((c for c in lm_df.columns if str(c).strip().lower() == 'set'), None)
+                dir_col = next((c for c in lm_df.columns
+                                if str(c).strip().lower() == 'load arrangement direction'), None)
+                if set_col and dir_col:
+                    for _, row in lm_df.iterrows():
+                        direction_map[str(row[set_col]).strip().lower()] = row[dir_col]
+                else:
+                    self.log("  WARNING: 'Load_Modify' sheet found but missing 'Set' / "
+                              "'Load Arrangement Direction' columns.")
+            else:
+                self.log("  WARNING: No 'Load_Modify' sheet found in the Main Input Excel.")
+        except Exception as e:
+            self.log(f"  WARNING: could not read 'Load_Modify' sheet: {e}")
+
+        # ---- Write User_Log.csv + copy the exe into every Set folder ----
+        for dest_folder in set_folders:
+            set_name = os.path.basename(dest_folder)
+            joint_xl_path = os.path.join(dest_folder, set_name + example_ext)
+            direction = direction_map.get(set_name.strip().lower(), "")
+            if not direction:
+                self.log(f"  WARNING: no Load Arrangement Direction found for '{set_name}' "
+                          f"in the Load_Modify sheet.")
+
+            user_log_path = os.path.join(dest_folder, "User_Log.csv")
+            with open(user_log_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Process Type", "Load Extraction Path", "User Working Path",
+                                  "User Working Folder Name", "Input Excel Path", "Output Location",
+                                  "Load Arrangement Direction"])
+                writer.writerow([
+                    "Auto",
+                    os.path.join(dest_folder, "Joint_Loads_Arrangement.h5"),
+                    dest_folder,
+                    f"{set_name}_Working Folder",
+                    joint_xl_path,
+                    dest_folder,
+                    direction,
+                ])
+
+            shutil.copy2(exe_path, os.path.join(dest_folder, os.path.basename(exe_path)))
+
+        self.log(f"  User_Log.csv written and Load Modifying exe copied into {n} Set folder(s)")
+        self.log(f"  Running up to {max_workers} at a time")
+
+        def _run_one(dest_folder):
+            set_name = os.path.basename(dest_folder)
+            local_exe = os.path.join(dest_folder, os.path.basename(exe_path))
+            log_path = os.path.join(dest_folder, "load_modifying_log.txt")
+            try:
+                with open(log_path, 'w') as log_file:
+                    result = subprocess.run([local_exe], cwd=dest_folder, stdout=log_file,
+                                             stderr=subprocess.STDOUT)
+                ok = result.returncode == 0
+            except Exception as e:
+                return set_name, False, str(e)
+
+            arrangement_path = os.path.join(dest_folder, "Joint_Loads_Arrangement.h5")
+            if os.path.exists(arrangement_path):
+                original_h5 = os.path.join(dest_folder, f"Joint_Loads_{set_name}.h5")
+                if os.path.exists(original_h5):
+                    os.remove(original_h5)
+                return set_name, ok, None
+            return set_name, False, "Joint_Loads_Arrangement.h5 was not produced"
+
+        n_ok = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_run_one, f) for f in set_folders]
+            done = 0
+            for future in concurrent.futures.as_completed(futures):
+                set_name, ok, err = future.result()
+                done += 1
+                if ok:
+                    n_ok += 1
+                    self.log(f"    [{done}/{n}] {set_name}: OK")
+                else:
+                    self.log(f"    [{done}/{n}] {set_name}: FAILED{(' - ' + err) if err else ''}")
+                self.root.after(0, lambda p=25 + (done / n) * 20: self.progress_var.set(p))
+
+        self.log(f"\n  LOAD MODIFYING: {n_ok}/{n} completed OK (took {time.time() - t_start:.1f}s)")
+        return n_ok, n
+
+    # ==================== STAGE 4: RSS CASE FINDING (PARALLEL) ====================
     def _run_rss_case_finding_core(self):
         """Run the RSS Case Finding exe (no arguments - it finds the H5 in
         its own cwd) in every Set folder, up to Max Parallel Runs at a
@@ -3930,12 +4123,12 @@ class JointRunTab:
                     self.log(f"    [{done}/{n}] {set_name}: OK")
                 else:
                     self.log(f"    [{done}/{n}] {set_name}: FAILED{(' - ' + err) if err else ''}")
-                self.root.after(0, lambda p=33 + (done / n) * 33: self.progress_var.set(p))
+                self.root.after(0, lambda p=45 + (done / n) * 20: self.progress_var.set(p))
 
         self.log(f"\n  RSS CASE FINDING: {n_ok}/{n} completed OK (took {time.time() - t_start:.1f}s)")
         return n_ok, n
 
-    # ==================== STAGE 3: WRITE LIMIT STRESS CHECK ====================
+    # ==================== STAGE 5: WRITE LIMIT STRESS CHECK ====================
     def _write_limit_stress_check_core(self):
         """For every Set folder, read Cap_Joint_Loads_<Set>.csv and
         Skin_Joint_Loads_<Set>.csv, and for every Spectrum Joint Input row
@@ -3952,6 +4145,12 @@ class JointRunTab:
             self.log("  No Set folders found - nothing to write.")
             return 0, 0
         n = len(set_folders)
+
+        try:
+            scale = float(self.scale_factor.get())
+        except (ValueError, TypeError):
+            scale = 1.0
+        self.log(f"  Scale factor: {scale}")
 
         # CSV header (normalized) -> Limit Stress Check header (exact, as in the template)
         col_map = {
@@ -3971,7 +4170,7 @@ class JointRunTab:
             joint_xl_path = self._find_joint_input_workbook_path(dest_folder, set_name)
             if not joint_xl_path:
                 self.log(f"    ERROR: No '{set_name}.xls*' workbook found in this folder - skipping.")
-                self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
+                self.root.after(0, lambda p=65 + (idx / n) * 15: self.progress_var.set(p))
                 continue
 
             cap_df = self._read_csv_keyed(os.path.join(dest_folder, f"Cap_Joint_Loads_{set_name}.csv"))
@@ -3988,7 +4187,7 @@ class JointRunTab:
             if spectrum_ws is None or lsc_ws is None:
                 self.log("    ERROR: missing 'Spectrum Joint Input' or 'Limit Stress Check' "
                           "sheet - skipping.")
-                self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
+                self.root.after(0, lambda p=65 + (idx / n) * 15: self.progress_var.set(p))
                 continue
 
             sp_header = {}
@@ -4000,7 +4199,7 @@ class JointRunTab:
             if not bar_id_col or not type_col:
                 self.log("    ERROR: 'Bar Element ID' / 'Type of Element' not found in "
                           "Spectrum Joint Input - skipping.")
-                self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
+                self.root.after(0, lambda p=65 + (idx / n) * 15: self.progress_var.set(p))
                 continue
 
             lsc_header = {}
@@ -4044,9 +4243,13 @@ class JointRunTab:
                     if not col_idx:
                         continue
                     val = row_data.get(norm_name)
-                    lsc_ws.cell(row=out_row, column=col_idx).value = (
-                        None if (val is None or (isinstance(val, float) and pd.isna(val))) else val
-                    )
+                    if val is None or (isinstance(val, float) and pd.isna(val)):
+                        lsc_ws.cell(row=out_row, column=col_idx).value = None
+                    else:
+                        try:
+                            lsc_ws.cell(row=out_row, column=col_idx).value = float(val) * scale
+                        except (ValueError, TypeError):
+                            lsc_ws.cell(row=out_row, column=col_idx).value = val
                 n_written += 1
                 out_row += 1
 
@@ -4054,11 +4257,66 @@ class JointRunTab:
             extra = f", {n_missing} Bar Element ID(s) not found in CSV" if n_missing else ""
             self.log(f"    Wrote {n_written} row(s) into 'Limit Stress Check'{extra}")
             n_done += 1
-            self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
+            self.root.after(0, lambda p=65 + (idx / n) * 15: self.progress_var.set(p))
 
         self.log(f"\n  LIMIT STRESS CHECK: {n_done}/{n} workbook(s) updated "
                   f"(took {time.time() - t_start:.1f}s)")
         return n_done, n
+
+    # ==================== STAGE 6: JOINT RUN (ROLLING PARALLEL POOL) ====================
+    def _run_joint_run_exe_core(self):
+        """Run the Joint Run exe (no arguments) in every Set folder, cwd'd
+        into it, keeping up to Max Parallel Runs running at the same time
+        - as soon as one finishes, the next queued Set starts immediately
+        (ThreadPoolExecutor's own scheduling already does this: submitting
+        every task up front means a free worker always pulls the next one,
+        rather than waiting for a whole batch of N to finish). Waits for
+        every run to finish. Returns (n_ok, n_total)."""
+        t_start = time.time()
+        self.log("\n" + "=" * 70)
+        self.log("RUNNING JOINT RUN")
+        self.log("=" * 70)
+
+        set_folders = self._find_joint_set_folders()
+        if not set_folders:
+            self.log("  No Set folders found - nothing to run.")
+            return 0, 0
+        n = len(set_folders)
+
+        exe_path = self.joint_run_exe_path.get().strip()
+        try:
+            max_workers = max(1, int(float(self.max_parallel_runs.get())))
+        except (ValueError, TypeError):
+            max_workers = 1
+        self.log(f"  {n} Set folder(s) found, keeping up to {max_workers} running at a time")
+
+        def _run_one(dest_folder):
+            set_name = os.path.basename(dest_folder)
+            log_path = os.path.join(dest_folder, "joint_run_log.txt")
+            try:
+                with open(log_path, 'w') as log_file:
+                    result = subprocess.run([exe_path], cwd=dest_folder, stdout=log_file,
+                                             stderr=subprocess.STDOUT)
+                return set_name, result.returncode == 0, None
+            except Exception as e:
+                return set_name, False, str(e)
+
+        n_ok = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_run_one, f) for f in set_folders]
+            done = 0
+            for future in concurrent.futures.as_completed(futures):
+                set_name, ok, err = future.result()
+                done += 1
+                if ok:
+                    n_ok += 1
+                    self.log(f"    [{done}/{n}] {set_name}: OK")
+                else:
+                    self.log(f"    [{done}/{n}] {set_name}: FAILED{(' - ' + err) if err else ''}")
+                self.root.after(0, lambda p=80 + (done / n) * 20: self.progress_var.set(p))
+
+        self.log(f"\n  JOINT RUN: {n_ok}/{n} completed OK (took {time.time() - t_start:.1f}s)")
+        return n_ok, n
 
     # ==================== RUN (FULL PIPELINE) ====================
     def start_run(self):
@@ -4071,8 +4329,20 @@ class JointRunTab:
         if not self.example_joint_excel_path.get().strip() or not os.path.exists(self.example_joint_excel_path.get().strip()):
             messagebox.showerror("Error", "Select a valid Example Joint Input Excel")
             return
+        if not self.util_folder.get().strip() or not os.path.isdir(self.util_folder.get().strip()):
+            messagebox.showerror("Error", "Select a valid Util Folder")
+            return
+        if not self.license_checker_exe_path.get().strip() or not os.path.exists(self.license_checker_exe_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid License Checker Exe")
+            return
+        if not self.load_modifying_exe_path.get().strip() or not os.path.exists(self.load_modifying_exe_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Load Modifying Exe")
+            return
         if not self.rss_exe_path.get().strip() or not os.path.exists(self.rss_exe_path.get().strip()):
             messagebox.showerror("Error", "Select a valid RSS Case Finding Exe")
+            return
+        if not self.joint_run_exe_path.get().strip() or not os.path.exists(self.joint_run_exe_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Joint Run Exe")
             return
         if not self.output_folder.get().strip():
             messagebox.showerror("Error", "Select an Output Folder")
@@ -4083,6 +4353,11 @@ class JointRunTab:
         except (ValueError, TypeError):
             messagebox.showerror("Error", "Max Parallel Runs must be a positive number")
             return
+        try:
+            float(self.scale_factor.get())
+        except (ValueError, TypeError):
+            messagebox.showerror("Error", "LSC Scale Factor must be a number")
+            return
 
         self.is_running = True
         self.btn_run.config(state=tk.DISABLED)
@@ -4090,22 +4365,31 @@ class JointRunTab:
         threading.Thread(target=self._run_pipeline, daemon=True).start()
 
     def _run_pipeline(self):
-        """Group H5s + fill Spectrum Joint Input, then run RSS Case Finding
-        in every Set folder (waiting for all to finish), then write every
-        Limit Stress Check sheet from the CSVs - one stage after another,
-        end to end, from this one button."""
+        """License Checker once, then group H5s + Util Folder + fill
+        Spectrum Joint Input, then Load Modifying, then RSS Case Finding
+        (each waiting for all of its Set folders to finish), then write
+        every Limit Stress Check sheet from the CSVs, then Joint Run -
+        one stage after another, end to end, from this one button."""
         t_start = time.time()
         try:
             self.log("\n" + "#" * 70)
-            self.log("RUN: PREPARE JOINT FOLDERS -> RSS CASE FINDING -> LIMIT STRESS CHECK")
+            self.log("RUN: LICENSE CHECKER -> PREPARE FOLDERS -> LOAD MODIFYING -> "
+                      "RSS CASE FINDING -> LIMIT STRESS CHECK -> JOINT RUN")
             self.log("#" * 70)
+
+            self._run_license_checker_core()
 
             n_done, n_total = self._prepare_joint_folders_core()
             if n_total == 0:
                 self.log("\nSTOPPED: no Joint_Loads_*.h5 files found - nothing to run.")
                 return
             if n_done == 0:
-                self.log("\nSTOPPED: no Set folder was prepared - RSS Case Finding not started.")
+                self.log("\nSTOPPED: no Set folder was prepared - Load Modifying not started.")
+                return
+
+            n_lm_ok, n_lm = self._run_load_modifying_core()
+            if n_lm == 0:
+                self.log("\nSTOPPED: no Set folder found for Load Modifying.")
                 return
 
             n_ok, n_rss = self._run_rss_case_finding_core()
@@ -4115,11 +4399,14 @@ class JointRunTab:
 
             n_written, n_lsc = self._write_limit_stress_check_core()
 
+            n_jr_ok, n_jr = self._run_joint_run_exe_core()
+
             self.root.after(0, lambda: self.progress_var.set(100))
             self.log(f"\n{'#' * 70}")
-            self.log(f"RUN COMPLETE: {n_done}/{n_total} Set folder(s) prepared, {n_ok}/{n_rss} RSS "
-                      f"Case Finding run(s) OK, {n_written}/{n_lsc} Limit Stress Check sheet(s) "
-                      f"updated (total {time.time() - t_start:.1f}s)")
+            self.log(f"RUN COMPLETE: {n_done}/{n_total} Set folder(s) prepared, {n_lm_ok}/{n_lm} "
+                      f"Load Modifying run(s) OK, {n_ok}/{n_rss} RSS Case Finding run(s) OK, "
+                      f"{n_written}/{n_lsc} Limit Stress Check sheet(s) updated, {n_jr_ok}/{n_jr} "
+                      f"Joint Run run(s) OK (total {time.time() - t_start:.1f}s)")
             self.log(f"{'#' * 70}")
 
         except Exception as e:

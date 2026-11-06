@@ -4136,8 +4136,10 @@ class JointRunTab:
 
     # ==================== STAGE 5: WRITE LIMIT STRESS CHECK ====================
     def _write_limit_stress_check_core(self):
-        """For every Set folder, read Cap_Joint_Loads_<Set>.csv and
-        Skin_Joint_Loads_<Set>.csv, and for every Spectrum Joint Input row
+        """For every Set folder, read Cap_Joint_Loads_Arranged.csv and
+        Skin_Joint_Loads_Arranged.csv (RSS Case Finding runs against
+        Joint_Loads_Arranged.h5, so that's what it names its output after),
+        and for every Spectrum Joint Input row
         (keyed by Bar Element ID, routed to Cap/Skin by Type of Element)
         write the matching row into that workbook's own Limit Stress Check
         sheet. Returns (n_done, n_total)."""
@@ -4179,12 +4181,12 @@ class JointRunTab:
                 self.root.after(0, lambda p=65 + (idx / n) * 15: self.progress_var.set(p))
                 continue
 
-            cap_df = self._read_csv_keyed(os.path.join(dest_folder, f"Cap_Joint_Loads_{set_name}.csv"))
-            skin_df = self._read_csv_keyed(os.path.join(dest_folder, f"Skin_Joint_Loads_{set_name}.csv"))
+            cap_df = self._read_csv_keyed(os.path.join(dest_folder, "Cap_Joint_Loads_Arranged.csv"))
+            skin_df = self._read_csv_keyed(os.path.join(dest_folder, "Skin_Joint_Loads_Arranged.csv"))
             if cap_df is None:
-                self.log(f"    WARNING: Cap_Joint_Loads_{set_name}.csv not found")
+                self.log("    WARNING: Cap_Joint_Loads_Arranged.csv not found")
             if skin_df is None:
-                self.log(f"    WARNING: Skin_Joint_Loads_{set_name}.csv not found")
+                self.log("    WARNING: Skin_Joint_Loads_Arranged.csv not found")
 
             keep_vba = joint_xl_path.lower().endswith(('.xlsm', '.xltm', '.xlam'))
             wb = openpyxl.load_workbook(joint_xl_path, keep_vba=keep_vba)

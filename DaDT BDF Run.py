@@ -3943,24 +3943,20 @@ class JointRunTab:
 
     # ==================== STAGE 2: LICENSE CHECKER (ONCE) ====================
     def _run_license_checker_core(self):
-        """Run the License Checker exe exactly once, no arguments. Does
-        not gate the rest of the pipeline - just logs the outcome."""
-        t_start = time.time()
+        """Launch the License Checker exe exactly once, no arguments - the
+        same as double-clicking it. It is not waited on (it may open a
+        window and stay open), so this just fires it and moves on."""
         self.log("\n" + "=" * 70)
         self.log("RUNNING LICENSE CHECKER")
         self.log("=" * 70)
         exe_path = self.license_checker_exe_path.get().strip()
+        exe_dir = os.path.dirname(exe_path) or None
         try:
-            result = subprocess.run([exe_path], capture_output=True, text=True)
-            self.log(f"  License Checker exited with code {result.returncode} "
-                      f"(took {time.time() - t_start:.1f}s)")
-            if result.stdout:
-                self.log(f"  stdout: {result.stdout.strip()[:1000]}")
-            if result.stderr:
-                self.log(f"  stderr: {result.stderr.strip()[:1000]}")
-            return result.returncode == 0
+            subprocess.Popen([exe_path], cwd=exe_dir)
+            self.log(f"  License Checker launched: {exe_path}")
+            return True
         except Exception as e:
-            self.log(f"  ERROR running License Checker: {e}")
+            self.log(f"  ERROR launching License Checker: {e}")
             return False
 
     # ==================== STAGE 3: LOAD MODIFYING (PARALLEL) ====================

@@ -3636,7 +3636,7 @@ class JointRunTab:
         ttk.Button(util_frame, text="Browse", command=lambda: self.util_folder.set(
             filedialog.askdirectory()
         )).pack(side=tk.LEFT)
-        ttk.Label(f1, text="(its contents are copied into every Set folder)",
+        ttk.Label(f1, text="(the whole folder, e.g. 'util', is copied into every Set folder)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
 
         # License Checker Exe
@@ -3902,8 +3902,9 @@ class JointRunTab:
 
             util_folder = self.util_folder.get().strip()
             if util_folder:
-                shutil.copytree(util_folder, dest_folder, dirs_exist_ok=True)
-                self.log(f"    Util Folder contents copied into: {dest_folder}")
+                util_dest = os.path.join(dest_folder, os.path.basename(os.path.normpath(util_folder)))
+                shutil.copytree(util_folder, util_dest, dirs_exist_ok=True)
+                self.log(f"    Util Folder copied to: {util_dest}")
 
             subset_df = main_df[main_df[struct_col].astype(str).str.strip() == set_name]
             self.log(f"    {len(subset_df)} row(s) match Structure Name '{set_name}'")

@@ -154,6 +154,10 @@ class IntegratedBDFRFTool:
         self.notebook.add(self.tab5, text="\U0001F517  Joint Run")
         self.tab5_tool = JointRunTab(self.tab5, self.root)
 
+        self.tab6 = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab6, text="⚡  Full Run")
+        self.tab6_tool = FullRunTab(self.tab6, self.root, self.tab3_tool, self.tab4_tool, self.tab5_tool)
+
 
     def setup_tab1(self):
         main = ttk.Frame(self.tab1, padding="10")
@@ -4438,6 +4442,665 @@ class JointRunTab:
         finally:
             self.is_running = False
             self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
+
+
+class FullRunTab:
+    """Chains Understanding Structure Type -> Post Processing -> Joint Run
+    end to end from one button, by driving the three existing tab objects
+    directly (their own classes are never modified): push this tab's own
+    field values into each tool's real StringVars/lists, then call that
+    tool's own blocking pipeline method - _run_solve() /
+    _run_pipeline() / _run_pipeline() - the exact same methods each tab's
+    own RUN button already uses in its background thread, just called
+    here in sequence on FullRunTab's own background thread instead.
+
+    What's auto-wired between stages (no separate input for these):
+      - OP2 Folder (Post Processing) = every .op2 produced by the solve,
+        moved into <run_folder>/_base_model/OP2_Results
+      - Output Folder H5 (Post Processing) = <run_folder>/_base_model/H5_Results
+      - BDF (Maneuver) / BDF (Thermal) (Post Processing) = the
+        '..._prop_updated_offseted_stru.bdf' files the solve wrote,
+        matched by 'maneuver'/'thermal' in their filename
+      - Output Folder (Post Processing LE split) =
+        <run_folder>/_base_model/Load_Extraction_Results
+      - Joint Load H5 Folder (Joint Run) = that same Load_Extraction_Results
+        folder (Load_Ext_H5.exe writes each group's Joint_Loads_*.h5 into
+        its own LoadExtraction_NN/Load_Ext_H5 subfolder, and Joint Run's
+        own H5 scan is already recursive, so no copying is needed)
+      - Output Folder (Joint Run) = <run_folder>/_base_model/Joint_Run
+
+    Post Processing's own loadext.bat runs are fire-and-forget (by
+    design - see PostProcessingTab), so after _run_pipeline() returns
+    this waits for every Load_Ext_H5.exe process to actually exit
+    (polling tasklist by image name) before starting Joint Run, since
+    Joint Run's H5 scan depends on them having finished writing."""
+
+    def __init__(self, parent_frame, root, tab3_tool, tab4_tool, tab5_tool):
+        self.root = root
+        self.parent_frame = parent_frame
+        self.tab3_tool = tab3_tool
+        self.tab4_tool = tab4_tool
+        self.tab5_tool = tab5_tool
+
+        # ---- Section 1: Understanding Structure Type ----
+        self.bdf_paths = []
+        self.maneuver_bdfs = []
+        self.property_excel_path = tk.StringVar()
+        self.element_excel_path = tk.StringVar()
+        self.nastran_path = tk.StringVar()
+        self.nastran_memory = tk.StringVar()
+        self.scratch_folder = tk.StringVar()
+        self.isu_output_folder = tk.StringVar()
+        self.cases_per_split = tk.StringVar()
+        self.isu_max_parallel_runs = tk.StringVar(value="1")
+
+        # ---- Section 2: Post Processing ----
+        self.converter_exe_path = tk.StringVar()
+        self.le_input_excel_path = tk.StringVar()
+        self.le_example_folder = tk.StringVar()
+        self.le_pickle_path = tk.StringVar()
+        self.le_split_count = tk.StringVar(value="10")
+        self.le_exe_path = tk.StringVar()
+        self.le_max_memory = tk.StringVar(value="50")
+
+        # ---- Section 3: Joint Run ----
+        self.jr_main_input_excel_path = tk.StringVar()
+        self.jr_example_joint_excel_path = tk.StringVar()
+        self.jr_util_folder = tk.StringVar()
+        self.jr_license_checker_exe_path = tk.StringVar()
+        self.jr_load_modifying_exe_path = tk.StringVar()
+        self.jr_rss_exe_path = tk.StringVar()
+        self.jr_joint_run_exe_path = tk.StringVar()
+        self.jr_max_parallel_runs = tk.StringVar(value="4")
+        self.jr_scale_factor = tk.StringVar(value="1")
+
+        self.is_running = False
+
+        self.setup_ui()
+
+    # ==================== GUI ====================
+    def setup_ui(self):
+        canvas = tk.Canvas(self.parent_frame)
+        scrollbar = ttk.Scrollbar(self.parent_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        main = scrollable_frame
+
+        ttk.Label(main, text="Full Run", style='Header.TLabel').pack(pady=10)
+        ttk.Label(main, text="Understanding Structure Type -> Post Processing -> Joint Run, "
+                              "chained end to end from one button",
+                 style='Subtitle.TLabel').pack()
+
+        # ---- Section 1: Understanding Structure Type ----
+        f1 = ttk.LabelFrame(main, text="\U0001F9EE  1. Understanding Structure Type", padding=10)
+        f1.pack(fill=tk.X, pady=5, padx=10)
+
+        bdf_frame = ttk.Frame(f1)
+        bdf_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(bdf_frame, text="All BDF Files:", width=18).pack(side=tk.LEFT, anchor=tk.N)
+        bdf_list_frame = ttk.Frame(bdf_frame)
+        bdf_list_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.bdf_listbox = tk.Listbox(bdf_list_frame, height=3, width=55, selectmode=tk.SINGLE,
+                                       font=('Segoe UI', 9), bg=_APP_COLORS['surface'], fg=_APP_COLORS['text'],
+                                       selectbackground=_APP_COLORS['primary'], selectforeground='white',
+                                       relief='flat', highlightthickness=1,
+                                       highlightbackground=_APP_COLORS['border'],
+                                       highlightcolor=_APP_COLORS['primary'])
+        self.bdf_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        bdf_scroll = ttk.Scrollbar(bdf_list_frame, orient="vertical", command=self.bdf_listbox.yview)
+        bdf_scroll.pack(side=tk.LEFT, fill=tk.Y)
+        self.bdf_listbox.configure(yscrollcommand=bdf_scroll.set)
+        bdf_btn_frame = ttk.Frame(bdf_frame)
+        bdf_btn_frame.pack(side=tk.LEFT, padx=5)
+        ttk.Button(bdf_btn_frame, text="Add", command=self._add_bdf).pack(fill=tk.X, pady=1)
+        ttk.Button(bdf_btn_frame, text="Remove", command=self._remove_bdf).pack(fill=tk.X, pady=1)
+
+        man_frame = ttk.Frame(f1)
+        man_frame.pack(fill=tk.X, pady=2)
+        man_lbl = ttk.Frame(man_frame)
+        man_lbl.pack(side=tk.LEFT, anchor=tk.N)
+        ttk.Label(man_lbl, text="Maneuver BDF:", width=18).pack(anchor=tk.W)
+        ttk.Label(man_lbl, text="  (Offset Source)", foreground="blue").pack(anchor=tk.W)
+        man_list_frame = ttk.Frame(man_frame)
+        man_list_frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.maneuver_listbox = tk.Listbox(man_list_frame, height=3, width=55, selectmode=tk.SINGLE,
+                                            font=('Segoe UI', 9), bg=_APP_COLORS['surface'], fg=_APP_COLORS['text'],
+                                            selectbackground=_APP_COLORS['primary'], selectforeground='white',
+                                            relief='flat', highlightthickness=1,
+                                            highlightbackground=_APP_COLORS['border'],
+                                            highlightcolor=_APP_COLORS['primary'])
+        self.maneuver_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        man_scroll = ttk.Scrollbar(man_list_frame, orient="vertical", command=self.maneuver_listbox.yview)
+        man_scroll.pack(side=tk.LEFT, fill=tk.Y)
+        self.maneuver_listbox.configure(yscrollcommand=man_scroll.set)
+        man_btn_frame = ttk.Frame(man_frame)
+        man_btn_frame.pack(side=tk.LEFT, padx=5)
+        ttk.Button(man_btn_frame, text="Add", command=self._add_maneuver_bdf).pack(fill=tk.X, pady=1)
+        ttk.Button(man_btn_frame, text="Remove", command=self._remove_maneuver_bdf).pack(fill=tk.X, pady=1)
+        ttk.Label(f1, text="(this BDF must also be included in 'All BDF Files' above with "
+                            "'maneuver' in its filename, so Post Processing can auto-find its "
+                            "solved, structure-only copy)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+        ttk.Label(f1, text="(include a BDF with 'thermal' in its filename in 'All BDF Files' too, "
+                            "for Post Processing's Thermal BDF to be auto-found)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+
+        self._add_file_row(f1, "Property Excel:", self.property_excel_path,
+                            [("Excel", "*.xlsx *.xls"), ("All", "*.*")])
+        self._add_file_row(f1, "Offset Element IDs:", self.element_excel_path,
+                            [("Excel", "*.xlsx *.xls"), ("All", "*.*")])
+        self._add_file_row(f1, "Nastran Exe:", self.nastran_path,
+                            [("Executable", "*.exe"), ("All", "*.*")])
+
+        mem_frame = ttk.Frame(f1)
+        mem_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(mem_frame, text="Requested Memory:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(mem_frame, textvariable=self.nastran_memory, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Label(mem_frame, text="(optional, e.g. 4gb / 500mb - blank = Nastran default)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        self._add_folder_row(f1, "Scratch Folder:", self.scratch_folder)
+        self._add_folder_row(f1, "Output Folder:", self.isu_output_folder)
+        ttk.Label(f1, text="(every run creates its own BaseModel_<timestamp> folder here)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+
+        split_frame = ttk.Frame(f1)
+        split_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(split_frame, text="Cases per Split:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(split_frame, textvariable=self.cases_per_split, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(split_frame, text="(blank/0 = solve as one BDF)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        par1_frame = ttk.Frame(f1)
+        par1_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(par1_frame, text="Max Parallel Runs:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(par1_frame, textvariable=self.isu_max_parallel_runs, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(par1_frame, text="(Nastran runs at the same time)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        # ---- Section 2: Post Processing ----
+        f2 = ttk.LabelFrame(main, text="\U0001F4E6  2. Post Processing", padding=10)
+        f2.pack(fill=tk.X, pady=5, padx=10)
+
+        self._add_file_row(f2, "Converter Exe:", self.converter_exe_path,
+                            [("Executable", "*.exe"), ("All", "*.*")])
+        self._add_file_row(f2, "Input Excel:", self.le_input_excel_path,
+                            [("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
+        ttk.Label(f2, text="(the settings excel with the 'Load_Extraction' sheet)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+        self._add_folder_row(f2, "Example LE Folder:", self.le_example_folder)
+        self._add_file_row(f2, "Pickle File:", self.le_pickle_path,
+                            [("Pickle", "*.pickle *.pkl"), ("All", "*.*")])
+        self._add_file_row(f2, "Load Extraction Exe:", self.le_exe_path,
+                            [("Executable", "*.exe"), ("All", "*.*")])
+
+        split2_frame = ttk.Frame(f2)
+        split2_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(split2_frame, text="Split Into:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(split2_frame, textvariable=self.le_split_count, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(split2_frame, text="(number of structure groups)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        mem2_frame = ttk.Frame(f2)
+        mem2_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(mem2_frame, text="Max Memory (GB):", width=18).pack(side=tk.LEFT)
+        ttk.Entry(mem2_frame, textvariable=self.le_max_memory, width=10).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(f2, text="(OP2 Folder, Output Folder H5, BDF Maneuver/Thermal and the LE split "
+                            "Output Folder are all auto-wired from stage 1's results)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(4, 2))
+
+        # ---- Section 3: Joint Run ----
+        f3 = ttk.LabelFrame(main, text="\U0001F517  3. Joint Run", padding=10)
+        f3.pack(fill=tk.X, pady=5, padx=10)
+
+        self._add_file_row(f3, "Main Input Excel:", self.jr_main_input_excel_path,
+                            [("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
+        self._add_file_row(f3, "Example Joint Input Excel:", self.jr_example_joint_excel_path,
+                            [("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
+        self._add_folder_row(f3, "Util Folder:", self.jr_util_folder)
+        self._add_file_row(f3, "License Checker Exe:", self.jr_license_checker_exe_path,
+                            [("Executable", "*.exe"), ("All", "*.*")])
+        self._add_file_row(f3, "Load Modifying Exe:", self.jr_load_modifying_exe_path,
+                            [("Executable", "*.exe"), ("All", "*.*")])
+        self._add_file_row(f3, "RSS Case Finding Exe:", self.jr_rss_exe_path,
+                            [("Executable", "*.exe"), ("All", "*.*")])
+        self._add_file_row(f3, "Joint Run Exe:", self.jr_joint_run_exe_path,
+                            [("Executable", "*.exe"), ("All", "*.*")])
+
+        par2_frame = ttk.Frame(f3)
+        par2_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(par2_frame, text="Max Parallel Runs:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(par2_frame, textvariable=self.jr_max_parallel_runs, width=10).pack(side=tk.LEFT, padx=5)
+
+        scale_frame = ttk.Frame(f3)
+        scale_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(scale_frame, text="LSC Scale Factor:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(scale_frame, textvariable=self.jr_scale_factor, width=10).pack(side=tk.LEFT, padx=5)
+
+        ttk.Label(f3, text="(Joint Load H5 Folder and Output Folder are auto-wired from stage 2's "
+                            "Load Extraction Results)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(4, 2))
+
+        # ---- Section 4: Actions (RUN sits at the very bottom) ----
+        f4 = ttk.LabelFrame(main, text="▶  4. Actions", padding=10)
+        f4.pack(fill=tk.X, pady=5, padx=10)
+
+        btn_row = ttk.Frame(f4)
+        btn_row.pack(fill=tk.X)
+        self.btn_run = ttk.Button(btn_row, text="▶  RUN", command=self.start_run, style='Accent.TButton')
+        self.btn_run.pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="Clear Log", command=self.clear_log).pack(side=tk.LEFT, padx=5)
+        ttk.Label(btn_row, text="(1. Solve base model  2. Post Processing (H5 + Load Extraction + "
+                                 "Load_Ext_H5.exe runs)  3. wait for those to finish  4. Joint Run)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(f4, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, pady=5)
+
+        # ---- Section 5: Log ----
+        f5 = ttk.LabelFrame(main, text="\U0001F4DC  5. Log", padding=10)
+        f5.pack(fill=tk.BOTH, expand=True, pady=5, padx=10)
+
+        self.log_text = scrolledtext.ScrolledText(f5, height=20, width=100, font=('Consolas', 10),
+                                                    bg=_APP_COLORS['log_bg'], fg=_APP_COLORS['log_fg'],
+                                                    insertbackground=_APP_COLORS['log_fg'], relief='flat',
+                                                    borderwidth=0)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def _add_file_row(self, parent, label, var, filetypes):
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X, pady=2)
+        ttk.Label(frame, text=label, width=18).pack(side=tk.LEFT)
+        ttk.Entry(frame, textvariable=var, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(frame, text="Browse", command=lambda: var.set(
+            filedialog.askopenfilename(filetypes=filetypes)
+        )).pack(side=tk.LEFT)
+
+    def _add_folder_row(self, parent, label, var):
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X, pady=2)
+        ttk.Label(frame, text=label, width=18).pack(side=tk.LEFT)
+        ttk.Entry(frame, textvariable=var, width=45).pack(side=tk.LEFT, padx=5)
+        ttk.Button(frame, text="Browse", command=lambda: var.set(
+            filedialog.askdirectory()
+        )).pack(side=tk.LEFT)
+
+    def log(self, msg):
+        def _do():
+            self.log_text.insert(tk.END, msg + "\n")
+            self.log_text.see(tk.END)
+        self.root.after(0, _do)
+
+    def clear_log(self):
+        self.log_text.delete(1.0, tk.END)
+
+    # ==================== BDF LIST OPS ====================
+    def _add_bdf(self):
+        paths = filedialog.askopenfilenames(filetypes=[("BDF", "*.bdf *.dat *.nas"), ("All", "*.*")])
+        for p in paths:
+            if p not in self.bdf_paths:
+                self.bdf_paths.append(p)
+                self.bdf_listbox.insert(tk.END, os.path.basename(p))
+
+    def _remove_bdf(self):
+        sel = self.bdf_listbox.curselection()
+        if sel:
+            idx = sel[0]
+            self.bdf_listbox.delete(idx)
+            del self.bdf_paths[idx]
+
+    def _add_maneuver_bdf(self):
+        files = filedialog.askopenfilenames(filetypes=[("BDF", "*.bdf *.dat *.nas"), ("All", "*.*")])
+        for f in files:
+            if f not in self.maneuver_bdfs:
+                self.maneuver_bdfs.append(f)
+                self.maneuver_listbox.insert(tk.END, os.path.basename(f))
+
+    def _remove_maneuver_bdf(self):
+        sel = self.maneuver_listbox.curselection()
+        if sel:
+            idx = sel[0]
+            self.maneuver_listbox.delete(idx)
+            del self.maneuver_bdfs[idx]
+
+    # ==================== AUTO-WIRING HELPERS ====================
+    @staticmethod
+    def _list_base_model_folders(output_base):
+        if not output_base or not os.path.isdir(output_base):
+            return set()
+        return {
+            name for name in os.listdir(output_base)
+            if name.startswith('BaseModel_') and os.path.isdir(os.path.join(output_base, name))
+        }
+
+    def _move_op2_files(self, search_root, dest_folder):
+        """Collect every .op2 under search_root (excluding dest_folder
+        itself) first, then move them all into dest_folder - two passes
+        so moving files mid-walk never disturbs os.walk's own traversal.
+        Returns how many were moved."""
+        dest_abs = os.path.abspath(dest_folder)
+        found = []
+        for dirpath, dirnames, filenames in os.walk(search_root):
+            if os.path.abspath(dirpath) == dest_abs:
+                dirnames[:] = []
+                continue
+            for fn in filenames:
+                if fn.lower().endswith('.op2'):
+                    found.append(os.path.join(dirpath, fn))
+
+        moved = 0
+        for src in found:
+            fn = os.path.basename(src)
+            dst = os.path.join(dest_folder, fn)
+            if os.path.exists(dst):
+                base, ext = os.path.splitext(fn)
+                i = 2
+                while os.path.exists(dst):
+                    dst = os.path.join(dest_folder, f"{base}_{i}{ext}")
+                    i += 1
+                self.log(f"    NOTE: name collision, {fn} -> {os.path.basename(dst)}")
+            shutil.move(src, dst)
+            moved += 1
+        return moved
+
+    @staticmethod
+    def _find_stru_bdf(base_model_folder, keyword):
+        """The '..._stru.bdf' (structure-only, prop-updated + offseted)
+        file whose name contains keyword ('maneuver'/'thermal'), or None."""
+        matches = []
+        for dirpath, _, filenames in os.walk(base_model_folder):
+            for fn in filenames:
+                fnl = fn.lower()
+                if fnl.endswith('_stru.bdf') and keyword in fnl:
+                    matches.append(os.path.join(dirpath, fn))
+        return matches[0] if matches else None
+
+    def _wait_for_exe_to_finish(self, exe_name, poll_seconds=30, max_wait_seconds=6 * 3600):
+        """Post Processing's loadext.bat runs are fire-and-forget (see
+        PostProcessingTab._run_tfx_batch_core), so there's no handle to
+        wait on - poll `tasklist` by image name instead, since that's the
+        only way to know they're done without touching that tab's code."""
+        if not exe_name:
+            return
+        self.log(f"\n  Waiting for every '{exe_name}' process to finish before starting Joint Run...")
+        waited = 0
+        last_log = 0
+        while waited < max_wait_seconds:
+            try:
+                result = subprocess.run(
+                    ["tasklist", "/FI", f"IMAGENAME eq {exe_name}"],
+                    capture_output=True, text=True
+                )
+                running = exe_name.lower() in result.stdout.lower()
+            except Exception as e:
+                self.log(f"  WARNING: could not check running processes ({e}) - proceeding without waiting.")
+                return
+            if not running:
+                self.log(f"  No more '{exe_name}' processes running (waited {waited}s).")
+                return
+            time.sleep(poll_seconds)
+            waited += poll_seconds
+            if waited - last_log >= 300:
+                self.log(f"    ...still waiting on '{exe_name}' ({waited}s elapsed)")
+                last_log = waited
+        self.log(f"  WARNING: gave up waiting for '{exe_name}' after {waited}s - proceeding anyway.")
+
+    # ==================== RUN (FULL PIPELINE) ====================
+    def start_run(self):
+        if not self.bdf_paths:
+            messagebox.showerror("Error", "Add at least one All BDF File")
+            return
+        if not self.property_excel_path.get().strip() or not os.path.exists(self.property_excel_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Property Excel")
+            return
+        if not self.nastran_path.get().strip() or not os.path.exists(self.nastran_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Nastran Exe")
+            return
+        if not self.isu_output_folder.get().strip():
+            messagebox.showerror("Error", "Select an Output Folder for Understanding Structure Type")
+            return
+        if not self.converter_exe_path.get().strip() or not os.path.exists(self.converter_exe_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Converter Exe")
+            return
+        if not self.le_input_excel_path.get().strip() or not os.path.exists(self.le_input_excel_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Post Processing Input Excel")
+            return
+        if not self.le_example_folder.get().strip() or not os.path.isdir(self.le_example_folder.get().strip()):
+            messagebox.showerror("Error", "Select a valid Example LE Folder")
+            return
+        if not self.le_exe_path.get().strip() or not os.path.exists(self.le_exe_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Load Extraction Exe")
+            return
+        if not self.jr_main_input_excel_path.get().strip() or not os.path.exists(self.jr_main_input_excel_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Joint Run Main Input Excel")
+            return
+        if not self.jr_example_joint_excel_path.get().strip() or not os.path.exists(self.jr_example_joint_excel_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Example Joint Input Excel")
+            return
+        if not self.jr_util_folder.get().strip() or not os.path.isdir(self.jr_util_folder.get().strip()):
+            messagebox.showerror("Error", "Select a valid Util Folder")
+            return
+        if not self.jr_license_checker_exe_path.get().strip() or not os.path.exists(self.jr_license_checker_exe_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid License Checker Exe")
+            return
+        if not self.jr_load_modifying_exe_path.get().strip() or not os.path.exists(self.jr_load_modifying_exe_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Load Modifying Exe")
+            return
+        if not self.jr_rss_exe_path.get().strip() or not os.path.exists(self.jr_rss_exe_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid RSS Case Finding Exe")
+            return
+        if not self.jr_joint_run_exe_path.get().strip() or not os.path.exists(self.jr_joint_run_exe_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Joint Run Exe")
+            return
+        try:
+            if int(float(self.le_split_count.get())) <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            messagebox.showerror("Error", "Split Into must be a positive number")
+            return
+        try:
+            if float(self.le_max_memory.get()) <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            messagebox.showerror("Error", "Post Processing Max Memory must be a positive number")
+            return
+        try:
+            if int(float(self.jr_max_parallel_runs.get())) <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            messagebox.showerror("Error", "Joint Run Max Parallel Runs must be a positive number")
+            return
+        try:
+            float(self.jr_scale_factor.get())
+        except (ValueError, TypeError):
+            messagebox.showerror("Error", "LSC Scale Factor must be a number")
+            return
+
+        self.is_running = True
+        self.btn_run.config(state=tk.DISABLED)
+        self.root.after(0, lambda: self.progress_var.set(0))
+        threading.Thread(target=self._run_pipeline, daemon=True).start()
+
+    def _run_pipeline(self):
+        t_start = time.time()
+        try:
+            self.log("\n" + "#" * 70)
+            self.log("FULL RUN: UNDERSTANDING STRUCTURE TYPE -> POST PROCESSING -> JOINT RUN")
+            self.log("#" * 70)
+
+            # ==================== STAGE A: UNDERSTANDING STRUCTURE TYPE ====================
+            self.log("\n" + "#" * 70)
+            self.log("STAGE 1/3: SOLVING BASE MODEL")
+            self.log("#" * 70)
+
+            t3 = self.tab3_tool
+            t3.bdf_paths = list(self.bdf_paths)
+            t3.maneuver_bdfs = list(self.maneuver_bdfs)
+            t3.property_excel_path.set(self.property_excel_path.get())
+            t3.element_excel_path.set(self.element_excel_path.get())
+            t3.nastran_path.set(self.nastran_path.get())
+            t3.nastran_memory.set(self.nastran_memory.get())
+            t3.scratch_folder.set(self.scratch_folder.get())
+            t3.output_folder.set(self.isu_output_folder.get())
+            t3.cases_per_split.set(self.cases_per_split.get())
+            t3.max_parallel_runs.set(self.isu_max_parallel_runs.get())
+            self.root.after(0, self._refresh_tab3_listboxes)
+
+            t3.load_properties()
+            if not t3.properties_loaded:
+                self.log("\nSTOPPED: Property Excel failed to load - see the Understanding "
+                          "Structure Type log/tab above for details.")
+                return
+            if self.element_excel_path.get().strip():
+                t3.load_element_ids()
+
+            output_base = self.isu_output_folder.get().strip()
+            before_folders = self._list_base_model_folders(output_base)
+
+            self.root.after(0, lambda: self.progress_var.set(5))
+            t3._run_solve()
+            self.root.after(0, lambda: self.progress_var.set(33))
+
+            after_folders = self._list_base_model_folders(output_base)
+            new_folders = after_folders - before_folders
+            if len(new_folders) == 1:
+                run_folder = os.path.join(output_base, new_folders.pop())
+            elif new_folders:
+                candidates = [os.path.join(output_base, n) for n in new_folders]
+                run_folder = max(candidates, key=os.path.getmtime)
+            else:
+                run_folder = None
+
+            if not run_folder:
+                self.log("\nSTOPPED: no new BaseModel_<timestamp> folder appeared - the solve "
+                          "likely failed before writing any output. See the Understanding "
+                          "Structure Type log/tab above.")
+                return
+            self.log(f"\n  Base model run folder: {run_folder}")
+
+            base_model_folder = os.path.join(run_folder, "_base_model")
+            op2_count_check = sum(
+                1 for dirpath, _, filenames in os.walk(base_model_folder) for fn in filenames
+                if fn.lower().endswith('.op2')
+            )
+            if op2_count_check == 0:
+                self.log("\nSTOPPED: no .op2 files were produced - Post Processing not started. "
+                          "See the Understanding Structure Type log/tab above.")
+                return
+            self.log(f"  {op2_count_check} .op2 file(s) found")
+
+            # ==================== STAGE B: POST PROCESSING ====================
+            self.log("\n" + "#" * 70)
+            self.log("STAGE 2/3: POST PROCESSING")
+            self.log("#" * 70)
+
+            op2_results_dir = os.path.join(base_model_folder, "OP2_Results")
+            h5_results_dir = os.path.join(base_model_folder, "H5_Results")
+            le_results_dir = os.path.join(base_model_folder, "Load_Extraction_Results")
+            os.makedirs(op2_results_dir, exist_ok=True)
+            os.makedirs(h5_results_dir, exist_ok=True)
+            os.makedirs(le_results_dir, exist_ok=True)
+
+            n_moved = self._move_op2_files(base_model_folder, op2_results_dir)
+            self.log(f"  Moved {n_moved} .op2 file(s) into {op2_results_dir}")
+
+            maneuver_stru = self._find_stru_bdf(base_model_folder, "maneuver")
+            thermal_stru = self._find_stru_bdf(base_model_folder, "thermal")
+            if not maneuver_stru:
+                self.log("  WARNING: no '..._stru.bdf' file with 'maneuver' in its name was found "
+                          "under _base_model - make sure a maneuver BDF is included in 'All BDF "
+                          "Files' (not just as the separate Maneuver/Offset Source entry).")
+            if not thermal_stru:
+                self.log("  WARNING: no '..._stru.bdf' file with 'thermal' in its name was found "
+                          "under _base_model - make sure a thermal BDF is included in 'All BDF Files'.")
+            self.log(f"  BDF (Maneuver) -> {maneuver_stru}")
+            self.log(f"  BDF (Thermal) -> {thermal_stru}")
+
+            t4 = self.tab4_tool
+            t4.op2_folder.set(op2_results_dir)
+            t4.converter_exe_path.set(self.converter_exe_path.get())
+            t4.output_folder.set(h5_results_dir)
+            t4.le_input_excel_path.set(self.le_input_excel_path.get())
+            t4.le_example_folder.set(self.le_example_folder.get())
+            t4.le_maneuver_bdf_path.set(maneuver_stru or "")
+            t4.le_thermal_bdf_path.set(thermal_stru or "")
+            t4.le_pickle_path.set(self.le_pickle_path.get())
+            t4.le_split_count.set(self.le_split_count.get())
+            t4.le_output_folder.set(le_results_dir)
+            t4.le_exe_path.set(self.le_exe_path.get())
+            t4.le_max_memory.set(self.le_max_memory.get())
+
+            self.root.after(0, lambda: self.progress_var.set(40))
+            t4._run_pipeline()
+            self.root.after(0, lambda: self.progress_var.set(66))
+
+            group_folders_found = [
+                name for name in (os.listdir(le_results_dir) if os.path.isdir(le_results_dir) else [])
+                if os.path.isdir(os.path.join(le_results_dir, name)) and name.lower().startswith('loadextraction_')
+            ]
+            if not group_folders_found:
+                self.log("\nSTOPPED: no LoadExtraction_NN folders were created - Joint Run not "
+                          "started. See the Post Processing log/tab above.")
+                return
+            self.log(f"  {len(group_folders_found)} LoadExtraction_NN group folder(s) found")
+
+            self._wait_for_exe_to_finish(os.path.basename(self.le_exe_path.get().strip()))
+            self.root.after(0, lambda: self.progress_var.set(70))
+
+            # ==================== STAGE C: JOINT RUN ====================
+            self.log("\n" + "#" * 70)
+            self.log("STAGE 3/3: JOINT RUN")
+            self.log("#" * 70)
+
+            joint_run_dir = os.path.join(base_model_folder, "Joint_Run")
+            os.makedirs(joint_run_dir, exist_ok=True)
+
+            t5 = self.tab5_tool
+            t5.h5_folder.set(le_results_dir)
+            t5.main_input_excel_path.set(self.jr_main_input_excel_path.get())
+            t5.example_joint_excel_path.set(self.jr_example_joint_excel_path.get())
+            t5.util_folder.set(self.jr_util_folder.get())
+            t5.license_checker_exe_path.set(self.jr_license_checker_exe_path.get())
+            t5.load_modifying_exe_path.set(self.jr_load_modifying_exe_path.get())
+            t5.rss_exe_path.set(self.jr_rss_exe_path.get())
+            t5.joint_run_exe_path.set(self.jr_joint_run_exe_path.get())
+            t5.output_folder.set(joint_run_dir)
+            t5.max_parallel_runs.set(self.jr_max_parallel_runs.get())
+            t5.scale_factor.set(self.jr_scale_factor.get())
+
+            self.root.after(0, lambda: self.progress_var.set(75))
+            t5._run_pipeline()
+            self.root.after(0, lambda: self.progress_var.set(100))
+
+            self.log(f"\n{'#' * 70}")
+            self.log(f"FULL RUN COMPLETE (total {time.time() - t_start:.1f}s)")
+            self.log(f"  Base model run folder: {run_folder}")
+            self.log(f"{'#' * 70}")
+
+        except Exception as e:
+            self.log(f"\nERROR after {time.time() - t_start:.1f}s: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
+
+    def _refresh_tab3_listboxes(self):
+        t3 = self.tab3_tool
+        t3.bdf_listbox.delete(0, tk.END)
+        for p in t3.bdf_paths:
+            t3.bdf_listbox.insert(tk.END, os.path.basename(p))
+        t3.maneuver_listbox.delete(0, tk.END)
+        for p in t3.maneuver_bdfs:
+            t3.maneuver_listbox.insert(tk.END, os.path.basename(p))
 
 
 def main():

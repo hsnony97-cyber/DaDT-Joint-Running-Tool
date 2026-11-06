@@ -4822,7 +4822,7 @@ class FullRunTab:
                     matches.append(os.path.join(dirpath, fn))
         return matches[0] if matches else None
 
-    def _wait_for_exe_to_finish(self, exe_name, poll_seconds=30, max_wait_seconds=6 * 3600):
+    def _wait_for_exe_to_finish(self, exe_name, poll_seconds=30, max_wait_seconds=12 * 3600):
         """Post Processing's loadext.bat runs are fire-and-forget (see
         PostProcessingTab._run_tfx_batch_core), so there's no handle to
         wait on - poll `tasklist` by image name instead, since that's the

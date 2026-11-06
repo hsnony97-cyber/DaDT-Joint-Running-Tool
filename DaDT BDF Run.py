@@ -3524,7 +3524,7 @@ class JointRunTab:
     Input' sheet from the Main Input Excel's DTCG_Input_Excel_Data rows
     whose Structure Name matches that Set. Runs the License Checker exe
     once, then per Set folder: writes a User_Log.csv, copies in and runs
-    the Load Modifying exe (which produces Joint_Loads_Arrangement.h5 -
+    the Load Modifying exe (which produces Joint_Loads_Arranged.h5 -
     the original Set-named H5 is then deleted), runs the RSS Case Finding
     exe (finds the H5 on its own, cwd'd into that folder), writes the
     matching Cap/Skin Joint Loads CSV rows (scaled by a user factor) into
@@ -3659,7 +3659,8 @@ class JointRunTab:
             filedialog.askopenfilename(filetypes=[("Executable", "*.exe"), ("All", "*.*")])
         )).pack(side=tk.LEFT)
         ttk.Label(f1, text="(copied into every Set folder and run there, before RSS Case Finding - "
-                            "writes Joint_Loads_Arrangement.h5, after which the Set-named H5 is deleted)",
+                            "writes Joint_Loads_Arranged.h5, after which every other .h5 in the "
+                            "folder is deleted)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
 
         # RSS Case Finding Exe
@@ -3670,8 +3671,9 @@ class JointRunTab:
         ttk.Button(rss_frame, text="Browse", command=lambda: self.rss_exe_path.set(
             filedialog.askopenfilename(filetypes=[("Executable", "*.exe"), ("All", "*.*")])
         )).pack(side=tk.LEFT)
-        ttk.Label(f1, text="(run with no arguments, cwd'd into each Set folder - it finds the H5 "
-                            "there on its own and writes the Cap/Skin Joint Loads CSVs)",
+        ttk.Label(f1, text="(copied into every Set folder and run there with no arguments - it "
+                            "finds the H5 on its own and writes the Cap/Skin Joint Loads CSVs; "
+                            "the copy is removed again before Joint Run runs)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
 
         # Joint Run Exe
@@ -3682,8 +3684,9 @@ class JointRunTab:
         ttk.Button(jr_frame, text="Browse", command=lambda: self.joint_run_exe_path.set(
             filedialog.askopenfilename(filetypes=[("Executable", "*.exe"), ("All", "*.*")])
         )).pack(side=tk.LEFT)
-        ttk.Label(f1, text="(run last, cwd'd into each Set folder, up to Max Parallel Runs at a "
-                            "time - refills as soon as a slot frees up)",
+        ttk.Label(f1, text="(run last: the RSS Case Finding / Load Modifying exe copies are "
+                            "deleted, then this is copied into every Set folder and run there, "
+                            "up to Max Parallel Runs at a time - refills as soon as a slot frees up)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
 
         # Output Folder
@@ -3965,8 +3968,8 @@ class JointRunTab:
         """For every Set folder: write User_Log.csv, copy in the Load
         Modifying exe, and run it (up to Max Parallel Runs at a time,
         waiting for all to finish). Once a run produces
-        Joint_Loads_Arrangement.h5, the original Joint_Loads_<Set>.h5 is
-        deleted so only Joint_Loads_Arrangement.h5 remains. Returns
+        Joint_Loads_Arranged.h5, the original Joint_Loads_<Set>.h5 is
+        deleted so only Joint_Loads_Arranged.h5 remains. Returns
         (n_ok, n_total)."""
         t_start = time.time()
         self.log("\n" + "=" * 70)
@@ -4024,7 +4027,7 @@ class JointRunTab:
                                   "Load Arrangement Direction"])
                 writer.writerow([
                     "Auto",
-                    os.path.join(dest_folder, "Joint_Loads_Arrangement.h5"),
+                    os.path.join(dest_folder, "Joint_Loads_Arranged.h5"),
                     dest_folder,
                     f"{set_name}_Working Folder",
                     joint_xl_path,
@@ -4049,13 +4052,13 @@ class JointRunTab:
             except Exception as e:
                 return set_name, False, str(e)
 
-            arrangement_path = os.path.join(dest_folder, "Joint_Loads_Arrangement.h5")
+            arrangement_path = os.path.join(dest_folder, "Joint_Loads_Arranged.h5")
             if os.path.exists(arrangement_path):
-                original_h5 = os.path.join(dest_folder, f"Joint_Loads_{set_name}.h5")
-                if os.path.exists(original_h5):
-                    os.remove(original_h5)
+                for fn in os.listdir(dest_folder):
+                    if fn.lower().endswith('.h5') and fn.lower() != 'joint_loads_arranged.h5':
+                        os.remove(os.path.join(dest_folder, fn))
                 return set_name, ok, None
-            return set_name, False, "Joint_Loads_Arrangement.h5 was not produced"
+            return set_name, False, "Joint_Loads_Arranged.h5 was not produced"
 
         n_ok = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -4076,9 +4079,10 @@ class JointRunTab:
 
     # ==================== STAGE 4: RSS CASE FINDING (PARALLEL) ====================
     def _run_rss_case_finding_core(self):
-        """Run the RSS Case Finding exe (no arguments - it finds the H5 in
-        its own cwd) in every Set folder, up to Max Parallel Runs at a
-        time, waiting for all of them to finish. Returns (n_ok, n_total)."""
+        """Copy the RSS Case Finding exe into every Set folder and run it
+        there (no arguments - it finds the H5 in its own cwd), up to Max
+        Parallel Runs at a time, waiting for all of them to finish.
+        Returns (n_ok, n_total)."""
         t_start = time.time()
         self.log("\n" + "=" * 70)
         self.log("RUNNING RSS CASE FINDING")
@@ -4095,14 +4099,19 @@ class JointRunTab:
             max_workers = max(1, int(float(self.max_parallel_runs.get())))
         except (ValueError, TypeError):
             max_workers = 1
-        self.log(f"  {n} Set folder(s) found, running up to {max_workers} at a time")
+
+        for dest_folder in set_folders:
+            shutil.copy2(exe_path, os.path.join(dest_folder, os.path.basename(exe_path)))
+        self.log(f"  RSS Case Finding exe copied into {n} Set folder(s)")
+        self.log(f"  Running up to {max_workers} at a time")
 
         def _run_one(dest_folder):
             set_name = os.path.basename(dest_folder)
+            local_exe = os.path.join(dest_folder, os.path.basename(exe_path))
             log_path = os.path.join(dest_folder, "rss_case_finding_log.txt")
             try:
                 with open(log_path, 'w') as log_file:
-                    result = subprocess.run([exe_path], cwd=dest_folder, stdout=log_file,
+                    result = subprocess.run([local_exe], cwd=dest_folder, stdout=log_file,
                                              stderr=subprocess.STDOUT)
                 return set_name, result.returncode == 0, None
             except Exception as e:
@@ -4262,13 +4271,14 @@ class JointRunTab:
 
     # ==================== STAGE 6: JOINT RUN (ROLLING PARALLEL POOL) ====================
     def _run_joint_run_exe_core(self):
-        """Run the Joint Run exe (no arguments) in every Set folder, cwd'd
-        into it, keeping up to Max Parallel Runs running at the same time
-        - as soon as one finishes, the next queued Set starts immediately
-        (ThreadPoolExecutor's own scheduling already does this: submitting
-        every task up front means a free worker always pulls the next one,
-        rather than waiting for a whole batch of N to finish). Waits for
-        every run to finish. Returns (n_ok, n_total)."""
+        """Delete the RSS Case Finding / Load Modifying exe copies left in
+        every Set folder, then copy in and run the Joint Run exe there (no
+        arguments), keeping up to Max Parallel Runs running at the same
+        time - as soon as one finishes, the next queued Set starts
+        immediately (ThreadPoolExecutor's own scheduling already does
+        this: submitting every task up front means a free worker always
+        pulls the next one, rather than waiting for a whole batch of N to
+        finish). Waits for every run to finish. Returns (n_ok, n_total)."""
         t_start = time.time()
         self.log("\n" + "=" * 70)
         self.log("RUNNING JOINT RUN")
@@ -4281,18 +4291,30 @@ class JointRunTab:
         n = len(set_folders)
 
         exe_path = self.joint_run_exe_path.get().strip()
+        rss_exe_name = os.path.basename(self.rss_exe_path.get().strip())
+        lm_exe_name = os.path.basename(self.load_modifying_exe_path.get().strip())
         try:
             max_workers = max(1, int(float(self.max_parallel_runs.get())))
         except (ValueError, TypeError):
             max_workers = 1
-        self.log(f"  {n} Set folder(s) found, keeping up to {max_workers} running at a time")
+
+        for dest_folder in set_folders:
+            for stale_name in (rss_exe_name, lm_exe_name):
+                stale_path = os.path.join(dest_folder, stale_name)
+                if os.path.exists(stale_path):
+                    os.remove(stale_path)
+            shutil.copy2(exe_path, os.path.join(dest_folder, os.path.basename(exe_path)))
+        self.log(f"  RSS Case Finding / Load Modifying exe copies removed, Joint Run exe "
+                  f"copied into {n} Set folder(s)")
+        self.log(f"  Keeping up to {max_workers} running at a time")
 
         def _run_one(dest_folder):
             set_name = os.path.basename(dest_folder)
+            local_exe = os.path.join(dest_folder, os.path.basename(exe_path))
             log_path = os.path.join(dest_folder, "joint_run_log.txt")
             try:
                 with open(log_path, 'w') as log_file:
-                    result = subprocess.run([exe_path], cwd=dest_folder, stdout=log_file,
+                    result = subprocess.run([local_exe], cwd=dest_folder, stdout=log_file,
                                              stderr=subprocess.STDOUT)
                 return set_name, result.returncode == 0, None
             except Exception as e:

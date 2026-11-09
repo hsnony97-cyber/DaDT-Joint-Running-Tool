@@ -4898,6 +4898,9 @@ class JointRunTab:
         except (ValueError, TypeError):
             max_workers = 1
 
+        # Main Input Excel'in "Load_Modify" sayfasından, her Set için
+        # "Load Arrangement Direction" değerini oku - bu değer aşağıda
+        # yazılacak User_Log.csv'nin bir sütunu olacak.
         direction_map = {}
         try:
             xl = pd.ExcelFile(main_excel)
@@ -4918,7 +4921,7 @@ class JointRunTab:
         except Exception as e:
             self.log(f"  WARNING: could not read 'Load_Modify' sheet: {e}")
 
-        # ---- Write User_Log.csv + copy the exe into every Set folder ----
+        # ---- Her Set klasörüne User_Log.csv yaz ve exe'yi kopyala ----
         for dest_folder in set_folders:
             set_name = os.path.basename(dest_folder)
             joint_xl_path = os.path.join(dest_folder, set_name + example_ext)
@@ -4927,6 +4930,9 @@ class JointRunTab:
                 self.log(f"  WARNING: no Load Arrangement Direction found for '{set_name}' "
                           f"in the Load_Modify sheet.")
 
+            # Load Modifying exe'sinin bekledği formatta User_Log.csv yaz -
+            # bu exe çalıştığında kendi çalışma klasöründe bu dosyayı okuyup
+            # hangi H5'i hangi Excel'e göre nasıl düzenleyeceğini öğrenir.
             user_log_path = os.path.join(dest_folder, "User_Log.csv")
             with open(user_log_path, 'w', newline='') as f:
                 writer = csv.writer(f)
@@ -4948,6 +4954,10 @@ class JointRunTab:
         self.log(f"  User_Log.csv written and Load Modifying exe copied into {n} Set folder(s)")
         self.log(f"  Running up to {max_workers} at a time")
 
+        # _run_one: Load Modifying exe'sini bu Set klasöründe (cwd=dest_folder)
+        # çalıştır, başarılı olup "Joint_Loads_Arranged.h5" üretmişse,
+        # klasördeki DİĞER tüm .h5 dosyalarını (orijinal Joint_Loads_<Set>.h5
+        # dahil) sil - geriye sadece "Arranged" (düzenlenmiş) H5 kalsın.
         def _run_one(dest_folder):
             set_name = os.path.basename(dest_folder)
             local_exe = os.path.join(dest_folder, os.path.basename(exe_path))
@@ -4968,6 +4978,8 @@ class JointRunTab:
                 return set_name, ok, None
             return set_name, False, "Joint_Loads_Arranged.h5 was not produced"
 
+        # Tüm Set klasörlerini, en fazla max_workers kadarı aynı anda
+        # çalışacak şekilde paralel işle; hepsi bitene kadar bekle.
         n_ok = 0
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(_run_one, f) for f in set_folders]
@@ -4986,6 +4998,10 @@ class JointRunTab:
         return n_ok, n
 
     # ==================== STAGE 4: RSS CASE FINDING (PARALLEL) ====================
+    # _run_rss_case_finding_core: Load Modifying ile aynı "exe'yi her Set
+    # klasörüne kopyala, cwd=dest_folder ile argümansız çalıştır, paralel
+    # işle" deseninin daha basit hali - burada argüman/CSV üretimi yok,
+    # exe kendi klasöründeki (Joint_Loads_Arranged.h5) dosyayı kendisi bulur.
     def _run_rss_case_finding_core(self):
         """Copy the RSS Case Finding exe into every Set folder and run it
         there (no arguments - it finds the H5 in its own cwd), up to Max
@@ -5068,7 +5084,8 @@ class JointRunTab:
             scale = 1.0
         self.log(f"  Scale factor: {scale}")
 
-        # CSV header (normalized) -> Limit Stress Check header (exact, as in the template)
+        # CSV başlığı (normalize) -> Limit Stress Check sayfasındaki TAM
+        # başlık adı (şablonda yazdığı gibi, boşluklu/büyük-küçük harfli).
         col_map = {
             'fbearingx': 'FX Bearing',
             'fbearingy': 'FY Bearing',
@@ -5089,6 +5106,8 @@ class JointRunTab:
                 self.root.after(0, lambda p=65 + (idx / n) * 15: self.progress_var.set(p))
                 continue
 
+            # RSS Case Finding'in ürettiği Cap/Skin CSV'lerini Bar Element ID
+            # ile indexlenmiş halde oku.
             cap_df = self._read_csv_keyed(os.path.join(dest_folder, "Cap_Joint_Loads_Arranged.csv"))
             skin_df = self._read_csv_keyed(os.path.join(dest_folder, "Skin_Joint_Loads_Arranged.csv"))
             if cap_df is None:
@@ -5106,6 +5125,9 @@ class JointRunTab:
                 self.root.after(0, lambda p=65 + (idx / n) * 15: self.progress_var.set(p))
                 continue
 
+            # "Spectrum Joint Input" sayfasının başlığından Bar Element ID
+            # ve Type of Element sütun numaralarını bul - bu sayfa HANGİ
+            # elemanların (ve Cap mı Skin mi olduklarının) işleneceğini belirler.
             sp_header = {}
             for cell in next(spectrum_ws.iter_rows(min_row=1, max_row=1)):
                 if cell.value:
@@ -5124,10 +5146,19 @@ class JointRunTab:
                     lsc_header[self._normalize_header(cell.value)] = cell.column
             lsc_bar_id_col = lsc_header.get('barelementid')
 
+            # Yazmadan önce "Limit Stress Check" sayfasındaki eski satırları temizle.
             for col_idx in lsc_header.values():
                 for r in range(2, 2002):
                     lsc_ws.cell(row=r, column=col_idx).value = None
 
+            # "Spectrum Joint Input" sayfasının HER satırı için: eleman
+            # tipine (Cap/Skin) göre doğru CSV'den (cap_df/skin_df) o Bar
+            # Element ID'nin satırını bul, bulunan F/N Bearing-Bypass
+            # değerlerini scale çarpanıyla çarpıp "Limit Stress Check"
+            # sayfasına aynı satır sırasıyla yaz. Eşleşme bulunamazsa satır
+            # sırası korunur (out_row yine ilerler) ama boş bırakılır - böylece
+            # Spectrum Joint Input ile Limit Stress Check satırları HER ZAMAN
+            # birbirine karşılık gelir.
             last_row = spectrum_ws.max_row
             n_written = 0
             n_missing = 0
@@ -5154,6 +5185,8 @@ class JointRunTab:
 
                 if lsc_bar_id_col:
                     lsc_ws.cell(row=out_row, column=lsc_bar_id_col).value = bar_id
+                # col_map'teki her CSV sütununu (normalize) ilgili Limit
+                # Stress Check başlığına eşleyip değeri scale ile çarparak yaz.
                 for norm_name, lsc_name in col_map.items():
                     col_idx = lsc_header.get(self._normalize_header(lsc_name))
                     if not col_idx:
@@ -5208,6 +5241,9 @@ class JointRunTab:
         except (ValueError, TypeError):
             max_workers = 1
 
+        # Önceki aşamalardan kalan RSS Case Finding / Load Modifying exe
+        # kopyalarını her Set klasöründen temizle (artık gerekli değiller,
+        # klasörü karıştırmasınlar), sonra Joint Run exe'sini kopyala.
         for dest_folder in set_folders:
             for stale_name in (rss_exe_name, lm_exe_name):
                 stale_path = os.path.join(dest_folder, stale_name)

@@ -6156,6 +6156,19 @@ class IterativeFullRunTab:
     (Bar Property, Skin Property, Offset element ID sheets, Load_
     Extraction, DTCG_Input_Excel_Data, Load_Modify) - the user's own file
     is never modified; everything happens on a private working copy."""
+    # Türkçe özet: FullRunTab'ın yaptığı 3 aşamalı zincirlemenin (Understanding
+    # Structure Type -> Post Processing -> Joint Run) AYNISI, N kere
+    # TEKRARLANIR. Her iterasyonda: (1) base model çözülür ve DTCG_Input_
+    # Excel_Data'nın t1(mm)/tfem sütunları, solve'ün yazdığı gerçek PBARL
+    # dim1 değerleriyle doldurulur; (2) Post Processing + Joint Run koşulur;
+    # (3) Joint Run'ın ürettiği "Nasgro Final Summary" CSV'lerinden bir uçuş
+    # saati (flight hours) boyutlandırma özeti çıkarılır (referans
+    # Summary_Creating.py script'inin Python'a taşınmış hali); (4) SON
+    # iterasyon DIŞINDAKİ her iterasyonda: disk yer açmak için o iterasyonun
+    # H5 dosyaları silinir, ve boyutlandırma özetindeki yönetici (governing)
+    # kalınlık değerleri bir sonraki iterasyonun Bar Property Dim1 (SADECE
+    # Dim1) değerleri olarak "working excel"e yazılır - kullanıcının asıl
+    # Master Input Excel'i HİÇBİR ZAMAN değiştirilmez.
 
     def __init__(self, parent_frame, root, tab3_tool, tab4_tool, tab5_tool):
         self.root = root
@@ -6167,7 +6180,7 @@ class IterativeFullRunTab:
         # ---- Section 1: Understanding Structure Type ----
         self.bdf_paths = []
         self.maneuver_bdfs = []
-        self.master_input_excel_path = tk.StringVar()
+        self.master_input_excel_path = tk.StringVar()   # Bar/Skin Property + DTCG_Input_Excel_Data + Load_Modify vb. HER sayfayı içeren tek Excel
         self.nastran_path = tk.StringVar()
         self.nastran_memory = tk.StringVar()
         self.scratch_folder = tk.StringVar()
@@ -6193,9 +6206,9 @@ class IterativeFullRunTab:
         self.jr_max_parallel_runs = tk.StringVar(value="4")
         self.jr_scale_factor = tk.StringVar(value="1")
 
-        # ---- Section 4: Iteration settings ----
-        self.target_flight_hours = tk.StringVar()
-        self.n_iterations = tk.StringVar(value="3")
+        # ---- Section 4: Iterasyon ayarları ----
+        self.target_flight_hours = tk.StringVar()   # hedef uçuş saati - boyutlandırmanın "yeterli" sayılma eşiği
+        self.n_iterations = tk.StringVar(value="3")  # toplam kaç kere tüm zincirin tekrarlanacağı
 
         self.is_running = False
 

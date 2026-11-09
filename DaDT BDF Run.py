@@ -5427,10 +5427,21 @@ class FullRunTab:
     this waits for every Load_Ext_H5.exe process to actually exit
     (polling tasklist by image name) before starting Joint Run, since
     Joint Run's H5 scan depends on them having finished writing."""
+    # Türkçe özet: Bu sınıf KENDİ hesaplama mantığını içermez - sadece
+    # Understanding Structure Type (tab3_tool), Post Processing (tab4_tool)
+    # ve Joint Run (tab5_tool) sekmelerinin GERÇEK nesnelerini (constructor'da
+    # referans olarak alınmış, kopyalanmamış) kullanıp, bu sekmenin kendi
+    # girdi alanlarını o nesnelerin StringVar'larına yazıp, o nesnelerin
+    # kendi (RUN butonlarının zaten çağırdığı) pipeline metodlarını SIRAYLA
+    # çağırır. Böylece 3 sekmenin kodu hiç değiştirilmeden, tek bir "Full
+    # Run" düğmesinden uçtan uca çalıştırılabilir.
 
     def __init__(self, parent_frame, root, tab3_tool, tab4_tool, tab5_tool):
         self.root = root
         self.parent_frame = parent_frame
+        # Bu üç referans KOPYA değil - gerçek tab nesneleri. Bu sekmenin
+        # yazdığı her şey (StringVar değerleri, bdf_paths listesi vb.)
+        # doğrudan o sekmelerin kendi state'ine yazılır.
         self.tab3_tool = tab3_tool
         self.tab4_tool = tab4_tool
         self.tab5_tool = tab5_tool
@@ -5724,6 +5735,10 @@ class FullRunTab:
             del self.maneuver_bdfs[idx]
 
     # ==================== AUTO-WIRING HELPERS ====================
+    # _list_base_model_folders: Understanding Structure Type sekmesinin
+    # ("BaseModel_YYYYMMDD_HHMMSS" adıyla, zaman damgalı) ürettiği çıktı
+    # klasörlerinin adlarını listele - _run_pipeline, solve'den ÖNCE ve
+    # SONRA bu kümeyi alıp farkına bakarak hangi klasörün YENİ üretildiğini bulur.
     @staticmethod
     def _list_base_model_folders(output_base):
         if not output_base or not os.path.isdir(output_base):
@@ -5740,6 +5755,8 @@ class FullRunTab:
         Returns how many were moved."""
         dest_abs = os.path.abspath(dest_folder)
         found = []
+        # 1. geçiş: hedef klasörün KENDİSİNİ hariç tutarak (dirnames[:] = []
+        # ile os.walk'ın o alt klasöre inmesini durdurarak) tüm .op2'leri topla.
         for dirpath, dirnames, filenames in os.walk(search_root):
             if os.path.abspath(dirpath) == dest_abs:
                 dirnames[:] = []
@@ -5748,6 +5765,9 @@ class FullRunTab:
                 if fn.lower().endswith('.op2'):
                     found.append(os.path.join(dirpath, fn))
 
+        # 2. geçiş: şimdi hepsini taşı - os.walk tamamen bittiği için
+        # taşıma işlemi gezinmeyi bozmaz. Aynı isimde dosya zaten varsa
+        # "_2", "_3", ... ekleyerek üzerine yazmadan benzersiz bir ad bul.
         moved = 0
         for src in found:
             fn = os.path.basename(src)
@@ -5763,6 +5783,11 @@ class FullRunTab:
             moved += 1
         return moved
 
+    # _find_stru_bdf: BarPropertySolverTab'ın ürettiği "..._stru.bdf"
+    # (structure-only, Excel özellikleri + offset uygulanmış) dosyalardan
+    # adında keyword ('maneuver' ya da 'thermal') geçeni bul - Post
+    # Processing'in "BDF (Maneuver)"/"BDF (Thermal)" alanlarına otomatik
+    # doldurulacak dosya budur.
     @staticmethod
     def _find_stru_bdf(base_model_folder, keyword):
         """The '..._stru.bdf' (structure-only, prop-updated + offseted)
@@ -5775,6 +5800,11 @@ class FullRunTab:
                     matches.append(os.path.join(dirpath, fn))
         return matches[0] if matches else None
 
+    # _wait_for_exe_to_finish: Post Processing'in loadext.bat çalıştırmaları
+    # "fırlat ve unut" (Popen, beklenmeden) olduğu için elde BEKLENECEK bir
+    # process handle'ı yok. Bu yüzden Windows'un `tasklist` komutuyla, verilen
+    # .exe adının hâlâ çalışıp çalışmadığı periyodik olarak sorgulanır -
+    # PostProcessingTab'ın kodunu değiştirmeden bitişini anlamanın tek yolu bu.
     def _wait_for_exe_to_finish(self, exe_name, poll_seconds=30, max_wait_seconds=12 * 3600):
         """Post Processing's loadext.bat runs are fire-and-forget (see
         PostProcessingTab._run_tfx_batch_core), so there's no handle to

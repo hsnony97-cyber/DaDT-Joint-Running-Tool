@@ -3398,6 +3398,9 @@ class BarPropertySolverTab:
         stable_since = None
         fallback_stable_seconds = 180
 
+        # _find_op2: .op2 dosyasını önce çıktı klasöründe, yoksa scratch
+        # klasöründe ara (bazı Nastran kurulumları .op2'yi out= yerine
+        # scratch klasörüne yazabiliyor); sadece boyutu > 0 olanı say.
         def _find_op2():
             for d in op2_search_dirs:
                 candidate = os.path.join(d, base + '.op2')
@@ -3409,6 +3412,8 @@ class BarPropertySolverTab:
             elapsed = time.time() - start
 
             if os.path.exists(f06_path):
+                # .f06'nın sadece son 8000 karakterini oku (performans) -
+                # "FATAL"/"END OF JOB" metinleri log'un en sonunda belirir.
                 try:
                     with open(f06_path, 'r', errors='ignore') as f:
                         tail = f.read()[-8000:].upper()
@@ -3422,6 +3427,10 @@ class BarPropertySolverTab:
                 if 'END OF JOB' in tail:
                     op2_dir, op2_path = _find_op2()
                     if op2_path:
+                        # .op2 beklenen çıktı klasöründe değilse (scratch
+                        # klasörüne yazılmışsa), beklenen yere kopyala -
+                        # sonraki aşamalar (OP2->H5 dönüşümü vb.) onu hep
+                        # aynı, tahmin edilebilir klasörde bulsun.
                         if op2_dir != folder:
                             self.log(f"    {label}NOTE: .op2 appeared in {op2_dir} (not the out= folder) - copying it to {folder}")
                             try:
@@ -3432,8 +3441,9 @@ class BarPropertySolverTab:
                     # F06 says the job is over but the .op2 hasn't shown up
                     # yet - keep polling a little longer rather than failing.
             else:
-                # No .f06 at all for this install/config - fall back to a
-                # long op2 size-stability window instead of failing outright.
+                # Bu kurulumda hiç .f06 üretilmiyor - son çare olarak .op2
+                # boyutunun uzun süre (fallback_stable_seconds) değişmediğini
+                # görünce "bitti" kabul et.
                 _, op2_path = _find_op2()
                 if op2_path:
                     size = os.path.getsize(op2_path)
@@ -3497,8 +3507,9 @@ class BarPropertySolverTab:
             self.log(f"    {label}Running {len(jobs)} Nastran job(s), max {max_parallel} at a time...")
             t_jobs_start = time.time()
 
-            # Run Nastran and WAIT for every job to actually finish (incl.
-            # each .op2 being fully written).
+            # Nastran'ı çalıştır ve HER işin gerçekten bitmesini BEKLE
+            # (.op2'nin tam yazılmış olması dahil). ThreadPoolExecutor,
+            # max_parallel kadar işi aynı anda çalıştırıp fazlasını kuyrukta tutar.
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
                 future_to_job = {
                     executor.submit(self._run_nastran, j['bdf_path'], j['folder'], j['label']): j
@@ -3528,6 +3539,9 @@ class BarPropertySolverTab:
             self.log(traceback.format_exc())
             return 0, 0
 
+    # start_solve: "SOLVE BASE MODEL" butonunun komutu - girdileri doğrular,
+    # butonu kilitler ve gerçek işi (_run_solve) GUI'yi dondurmamak için
+    # ayrı bir daemon thread'de başlatır.
     def start_solve(self):
         if not self.bdf_paths:
             messagebox.showerror("Error", "Add at least one BDF file")
@@ -3556,6 +3570,9 @@ class BarPropertySolverTab:
                 self.log("\nSOLVE ERROR: BDF loading failed - see log above.")
                 return
 
+            # Her çalıştırma zaman damgalı kendi klasörüne gider
+            # ("BaseModel_YYYYMMDD_HHMMSS") - böylece ardışık SOLVE
+            # tıklamaları birbirinin üzerine yazmaz.
             output_base = self.output_folder.get()
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             run_folder = os.path.join(output_base, f"BaseModel_{ts}")
@@ -3585,10 +3602,15 @@ class BarPropertySolverTab:
             self.log(traceback.format_exc())
 
         finally:
+            # Hata olsa da olmasa da: koşum bayrağını indir ve SOLVE
+            # butonunu yeniden tıklanabilir yap.
             self.is_running = False
             self.root.after(0, lambda: self.btn_start.config(state=tk.NORMAL))
 
 
+# ============================================================================
+# PostProcessingTab  --  "Post Processing" sekmesi (Tab 4)
+# ============================================================================
 class PostProcessingTab:
     """OP2 -> H5 batch conversion, then Load Extraction folder prep - one
     RUN button runs both stages back to back. Lists every .op2 under a

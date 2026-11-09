@@ -1567,6 +1567,11 @@ class IntegratedBDFRFTool:
         self.log1(f"      Expanded {len(processed_includes)} includes")
         return '\n'.join(result_lines)
 
+    # start_processing: "PROCESS & MERGE" butonuna basılınca çağrılır.
+    # Önce temel alanların (en az bir BDF listesi, Excel, çıktı klasörü)
+    # doldurulduğunu kontrol eder, sonra butonu kilitler, ilerleme çubuğunu
+    # (belirsiz/animasyonlu modda) başlatır ve asıl işi (process_merge)
+    # arka planda bir thread'de çalıştırır - GUI dondurulmasın diye.
     def start_processing(self):
         if not self.thermal_bdfs and not self.maneuver_bdfs:
             messagebox.showerror("Error","Add BDF files"); return
@@ -1577,37 +1582,49 @@ class IntegratedBDFRFTool:
         self.process_btn.config(state=tk.DISABLED)
         self.progress1.start()
         threading.Thread(target=self.process_merge, daemon=True).start()
-    
+
+    # process_merge: Tab 1'in asıl iş akışı. Excel'den gerekli bilgileri
+    # (hangi SUBCASE'lerin isteneceği, hangi element/node ID'lerinin dahil
+    # edileceği) okur, sonra THERMAL ve MANEUVER birleştirme işlemlerini
+    # (varsa, kullanıcı o türden BDF eklemişse) sırayla başlatır.
     def process_merge(self):
         try:
             self.log1("="*70)
             self.log1("BDF Merger Tool v8")
             self.log1("="*70)
-            
+
             self.log1("\n[1] Reading Excel...")
+            # Excel dosyasını pandas ile aç ve içindeki sheet (sayfa) isimlerini al.
             xl = pd.ExcelFile(self.excel_path.get())
             sheets = xl.sheet_names
             self.log1(f"    Available sheets: {sheets}")
 
             thermal_sh = maneuver_sh = element_sh = node_sh = None
 
-            # First pass: look for exact or specific matches
+            # ---- Birinci geçiş: isim bazlı TAM/özel eşleşmeleri ara ----
+            # Excel sheet isimleri kullanıcıdan kullanıcıya değişebileceği
+            # için, önce bilinen anahtar kelimelere göre akıllı bir eşleştirme
+            # deneniyor (sabit sheet SIRASINA güvenmek yerine).
             for s in sheets:
                 sl = s.lower()
-                # Element_Set exact match (priority)
+                # "Element_Set" ismiyle TAM eşleşme (öncelikli).
                 if sl == 'element_set' or sl == 'elementset':
                     element_sh = s
-                # Node_Set exact match (priority)
+                # "Node_Set" ismiyle TAM eşleşme (öncelikli).
                 elif sl == 'node_set' or sl == 'nodeset':
                     node_sh = s
-                # Thermal
+                # İçinde "thermal" geçen ilk sheet.
                 elif 'thermal' in sl and not thermal_sh:
                     thermal_sh = s
-                # Maneuver
+                # İçinde "maneuver" (İngilizce) veya "manevra" (Türkçe) geçen ilk sheet.
                 elif ('maneuver' in sl or 'manevra' in sl) and not maneuver_sh:
                     maneuver_sh = s
 
-            # Second pass: if element_sh/node_sh not found, look for partial matches
+            # ---- İkinci geçiş: element_sh/node_sh hâlâ bulunamadıysa, daha
+            # gevşek (kısmi) eşleşme dene ----
+            # (örn. "Set_Element" gibi kelime sırası farklı bir isim de
+            # yakalanabilsin diye "element" VE "set" kelimelerinin İKİSİNİN
+            # DE geçmesi yeterli sayılıyor, sırası önemli değil.)
             if not element_sh:
                 for s in sheets:
                     sl = s.lower()
@@ -1621,7 +1638,10 @@ class IntegratedBDFRFTool:
                         node_sh = s
                         break
 
-            # Fallback to index-based if still not found
+            # ---- Son çare: hâlâ bulunamayan sheet'ler için SIRAYA göre
+            # (0=Thermal, 1=Maneuver, 2=Element_Set, 3=Node_Set) varsay ----
+            # Bu, eski/isimlendirme kuralına uymayan Excel dosyalarıyla bile
+            # bir şekilde çalışabilmek için bir geriye dönük uyumluluk tedbiri.
             if not thermal_sh and len(sheets) > 0: thermal_sh = sheets[0]
             if not maneuver_sh and len(sheets) > 1: maneuver_sh = sheets[1]
             if not element_sh and len(sheets) > 2: element_sh = sheets[2]
@@ -1629,6 +1649,11 @@ class IntegratedBDFRFTool:
 
             self.log1(f"    Using sheets -> Thermal: '{thermal_sh}', Maneuver: '{maneuver_sh}', Element_Set: '{element_sh}', Node_Set: '{node_sh}'")
 
+            # Her sheet'in İLK sütununu oku, boş hücreleri at (dropna),
+            # tam sayıya çevir (astype(int)) ve Python listesine dönüştür.
+            # Bu listeler: hangi SUBCASE ID'lerinin isteneceği (thermal/
+            # maneuver_cases) ve hangi element/node ID'lerinin dahil
+            # edileceği (element_ids/node_ids, ayrıca sıralı hale getiriliyor).
             thermal_cases = pd.read_excel(xl, sheet_name=thermal_sh).iloc[:,0].dropna().astype(int).tolist() if thermal_sh else []
             maneuver_cases = pd.read_excel(xl, sheet_name=maneuver_sh).iloc[:,0].dropna().astype(int).tolist() if maneuver_sh else []
             element_ids = sorted(pd.read_excel(xl, sheet_name=element_sh).iloc[:,0].dropna().astype(int).tolist()) if element_sh else []
@@ -1639,12 +1664,15 @@ class IntegratedBDFRFTool:
             self.log1(f"    Element IDs: {len(element_ids)}")
             self.log1(f"    Node IDs: {len(node_ids)}")
 
+            # GUI'deki Settings bölümünden girilen sabit değerleri oku.
             set_id = int(self.set_id.get())
             node_set_id = int(self.node_set_id.get())
             temp_initial = self.temp_initial.get()
             out_dir = self.output_folder.get()
+            # Çıktı klasörü yoksa oluştur (varsa dokunma - exist_ok=True).
             os.makedirs(out_dir, exist_ok=True)
 
+            # THERMAL BDF'ler eklendiyse, THERMAL birleştirme işlemini başlat.
             if self.thermal_bdfs:
                 self.log1("\n" + "="*70)
                 self.log1("[2] Processing THERMAL...")
@@ -1652,70 +1680,101 @@ class IntegratedBDFRFTool:
                 self.process_thermal_bdf(self.thermal_bdfs, thermal_cases, element_ids, set_id,
                     node_ids, node_set_id, temp_initial, os.path.join(out_dir, self.output_thermal_name.get()))
 
+            # MANEUVER BDF'ler eklendiyse, MANEUVER birleştirme işlemini başlat.
             if self.maneuver_bdfs:
                 self.log1("\n" + "="*70)
                 self.log1("[3] Processing MANEUVER...")
                 self.log1("="*70)
                 self.process_maneuver_bdf(self.maneuver_bdfs, maneuver_cases, element_ids, set_id,
                     node_ids, node_set_id, os.path.join(out_dir, self.output_maneuver_name.get()))
-            
+
             self.log1("\n" + "="*70)
             self.log1("COMPLETED!")
             self.log1("="*70)
+            # İşlem tamamlandığında kullanıcıya bir "Done" pop-up'ı göster.
+            # self.root.after(0, ...) kullanılıyor çünkü bu kod bir arka plan
+            # thread'inde çalışıyor ve Tkinter widget'larına (messagebox
+            # dahil) sadece ANA thread'den dokunulmalı - after(0, ...) bu
+            # çağrıyı ana thread'in event döngüsüne güvenli şekilde iletir.
             self.root.after(0, lambda: messagebox.showinfo("Done","Merge completed!"))
         except Exception as e:
+            # İşlem sırasında herhangi bir hata olursa logla, hata izini
+            # göster ve kullanıcıya bir hata pop-up'ı göster.
             self.log1(f"\nERROR: {e}")
             import traceback
             self.log1(traceback.format_exc())
             self.root.after(0, lambda: messagebox.showerror("Error",str(e)))
         finally:
+            # Hata olsun olmasın (finally): ilerleme çubuğunu durdur ve
+            # "PROCESS & MERGE" butonunu tekrar tıklanabilir hale getir.
             self.root.after(0, lambda: [self.progress1.stop(), self.process_btn.config(state=tk.NORMAL)])
-    
+
+    # process_thermal_bdf: THERMAL BDF birleştirme işleminin tamamı. Önceki
+    # yardımcı metodları (collect_all_lines_from_masters, merge_lines_with_
+    # pynastran, check_and_remove_duplicates, extract_param_cards,
+    # format_include_nastran) sırayla çağırıp, sonunda EKSİKSİZ, GEÇERLİ bir
+    # NASTRAN BDF dosyası (kendi SOL/CEND/SET/SUBCASE başlıkları + birleşmiş
+    # bulk data + COMMON INCLUDE'lar + ENDDATA) yazıp diske kaydeder.
     def process_thermal_bdf(self, bdf_files, load_cases, element_ids, set_id, node_ids, node_set_id, temp_initial, output_path):
         self.log1(f"    MASTER BDFs: {len(bdf_files)}")
         self.log1(f"    Load cases to match: {len(load_cases)}")
+        # Hızlı üyelik kontrolü (in) için listeyi set'e çevir.
         load_case_set = set(load_cases)
-        
-        # Step 1: Tüm satırları topla
+
+        # ---- Adım 1: istenen SUBCASE'lere ait tüm satırları topla ----
         self.log1("\n    === Step 1: Collecting all lines from MASTER BDFs ===")
         all_lines, common_includes, subcase_info_map = self.collect_all_lines_from_masters(
             bdf_files, load_case_set, 'THERMAL'
         )
-        
-        # Step 2: pyNastran ile merge et
+
+        # ---- Adım 2: toplanan satırları pyNastran ile "temiz" bir bulk data'ya dönüştür ----
         self.log1("\n    === Step 2: Merging with pyNastran ===")
         merged_bulk_data = self.merge_lines_with_pynastran(all_lines)
-        
-        # Step 2.5: Duplicate kontrolü
+
+        # ---- Adım 2.5: pyNastran'dan sonra bile kalmış olabilecek
+        # duplicate kartları (özellikle farklı master dosyalardan gelen,
+        # pyNastran'ın göz ardı etmiş olabileceği tekrarları) temizle ----
         if merged_bulk_data:
             self.log1("\n    === Step 2.5: Checking duplicates ===")
             merged_bulk_data = self.check_and_remove_duplicates(merged_bulk_data)
-        
-        # Step 3: Output dosyası oluştur
+
+        # ---- Adım 3: nihai çıktı BDF dosyasının TÜM satırlarını sırayla oluştur ----
         self.log1("\n    === Step 3: Writing output BDF ===")
         out = []
+        # Dosya başlığı/yorumu.
         out.append(f"$ {'='*60}")
         out.append(f"$ THERMAL - MERGED BDF (v8)")
         out.append(f"$ {'='*60}")
+        # NASTRAN çözüm tipi (SOL 101 = lineer statik analiz), Case Control
+        # bölümünün başlangıcı (CEND), çıktı ekosunu kapat, başlık,
+        # başlangıç sıcaklığı kartı.
         out.append("SOL 101")
         out.append("CEND")
         out.append("ECHO=NONE")
         out.append(f"TITLE = THERMAL ANALYSIS")
         out.append(f"TEMPERATURE(INITIAL) = {temp_initial}")
         out.append("$")
-        
-        # SET definition
+
+        # ---- SET tanımı (eleman ID'leri) ----
+        # NASTRAN'da bir SET kartı tek satıra sığmayabilir (çok fazla ID
+        # varsa) - bu yüzden element_ids listesi, her satır en fazla ~60
+        # karakter olacak şekilde "chunk"lara (parçalara) bölünüyor.
         chunks = []
         current = ""
         for eid in element_ids:
             test = f"{current},{eid}" if current else str(eid)
             if len(test) > 60 and current:
+                # Bu ID eklenirse satır çok uzayacak - mevcut parçayı
+                # kapat, yeni bir parçaya bu ID ile başla.
                 chunks.append(current)
                 current = str(eid)
             else:
                 current = test
         if current: chunks.append(current)
 
+        # Her parçayı ayrı bir satır olarak yaz. İlk satır "SET <id> = ..."
+        # ile başlar, ARA satırlar devam niteliğinde girintili yazılır, SON
+        # satırın sonunda virgül OLMAZ (NASTRAN'da kart bittiği anlamına gelir).
         for i, chunk in enumerate(chunks):
             if i == 0:
                 out.append(f"SET {set_id} = {chunk}" + ("," if len(chunks) > 1 else ""))
@@ -1724,7 +1783,8 @@ class IntegratedBDFRFTool:
             else:
                 out.append(f"         {chunk},")
 
-        # SET definition (nodes)
+        # ---- SET tanımı (düğüm/node ID'leri) ----
+        # Yukarıdakiyle BİREBİR AYNI mantık, bu sefer node_ids listesi için.
         node_chunks = []
         current = ""
         for nid in node_ids:
@@ -1744,6 +1804,11 @@ class IntegratedBDFRFTool:
             else:
                 out.append(f"         {chunk},")
 
+        # ---- Çıktı istek kartları (hangi sonuçların hesaplanıp raporlanacağı) ----
+        # DISPLACEMENT: tüm düğümlerin yer değiştirmesi.
+        # FORCE: yukarıda tanımlanan eleman SET'i için iç kuvvetler.
+        # GPFORCE: yukarıda tanımlanan düğüm SET'i için düğüm kuvvetleri.
+        # OLOAD/SPCFORCE: uygulanan yükler ve sınır şartı (SPC) tepki kuvvetleri.
         out.append("$")
         out.append("DISPLACEMENT(SORT1,PLOT,REAL)=ALL")
         out.append(f"FORCE(SORT1,PLOT,REAL,CENTER)={set_id}")
@@ -1752,7 +1817,14 @@ class IntegratedBDFRFTool:
         out.append("SPCFORCE(SORT1,PLOT)=ALL")
         out.append("$")
 
-        # SUBCASE definitions
+        # ---- SUBCASE tanımları ----
+        # Excel'den istenen HER load case (lc) için bir SUBCASE bloğu yaz.
+        # Eğer bu subcase'in bilgisi (temp_load_id, subtitle)
+        # collect_all_lines_from_masters tarafından önceden tespit
+        # edilmişse (subcase_info_map içinde varsa) o bilgi kullanılır;
+        # yoksa (eşleşme bulunamadıysa) makul bir varsayılan (subcase ID'sinin
+        # kendisini TEMPERATURE(LOAD) ID'si olarak kullanmak, otomatik
+        # bir "Thermal Case N" başlığı üretmek) uygulanır.
         for lc in load_cases:
             if lc in subcase_info_map:
                 info = subcase_info_map[lc]
@@ -1766,78 +1838,101 @@ class IntegratedBDFRFTool:
             out.append("SPC = 1")
             out.append(f"TEMPERATURE(LOAD) = {temp_load}")
             out.append("$")
-        
+
+        # Case Control bölümü bitti, Bulk Data bölümü başlıyor.
         out.append("BEGIN BULK")
-        
-        # PARAM kartlarını ayır ve BEGIN BULK'tan hemen sonra yaz
+
+        # ---- PARAM kartlarını ayır ve BEGIN BULK'tan HEMEN SONRA yaz ----
+        # (NASTRAN'da PARAM kartlarının bulk data'nın başında olması
+        # alışılagelmiş/tercih edilen bir konumdur, bu yüzden merged_bulk_
+        # data'nın geri kalanından ayrı tutulup en öne yazılıyor.)
         param_lines = []
         if merged_bulk_data:
             param_lines, merged_bulk_data = self.extract_param_cards(merged_bulk_data)
-        
+
         if param_lines:
             out.append("$ --- PARAM CARDS ---")
             out.extend(param_lines)
             out.append("$")
-        
-        # Merged bulk data
+
+        # ---- Birleştirilmiş yapısal/model verisi (geri kalan tüm bulk data) ----
         if merged_bulk_data:
             out.append(f"$ {'='*60}")
             out.append(f"$ MERGED STRUCTURE DATA")
             out.append(f"$ {'='*60}")
             out.append(merged_bulk_data)
-        
-        # Common Thermal INCLUDE'ları
+
+        # ---- Ortak (COMMON) Thermal INCLUDE kartları ----
+        # collect_all_lines_from_masters tarafından "COMMON" olarak
+        # ayrılmış (satır içine kopyalanmayıp sadece yolu saklanmış)
+        # INCLUDE'lar burada, dosyanın EN SONUNDA, tek tek INCLUDE kartları
+        # olarak (gerekirse çok satıra bölünerek, format_include_nastran
+        # ile) yazılıyor. Alfabetik sıraya (sorted) konularak çıktı tutarlı/
+        # öngörülebilir oluyor.
         out.append("$")
         out.append(f"$ {'='*60}")
         out.append(f"$ COMMON THERMAL INCLUDES ({len(common_includes)} files)")
         out.append(f"$ {'='*60}")
-        
+
         for abs_path in sorted(common_includes):
             include_lines = self.format_include_nastran(abs_path)
             out.extend(include_lines)
-        
+
         out.append("$")
         out.append("ENDDATA")
-        
+
+        # Oluşturulan tüm satırları tek bir metin olarak birleştirip çıktı
+        # dosyasına yaz.
         with open(output_path, 'w') as f:
             f.write('\n'.join(out))
-        
+
         self.log1(f"    Output: {os.path.basename(output_path)}")
         self.log1(f"    COMMON THERMAL INCLUDES: {len(common_includes)}")
-    
+
+    # process_maneuver_bdf: process_thermal_bdf ile BİREBİR AYNI akışı
+    # (satırları topla -> pyNastran ile birleştir -> duplicate temizle ->
+    # SET/SUBCASE başlıklarıyla birlikte çıktı BDF'ini yaz) izler, aradaki
+    # TEK farkı şu: THERMAL'da "TEMPERATURE(LOAD)" kartı kullanılırken
+    # MANEUVER'da normal "LOAD" kartı kullanılır (ve TEMPERATURE(INITIAL)
+    # satırı hiç yoktur - maneuver analizinde başlangıç sıcaklığı kavramı
+    # yok). Aşağıdaki yorumlar bu yüzden daha kısa tutuldu; adım adım aynı
+    # mantık için process_thermal_bdf'in yorumlarına bakılabilir.
     def process_maneuver_bdf(self, bdf_files, load_cases, element_ids, set_id, node_ids, node_set_id, output_path):
         self.log1(f"    MASTER BDFs: {len(bdf_files)}")
         self.log1(f"    Load cases to match: {len(load_cases)}")
         load_case_set = set(load_cases)
-        
-        # Step 1: Tüm satırları topla
+
+        # Adım 1: istenen SUBCASE'lere ait tüm satırları topla (common_type='LOAD').
         self.log1("\n    === Step 1: Collecting all lines from MASTER BDFs ===")
         all_lines, common_includes, subcase_info_map = self.collect_all_lines_from_masters(
             bdf_files, load_case_set, 'LOAD'
         )
-        
-        # Step 2: pyNastran ile merge et
+
+        # Adım 2: pyNastran ile birleştir.
         self.log1("\n    === Step 2: Merging with pyNastran ===")
         merged_bulk_data = self.merge_lines_with_pynastran(all_lines)
-        
-        # Step 2.5: Duplicate kontrolü
+
+        # Adım 2.5: kalan duplicate kartları temizle.
         if merged_bulk_data:
             self.log1("\n    === Step 2.5: Checking duplicates ===")
             merged_bulk_data = self.check_and_remove_duplicates(merged_bulk_data)
-        
-        # Step 3: Output dosyası oluştur
+
+        # Adım 3: çıktı BDF dosyasını satır satır oluştur.
         self.log1("\n    === Step 3: Writing output BDF ===")
         out = []
         out.append(f"$ {'='*60}")
         out.append(f"$ MANEUVER - MERGED BDF (v8)")
         out.append(f"$ {'='*60}")
+        # THERMAL'dan farklı olarak burada TEMPERATURE(INITIAL) kartı YOK
+        # - maneuver (manevra) analizinde başlangıç sıcaklığı tanımlanmaz.
         out.append("SOL 101")
         out.append("CEND")
         out.append("ECHO=NONE")
         out.append(f"TITLE = MANEUVER ANALYSIS")
         out.append("$")
-        
-        # SET definition
+
+        # ---- SET tanımı (eleman ID'leri) - process_thermal_bdf ile aynı
+        # "60 karakteri aşma, yeni satıra böl" mantığı. ----
         chunks = []
         current = ""
         for eid in element_ids:
@@ -1857,7 +1952,7 @@ class IntegratedBDFRFTool:
             else:
                 out.append(f"         {chunk},")
 
-        # SET definition (nodes)
+        # ---- SET tanımı (düğüm ID'leri) - yine aynı mantık. ----
         node_chunks = []
         current = ""
         for nid in node_ids:
@@ -1877,6 +1972,7 @@ class IntegratedBDFRFTool:
             else:
                 out.append(f"         {chunk},")
 
+        # ---- Çıktı istek kartları (THERMAL ile aynı). ----
         out.append("$")
         out.append("DISPLACEMENT(SORT1,PLOT,REAL)=ALL")
         out.append(f"FORCE(SORT1,PLOT,REAL,CENTER)={set_id}")
@@ -1885,7 +1981,10 @@ class IntegratedBDFRFTool:
         out.append("SPCFORCE(SORT1,PLOT)=ALL")
         out.append("$")
 
-        # SUBCASE definitions
+        # ---- SUBCASE tanımları ----
+        # THERMAL'daki "TEMPERATURE(LOAD) = temp_load" yerine burada
+        # "LOAD = load_id" kartı yazılıyor - manevra analizinde uygulanan
+        # yük, TEMPERATURE değil LOAD kartıyla referans gösterilir.
         for lc in load_cases:
             if lc in subcase_info_map:
                 info = subcase_info_map[lc]
@@ -1899,42 +1998,44 @@ class IntegratedBDFRFTool:
             out.append("SPC = 1")
             out.append(f"LOAD = {load_id}")
             out.append("$")
-        
+
         out.append("BEGIN BULK")
-        
-        # PARAM kartlarını ayır ve BEGIN BULK'tan hemen sonra yaz
+
+        # PARAM kartlarını ayır ve BEGIN BULK'tan hemen sonra yaz (THERMAL ile aynı).
         param_lines = []
         if merged_bulk_data:
             param_lines, merged_bulk_data = self.extract_param_cards(merged_bulk_data)
-        
+
         if param_lines:
             out.append("$ --- PARAM CARDS ---")
             out.extend(param_lines)
             out.append("$")
-        
-        # Merged bulk data
+
+        # Birleştirilmiş yapısal veri.
         if merged_bulk_data:
             out.append(f"$ {'='*60}")
             out.append(f"$ MERGED STRUCTURE DATA")
             out.append(f"$ {'='*60}")
             out.append(merged_bulk_data)
-        
-        # Common Load INCLUDE'ları
+
+        # ---- Ortak (COMMON) LOAD INCLUDE kartları ----
+        # (THERMAL'daki "COMMON THERMAL" bölümünün LOAD karşılığı.)
         out.append("$")
         out.append(f"$ {'='*60}")
         out.append(f"$ COMMON LOAD INCLUDES ({len(common_includes)} files)")
         out.append(f"$ {'='*60}")
-        
+
         for abs_path in sorted(common_includes):
             include_lines = self.format_include_nastran(abs_path)
             out.extend(include_lines)
-        
+
         out.append("$")
         out.append("ENDDATA")
-        
+
+        # Oluşturulan tüm satırları çıktı dosyasına yaz.
         with open(output_path, 'w') as f:
             f.write('\n'.join(out))
-        
+
         self.log1(f"    Output: {os.path.basename(output_path)}")
         self.log1(f"    COMMON LOAD INCLUDES: {len(common_includes)}")
 

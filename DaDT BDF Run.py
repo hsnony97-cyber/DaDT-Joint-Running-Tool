@@ -7082,9 +7082,17 @@ class IterativeFullRunTab:
                     return
                 self.log(f"  {len(group_folders_found)} LoadExtraction_NN group folder(s) found")
 
+                # t4._run_pipeline() döndüğünde loadext.bat'lar henüz
+                # BAŞLATILMIŞ olabilir (fire-and-forget) - Joint Run'ın H5
+                # taraması bunların çıktısına bağımlı olduğundan, hepsinin
+                # gerçekten bitmesini bekle.
                 self._wait_for_exe_to_finish(os.path.basename(self.le_exe_path.get().strip()))
 
                 # ---- STAGE C: JOINT RUN ----
+                # FullRunTab ile aynı mantık: t5 nesnesinin alanlarını doldur
+                # (Main Input Excel = bu iterasyonun working_excel'i) ve
+                # t5._run_pipeline()'ı çağır - bu metod zaten Joint Run exe
+                # havuzunun tamamının bitmesini bekler.
                 self.log(f"\n--- Iteration {iteration}: Joint Run ---")
                 joint_run_dir = os.path.join(base_model_folder, "Joint_Run")
                 os.makedirs(joint_run_dir, exist_ok=True)
@@ -7104,13 +7112,22 @@ class IterativeFullRunTab:
 
                 t5._run_pipeline()
 
-                # ---- STAGE D: SIZING SUMMARY ----
+                # ---- STAGE D: BOYUTLANDIRMA ÖZETİ ----
+                # Bu iterasyonun Joint Run sonuçlarından (Nasgro Final
+                # Summary CSV'leri) prop_summary_df'i üret - bu değişken bir
+                # SONRAKİ iterasyonun başındaki geri besleme adımında
+                # (yukarıda) kullanılacak.
                 prop_summary_df, t_col = self._build_flight_hours_summary(joint_run_dir, target_life)
                 if prop_summary_df is None:
                     self.log(f"\nSTOPPED (iteration {iteration}): no sizing summary could be built "
                               "- not continuing to further iterations. See the log above.")
                     return
 
+                # SON iterasyon DIŞINDAKİ her iterasyonda: bu iterasyonun H5
+                # dosyaları (hem Load Extraction hem Joint Run) artık
+                # gerekli değil (sonraki iterasyon kendi H5'lerini üretecek)
+                # - disk yer açmak için sil. SON iterasyonun H5'leri
+                # kullanıcı inceleyebilsin diye KORUNUR.
                 if iteration < n_iterations:
                     n_del_le = self._delete_h5_files(le_results_dir)
                     n_del_jr = self._delete_h5_files(joint_run_dir)
@@ -7134,6 +7151,9 @@ class IterativeFullRunTab:
             self.is_running = False
             self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
 
+    # _refresh_tab3_listboxes: t3.bdf_paths/maneuver_bdfs listelerine
+    # yukarıda doğrudan yazıldığı için, o sekmenin GUI listbox'ları
+    # otomatik güncellenmez - burada manuel senkronize edilir.
     def _refresh_tab3_listboxes(self):
         t3 = self.tab3_tool
         t3.bdf_listbox.delete(0, tk.END)
@@ -7144,11 +7164,20 @@ class IterativeFullRunTab:
             t3.maneuver_listbox.insert(tk.END, os.path.basename(p))
 
 
+# ============================================================================
+# main()  --  programın giriş noktası
+# ============================================================================
+# Tkinter ana penceresini (root) oluşturur, tüm sekmeleri barındıran
+# IntegratedBDFRFTool uygulamasını bu pencere üzerine kurar, ve Tkinter'ın
+# olay döngüsünü (mainloop) başlatır - bu çağrı, pencere kapatılana kadar
+# bloklar (GUI olaylarını işler).
 def main():
     root = tk.Tk()
     app = IntegratedBDFRFTool(root)
     root.mainloop()
 
 
+# Bu dosya doğrudan çalıştırıldığında (başka bir modül tarafından import
+# edilmediğinde) main()'i çağır - standart Python giriş noktası deseni.
 if __name__ == "__main__":
     main()

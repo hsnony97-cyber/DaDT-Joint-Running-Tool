@@ -194,7 +194,7 @@ class IntegratedBDFRFTool:
         # oluşturulup buraya parametre olarak geçiriliyor).
         self.root = root
         # Pencere başlığı (Windows'ta pencerenin üst çubuğunda görünen yazı).
-        self.root.title("DaDT Structure Definition Tool v16.0")
+        self.root.title("DaDT Joint Optimization Tool")
         # Pencerenin açılış boyutu (genişlik x yükseklik, piksel).
         self.root.geometry("1150x950")
         # Pencerenin küçültülebileceği en küçük boyut sınırı.
@@ -219,17 +219,33 @@ class IntegratedBDFRFTool:
         self.node_set_id = tk.StringVar(value="199")   # NASTRAN düğüm (node) SET kart ID'si (varsayılan 199)
         self.temp_initial = tk.StringVar(value="10")   # başlangıç sıcaklığı değeri (varsayılan 10)
 
+        # Sekme kulakçıklarına eklenen renkli kare ikonların (PhotoImage)
+        # Python referanslarını canlı tutmak için liste - referans kalmazsa
+        # Tkinter bu imgeleri çöp toplayıcıya (garbage collector) kaptırıp
+        # sekmelerdeki renkleri görünmez (boş) yapar.
+        self._tab_color_icons = []
 
         # Arayüzü (tüm sekmeleri) kuran metodu çağır - bu metod aşağıda tanımlı.
         self.setup_ui()
 
+    # _make_tab_icon: verilen hex renk koduyla dolu, küçük kare bir
+    # PhotoImage üretir. Sekme (tab) kulakçıklarının arka plan rengini
+    # ttk ile doğrudan değiştirmek desteklenmediği için, bu renkli kare
+    # ikon her sekmenin metninin hemen önüne (image + compound='left')
+    # eklenerek sekmeler grup grup renk kodlanmış gibi gösterilir.
+    def _make_tab_icon(self, hex_color, size=14):
+        icon = tk.PhotoImage(width=size, height=size)
+        icon.put(hex_color, to=(0, 0, size, size))
+        self._tab_color_icons.append(icon)  # GC'ye karşı referansı sakla
+        return icon
+
     def setup_ui(self):
         # ---- Üst başlık şeridi (banner) ----
-        # Pencerenin en üstünde görünen "🔧 DaDT Structure Definition Tool  v16.0"
+        # Pencerenin en üstünde görünen "🔧 DaDT Joint Optimization Tool"
         # yazısını içeren çerçeve.
         banner = ttk.Frame(self.root, padding=(16, 12))
         banner.pack(fill=tk.X)
-        ttk.Label(banner, text="\U0001F527 DaDT Structure Definition Tool", style='Header.TLabel').pack(side=tk.LEFT)
+        ttk.Label(banner, text="\U0001F527 DaDT Joint Optimization Tool", style='Header.TLabel').pack(side=tk.LEFT)
         ttk.Label(banner, text="  v16.0", style='Subtitle.TLabel').pack(side=tk.LEFT, pady=(6, 0))
         # Banner ile sekme çubuğu arasına yatay bir ayraç (ince çizgi) çiz.
         ttk.Separator(self.root, orient='horizontal').pack(fill=tk.X)
@@ -240,37 +256,50 @@ class IntegratedBDFRFTool:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        # ---- Sekme 1: BDF Merge Preparation ----
+        # ---- Sekme renk grupları ----
+        # BDF Merge Preparation: mavi (tek başına kendi rengi).
+        # Nastran Solver / Post Processing / Joint Run: aynı grup, yeşil.
+        # Full Run: sarı. Iterative Full Run: bordo.
+        _TAB_COLOR_BLUE = '#2563eb'
+        _TAB_COLOR_GREEN = '#16a34a'
+        _TAB_COLOR_YELLOW = '#eab308'
+        _TAB_COLOR_MAROON = '#800000'
+
+        # ---- Sekme 1: BDF Merge Preparation (mavi) ----
         # Bu sekmenin içeriği ayrı bir sınıfa çıkarılmamış; setup_tab1()
         # metodu doğrudan bu notebook'un ilk sekmesinin (self.tab1) içini dolduruyor.
         self.tab1 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab1, text="\U0001F4C4  BDF Merge Preparation")
+        self.notebook.tab(self.tab1, image=self._make_tab_icon(_TAB_COLOR_BLUE), compound='left')
         self.setup_tab1()
 
-        # ---- Sekme 2: Understanding Structure Type ----
+        # ---- Sekme 2: Nastran Solver (yeşil) ----
         # BarPropertySolverTab sınıfının bir örneği (self.tab3_tool) oluşturulup
         # self.tab3 çerçevesinin içine yerleştiriliyor. Bu örnek referansı daha
         # sonra Full Run / Iterative Full Run sekmeleri tarafından da (dışarıdan,
         # bu sınıfın kodu hiç değiştirilmeden) kullanılacak.
         self.tab3 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab3, text="\U0001F9EE  Understanding Structure Type")
+        self.notebook.add(self.tab3, text="\U0001F9EE  Nastran Solver")
+        self.notebook.tab(self.tab3, image=self._make_tab_icon(_TAB_COLOR_GREEN), compound='left')
         self.tab3_tool = BarPropertySolverTab(self.tab3, self.root)
 
-        # ---- Sekme 3: Post Processing ----
+        # ---- Sekme 3: Post Processing (yeşil) ----
         # OP2 -> H5 dönüşümü ve Load Extraction klasör hazırlığını yapan sekme.
         self.tab4 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab4, text="\U0001F4E6  Post Processing")
+        self.notebook.tab(self.tab4, image=self._make_tab_icon(_TAB_COLOR_GREEN), compound='left')
         self.tab4_tool = PostProcessingTab(self.tab4, self.root)
 
-        # ---- Sekme 4: Joint Run ----
+        # ---- Sekme 4: Joint Run (yeşil) ----
         # Joint Load H5'lerini Set bazında gruplayıp RSS Case Finding / Load
         # Modifying / Joint Run exe'lerini çalıştıran sekme.
         self.tab5 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab5, text="\U0001F517  Joint Run")
+        self.notebook.tab(self.tab5, image=self._make_tab_icon(_TAB_COLOR_GREEN), compound='left')
         self.tab5_tool = JointRunTab(self.tab5, self.root)
 
-        # ---- Sekme 5: Full Run ----
-        # Understanding Structure Type + Post Processing + Joint Run'ı uç uca
+        # ---- Sekme 5: Full Run (sarı) ----
+        # Nastran Solver + Post Processing + Joint Run'ı uç uca
         # zincirleyen sekme. Dikkat: tab3_tool/tab4_tool/tab5_tool nesne
         # referansları FullRunTab'e PARAMETRE olarak geçiriliyor - yani Full Run
         # kendi kopyasını oluşturmuyor, doğrudan yukarıdaki aynı 3 sekme
@@ -278,14 +307,16 @@ class IntegratedBDFRFTool:
         # dışarıdan yönetiyor.
         self.tab6 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab6, text="⚡  Full Run")
+        self.notebook.tab(self.tab6, image=self._make_tab_icon(_TAB_COLOR_YELLOW), compound='left')
         self.tab6_tool = FullRunTab(self.tab6, self.root, self.tab3_tool, self.tab4_tool, self.tab5_tool)
 
-        # ---- Sekme 6: Iterative Full Run ----
+        # ---- Sekme 6: Iterative Full Run (bordo) ----
         # Full Run'ın aynı mantığının N kez döngüye alınmış hali (her
         # iterasyonun sonucu bir sonraki iterasyonun girdisine besleniyor).
         # Aynı şekilde tab3_tool/tab4_tool/tab5_tool referansları paylaşılıyor.
         self.tab7 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab7, text="\U0001F501  Iterative Full Run")
+        self.notebook.tab(self.tab7, image=self._make_tab_icon(_TAB_COLOR_MAROON), compound='left')
         self.tab7_tool = IterativeFullRunTab(self.tab7, self.root, self.tab3_tool, self.tab4_tool, self.tab5_tool)
 
 
@@ -2111,7 +2142,7 @@ class BarPropertySolverTab:
         main = scrollable_frame
 
         # Başlık ve alt başlık.
-        ttk.Label(main, text="Joint Structure Type Understanding", style='Header.TLabel').pack(pady=10)
+        ttk.Label(main, text="Nastran Solver", style='Header.TLabel').pack(pady=10)
         ttk.Label(main, text="Apply Property Excel + offsets and solve the base model",
                  style='Subtitle.TLabel').pack()
 
@@ -5496,12 +5527,12 @@ class FullRunTab:
         main = scrollable_frame
 
         ttk.Label(main, text="Full Run", style='Header.TLabel').pack(pady=10)
-        ttk.Label(main, text="Understanding Structure Type -> Post Processing -> Joint Run, "
+        ttk.Label(main, text="Nastran Solver -> Post Processing -> Joint Run, "
                               "chained end to end from one button",
                  style='Subtitle.TLabel').pack()
 
-        # ---- Section 1: Understanding Structure Type ----
-        f1 = ttk.LabelFrame(main, text="\U0001F9EE  1. Understanding Structure Type", padding=10)
+        # ---- Section 1: Nastran Solver ----
+        f1 = ttk.LabelFrame(main, text="\U0001F9EE  1. Nastran Solver", padding=10)
         f1.pack(fill=tk.X, pady=5, padx=10)
 
         bdf_frame = ttk.Frame(f1)
@@ -6232,8 +6263,8 @@ class IterativeFullRunTab:
                               "iteration's Bar Property thicknesses",
                  style='Subtitle.TLabel').pack()
 
-        # ---- Section 1: Understanding Structure Type ----
-        f1 = ttk.LabelFrame(main, text="\U0001F9EE  1. Understanding Structure Type", padding=10)
+        # ---- Section 1: Nastran Solver ----
+        f1 = ttk.LabelFrame(main, text="\U0001F9EE  1. Nastran Solver", padding=10)
         f1.pack(fill=tk.X, pady=5, padx=10)
 
         bdf_frame = ttk.Frame(f1)

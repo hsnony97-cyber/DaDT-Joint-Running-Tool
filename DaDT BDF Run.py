@@ -3611,6 +3611,14 @@ class BarPropertySolverTab:
 # ============================================================================
 # PostProcessingTab  --  "Post Processing" sekmesi (Tab 4)
 # ============================================================================
+# ============================================================================
+# PostProcessingTab'ın görevi iki aşamalıdır: (1) BarPropertySolverTab'ın
+# ürettiği .op2 dosyalarını toplu şekilde .h5'e dönüştürmek (harici bir
+# converter exe'yi bir Batch_Run.bat üretip çalıştırarak), (2) ardından
+# Load Extraction için gereken klasör yapısını (Example LE şablonunun N
+# kopyası + her birine özgü TF-X Excel'i) hazırlamak. Tek bir RUN butonu bu
+# iki aşamayı art arda çalıştırır.
+# ============================================================================
 class PostProcessingTab:
     """OP2 -> H5 batch conversion, then Load Extraction folder prep - one
     RUN button runs both stages back to back. Lists every .op2 under a
@@ -3626,18 +3634,18 @@ class PostProcessingTab:
         self.root = root
         self.parent_frame = parent_frame
 
-        self.op2_folder = tk.StringVar()
-        self.converter_exe_path = tk.StringVar()
-        self.output_folder = tk.StringVar()
-        self.op2_files = []
+        self.op2_folder = tk.StringVar()          # OP2 dosyalarının aranacağı kök klasör
+        self.converter_exe_path = tk.StringVar()  # OP2->H5 dönüştürücü .exe
+        self.output_folder = tk.StringVar()       # üretilen .h5 dosyalarının yazılacağı klasör
+        self.op2_files = []                        # List butonuyla bulunan .op2 dosya yolları (önizleme listesi)
 
-        # ---- Load Extraction prep ----
+        # ---- Load Extraction prep (2. aşama girdileri) ----
         self.le_input_excel_path = tk.StringVar()    # settings excel with the 'Load_Extraction' sheet
         self.le_example_folder = tk.StringVar()      # template folder (Load_Ext_H5 + TF-X_Load_Extraction.xlsx)
-        self.le_maneuver_bdf_path = tk.StringVar()
-        self.le_thermal_bdf_path = tk.StringVar()
-        self.le_pickle_path = tk.StringVar()
-        self.le_split_count = tk.StringVar(value="10")
+        self.le_maneuver_bdf_path = tk.StringVar()   # maneuver yüklerinin kaynağı BDF
+        self.le_thermal_bdf_path = tk.StringVar()    # thermal yüklerinin kaynağı BDF
+        self.le_pickle_path = tk.StringVar()         # Load_Ext_H5.exe'nin kullandığı önbellek (.pickle) dosyası
+        self.le_split_count = tk.StringVar(value="10")  # Load_Extraction sayfası kaç LoadExtraction_NN grubuna bölünecek
         self.le_output_folder = tk.StringVar()       # where the split LoadExtraction_NN folders are created
         self.le_exe_path = tk.StringVar()             # Load_Ext_H5.exe
         self.le_max_memory = tk.StringVar(value="50")  # --max-memory, GB
@@ -3647,6 +3655,8 @@ class PostProcessingTab:
         self.setup_ui()
 
     # ==================== GUI ====================
+    # setup_ui: "OP2->H5 dönüşümü" (Section 1) ve "Load Extraction hazırlığı"
+    # (Section 2) girdilerini tek bir kaydırılabilir sekmede toplar.
     def setup_ui(self):
         canvas = tk.Canvas(self.parent_frame)
         scrollbar = ttk.Scrollbar(self.parent_frame, orient="vertical", command=canvas.yview)
@@ -3667,7 +3677,7 @@ class PostProcessingTab:
         f1 = ttk.LabelFrame(main, text="\U0001F4C1  1. Input Files", padding=10)
         f1.pack(fill=tk.X, pady=5, padx=10)
 
-        # OP2 Folder
+        # OP2 Folder - dönüştürülecek .op2 dosyalarının aranacağı kök klasör
         op2_frame = ttk.Frame(f1)
         op2_frame.pack(fill=tk.X, pady=2)
         ttk.Label(op2_frame, text="OP2 Folder:", width=18).pack(side=tk.LEFT)
@@ -3698,7 +3708,7 @@ class PostProcessingTab:
         self.op2_status = ttk.Label(f1, text="No OP2 files listed", foreground="gray")
         self.op2_status.pack(anchor=tk.W)
 
-        # Converter Exe
+        # Converter Exe - OP2'leri H5'e çeviren harici program
         exe_frame = ttk.Frame(f1)
         exe_frame.pack(fill=tk.X, pady=2)
         ttk.Label(exe_frame, text="Converter Exe:", width=18).pack(side=tk.LEFT)
@@ -3712,7 +3722,7 @@ class PostProcessingTab:
                                   "exe and run from there, same as pasting/running it by hand)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
-        # Output Folder
+        # Output Folder - üretilecek .h5 dosyalarının yazılacağı klasör
         out_frame = ttk.Frame(f1)
         out_frame.pack(fill=tk.X, pady=2)
         ttk.Label(out_frame, text="Output Folder (H5):", width=18).pack(side=tk.LEFT)
@@ -3725,7 +3735,7 @@ class PostProcessingTab:
         f2 = ttk.LabelFrame(main, text="\U0001F4C1  2. Load Extraction Input Files", padding=10)
         f2.pack(fill=tk.X, pady=5, padx=10)
 
-        # Settings Excel (reads the 'Load_Extraction' sheet)
+        # Settings Excel ('Load_Extraction' sayfasını okur)
         le_xl_frame = ttk.Frame(f2)
         le_xl_frame.pack(fill=tk.X, pady=2)
         ttk.Label(le_xl_frame, text="Input Excel:", width=18).pack(side=tk.LEFT)
@@ -3858,6 +3868,10 @@ class PostProcessingTab:
         self.log_text.delete(1.0, tk.END)
 
     # ==================== OP2 LISTING ====================
+    # _scan_op2_files: verilen klasörü (ve TÜM alt klasörlerini - os.walk ile
+    # rekürsif) tara, ".op2" ile biten her dosyayı bul. Rekürsif olması
+    # gerekli çünkü Understanding Structure Type sekmesinin paralel/split
+    # çalıştırmaları .op2'leri run1/run2/... alt klasörlerine yerleştiriyor.
     @staticmethod
     def _scan_op2_files(folder):
         files = []
@@ -3917,8 +3931,8 @@ class PostProcessingTab:
             return 0, 0
 
         exe_path = self.converter_exe_path.get().strip()
-        exe_dir = os.path.dirname(exe_path) or None
-        exe_name = os.path.basename(exe_path)
+        exe_dir = os.path.dirname(exe_path) or None  # bat dosyasının yazılıp çalıştırılacağı klasör
+        exe_name = os.path.basename(exe_path)          # bat içinde SADECE dosya adıyla referans verilecek
         out_dir = self.output_folder.get().strip()
         os.makedirs(out_dir, exist_ok=True)
 
@@ -3945,10 +3959,13 @@ class PostProcessingTab:
 
         with open(bat_path, 'w', encoding='latin-1') as f:
             f.write('\n'.join(lines) + '\n')
-        self.log(f"  Batch file written: {bat_path}")
+        self.log(f"  Batch file written: {bat_path}")  # Batch_Run.bat - her satırda bir OP2->H5 dönüşüm komutu
 
         self.root.after(0, lambda: self.progress_var.set(2))
         self.log(f"\n  Running batch ({len(lines)} conversion(s))...")
+        # Bat dosyasını cmd.exe üzerinden, converter exe'nin KENDİ klasöründen
+        # (cwd=exe_dir) çalıştır - tam olarak kullanıcı o klasörde çift
+        # tıklamış gibi davranır.
         result = subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, capture_output=True, text=True)
         self.root.after(0, lambda: self.progress_var.set(30))
 
@@ -3959,6 +3976,9 @@ class PostProcessingTab:
         if result.stderr:
             self.log(f"  stderr: {result.stderr.strip()[:2000]}")
 
+        # Beklenen her .h5 dosyasının gerçekten diskte oluştuğunu doğrula -
+        # bu, "converter sessizce başarısız oldu ama bat dosyası 0 ile çıktı"
+        # durumunu yakalayan asıl kontrol.
         n_ok = sum(1 for p in expected_h5 if os.path.exists(p))
         self.log(f"\n  {n_ok}/{len(expected_h5)} H5 file(s) produced (took {time.time() - t_start:.1f}s)")
         if n_ok < len(expected_h5):
@@ -3970,6 +3990,9 @@ class PostProcessingTab:
         return n_ok, len(expected_h5)
 
     # ==================== LOAD EXTRACTION PREP ====================
+    # _chunk_list: items listesini n parçaya böl, parçalar mümkün olduğunca
+    # eşit boyutlu olsun (k=taban boyut, m=kalan - ilk m parça bir eleman
+    # daha fazla alır) - numpy.array_split ile aynı dengeli bölme mantığı.
     @staticmethod
     def _chunk_list(items, n):
         """Split items into n contiguous, as-equal-as-possible chunks (same
@@ -4042,7 +4065,7 @@ class PostProcessingTab:
         self.log("PREPARING LOAD EXTRACTION")
         self.log("=" * 70)
 
-        # ---- 1. Read the 'Load_Extraction' sheet ----
+        # ---- 1. 'Load_Extraction' sayfasını oku ----
         xl = pd.ExcelFile(input_excel)
         le_sheet = None
         for sheet in xl.sheet_names:
@@ -4062,7 +4085,7 @@ class PostProcessingTab:
             self.log("  ERROR: No 'Set' column found in the Load_Extraction sheet.")
             return 0, n
 
-        # ---- 2. Group by Set (first-seen order), split into n chunks ----
+        # ---- 2. 'Set' sütununa göre grupla (ilk görülme sırasıyla), n parçaya böl ----
         unique_sets = list(dict.fromkeys(df[set_col].tolist()))
         set_chunks = self._chunk_list(unique_sets, n)
         self.log(f"  {len(unique_sets)} unique Set(s) -> split into {n} group(s)")
@@ -4070,7 +4093,7 @@ class PostProcessingTab:
         if empty_chunks:
             self.log(f"  NOTE: {empty_chunks} group(s) have no Sets (fewer unique Sets than the split count)")
 
-        # ---- 3. H5 files from the OP2->H5 conversion's own Output Folder ----
+        # ---- 3. H5 dosyalarını, OP2->H5 dönüşümünün Output Folder'ından topla ----
         h5_folder = self.output_folder.get().strip()
         h5_files = []
         if h5_folder and os.path.isdir(h5_folder):
@@ -4085,12 +4108,14 @@ class PostProcessingTab:
         thm_bdf = self.le_thermal_bdf_path.get().strip()
         pickle_path = self.le_pickle_path.get().strip()
 
-        # ---- 4. One split folder per chunk ----
+        # ---- 4. Her gruba (chunk) kendi "LoadExtraction_NN" klasörü ----
         n_done = 0
         for i, chunk_sets in enumerate(set_chunks):
             idx = i + 1
             self.log(f"\n  --- Group {idx}/{n}: {len(chunk_sets)} Set(s) ---")
             dest_folder = os.path.join(out_base, f"LoadExtraction_{idx:02d}")
+            # Şablon klasörü (Example LE Folder) bu gruba özel klasöre
+            # kopyala - her grup kendi bağımsız, tam çalışır kopyasına sahip olur.
             shutil.copytree(example_folder, dest_folder, dirs_exist_ok=True)
             self.log(f"    Template copied to: {dest_folder}")
 

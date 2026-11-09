@@ -4128,6 +4128,8 @@ class PostProcessingTab:
                           f"openpyxl can't edit it. Skipping.")
                 continue
 
+            # keep_vba: .xlsm/.xltm/.xlam uzantılı dosyalarda makro (VBA) kodu
+            # korunmalı - aksi halde openpyxl kaydederken makroları siler.
             keep_vba = tfx_path.lower().endswith(('.xlsm', '.xltm', '.xlam'))
             wb = openpyxl.load_workbook(tfx_path, keep_vba=keep_vba)
 
@@ -4136,6 +4138,7 @@ class PostProcessingTab:
                 self.log(f"    WARNING: no 'Joint_Input' sheet (or 'Bar Element ID' header) found in "
                           f"{os.path.basename(tfx_path)} - structure rows not written.")
             else:
+                # Başlık satırından (1. satır) sütun adı -> sütun numarası haritası çıkar.
                 header_map = {}
                 for cell in next(data_ws.iter_rows(min_row=1, max_row=1)):
                     if cell.value:
@@ -4143,11 +4146,12 @@ class PostProcessingTab:
 
                 subset_df = df[df[set_col].isin(chunk_sets)]
 
-                # Clear stale example rows under the header before pasting
+                # Yapıştırmadan önce başlığın altındaki eski örnek satırları temizle.
                 for col_idx in header_map.values():
                     for r in range(2, 2002):
                         data_ws.cell(row=r, column=col_idx).value = None
 
+                # Bu gruba ait satırları (subset_df) sütun adı eşleştirmesiyle yapıştır.
                 for r_off, (_, row) in enumerate(subset_df.iterrows()):
                     r = r_off + 2
                     for col_name in subset_df.columns:
@@ -4157,14 +4161,20 @@ class PostProcessingTab:
                             data_ws.cell(row=r, column=col_idx).value = None if pd.isna(val) else val
                 self.log(f"    Wrote {len(subset_df)} row(s) into '{data_ws.title}'")
 
+            # "Control" sayfasını, içinde "BDF File for Sprung System" metni
+            # geçen hücreye bakarak bul (sayfa adı sabit değil, bu yüzden
+            # içerik ipucuyla aranıyor).
             control_ws = self._find_control_sheet(wb, "BDF File for Sprung System")
             if control_ws is None:
                 self.log(f"    WARNING: no control sheet (with 'BDF File for Sprung System') found in "
                           f"{os.path.basename(tfx_path)} - C9/C10/C11/C17+ not written.")
             else:
+                # C9/C10/C11: maneuver/thermal BDF ve pickle dosya yolları.
                 control_ws['C9'] = man_bdf
                 control_ws['C10'] = thm_bdf
                 control_ws['C11'] = pickle_path
+                # C17'den başlayarak tüm H5 dosya yollarını, önce eski
+                # değerleri temizleyip, listele.
                 for r in range(17, 2017):
                     control_ws.cell(row=r, column=3).value = None
                 for r_off, p in enumerate(h5_files):
@@ -4180,6 +4190,9 @@ class PostProcessingTab:
         return n_done, n
 
     # ==================== RUN TF-X ANALYSES (Load_Ext_H5.exe BATCH FILES) ====================
+    # _find_le_groups_folders: LE Output Folder altındaki tüm "loadextraction_"
+    # ile başlayan alt klasörleri bul. İsimler sıfır doldurmalı (01, 02, ...)
+    # olduğu için düz alfabetik sıralama 99 gruba kadar doğru sırayı verir.
     def _find_le_groups_folders(self):
         """Every LoadExtraction_NN folder under the LE Output Folder,
         sorted by name (zero-padded, so plain alphabetical sort is correct
@@ -4231,6 +4244,8 @@ class PostProcessingTab:
                 self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
                 continue
 
+            # Load_Ext_H5.exe'ye verilecek sabit komut satırı argümanları -
+            # bu gruba özgü olan tek şey --xls (bu grubun TF-X Excel'i).
             cmd_line = (
                 f'{exe_name} --mode "Joint" --bdf "{maneuver_bdf}" --sprung-bdf "{thermal_bdf}" '
                 f'--xls "{tfx_path}" --cid "Material" --nsigma "1.28" --pickle "{pickle_path}" '
@@ -4242,6 +4257,10 @@ class PostProcessingTab:
                 f.write(f'cd /d "{exe_dir}"\n{cmd_line}\n')
             self.log(f"    Batch file written: {bat_path}")
 
+            # Popen (subprocess.run DEĞİL) ile "fırlat ve unut" (fire and
+            # forget) şeklinde başlat - bu TF-X analizi dakikalarca/saatlerce
+            # sürebilir ve bu tool onun bitmesini BEKLEMEZ, sadece başlatır.
+            # Çıktısı o grubun kendi loadext_log.txt'sine yönlendirilir.
             log_path = os.path.join(dest_folder, "loadext_log.txt")
             try:
                 log_file = open(log_path, 'w')
@@ -4253,6 +4272,9 @@ class PostProcessingTab:
 
             self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
 
+            # Her başlatma arasında 20s bekle - aynı anda çok fazla ağır
+            # analiz sürecinin birden fırlatılıp sistemi/lisans sunucusunu
+            # boğmasını önlemek için kademeli (staggered) başlatma.
             if idx < n:
                 self.log("    Waiting 20s before starting the next one...")
                 time.sleep(20)
@@ -4262,8 +4284,12 @@ class PostProcessingTab:
         return n_started, n
 
     # ==================== RUN (FULL PIPELINE) ====================
+    # start_run: "RUN" butonunun komutu. Her iki aşamanın (OP2->H5 ve Load
+    # Extraction hazırlığı) TÜM girdilerini önceden doğrular - gerçek
+    # çalışma (arka plan thread'inde _run_pipeline) başlamadan hiçbir
+    # eksik/geçersiz alan yüzünden yarı yolda hata vermesin diye.
     def start_run(self):
-        # OP2 -> H5 inputs
+        # OP2 -> H5 girdileri
         if not self.op2_folder.get().strip() or not os.path.isdir(self.op2_folder.get().strip()):
             messagebox.showerror("Error", "Select a valid OP2 Folder")
             return
@@ -4275,7 +4301,7 @@ class PostProcessingTab:
             messagebox.showerror("Error", "Select an Output Folder (H5)")
             return
 
-        # Load Extraction inputs
+        # Load Extraction girdileri
         if not self.le_input_excel_path.get().strip() or not os.path.exists(self.le_input_excel_path.get().strip()):
             messagebox.showerror("Error", "Select a valid Input Excel")
             return
@@ -4307,6 +4333,10 @@ class PostProcessingTab:
         self.root.after(0, lambda: self.progress_var.set(0))
         threading.Thread(target=self._run_pipeline, daemon=True).start()
 
+    # _run_pipeline: tüm sekmenin 3 aşamasını SIRAYLA çalıştırır ve her
+    # aşama SADECE öncekinin TAM başarılı olmasıyla devam eder - yarım
+    # kalmış/eksik bir ara adım üzerine bina edip yanlış/eksik sonuç
+    # üretmek yerine, hatayı erkenden durdurup kullanıcıya bildirir.
     def _run_pipeline(self):
         """OP2 -> H5 conversion, then (only if every H5 came out OK) Load
         Extraction prep, then (only if at least one group was prepared)
@@ -4318,6 +4348,7 @@ class PostProcessingTab:
             self.log("RUN: OP2 -> H5 CONVERSION -> LOAD EXTRACTION PREP -> TF-X ANALYSES")
             self.log("#" * 70)
 
+            # Aşama 1: OP2 -> H5 dönüşümü.
             n_ok, n_total = self._convert_op2_to_h5()
 
             if n_total == 0:
@@ -4328,12 +4359,14 @@ class PostProcessingTab:
                           f"Extraction prep not started. Fix the issue above, then press RUN again.")
                 return
 
+            # Aşama 2: Load Extraction klasör/Excel hazırlığı - SADECE tüm H5'ler başarılı olduysa çalışır.
             n_done, n_groups = self._prepare_load_extraction_core()
 
             if n_done == 0:
                 self.log("\nSTOPPED: no Load Extraction group was prepared - TF-X analyses not started.")
                 return
 
+            # Aşama 3: her gruba ait TF-X analizini (Load_Ext_H5.exe) başlat - SADECE en az bir grup hazırsa çalışır.
             n_started, n_analyses = self._run_tfx_batch_core()
 
             self.root.after(0, lambda: self.progress_var.set(100))
@@ -4353,6 +4386,9 @@ class PostProcessingTab:
             self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
 
 
+# ============================================================================
+# JointRunTab  --  "Joint Run" sekmesi (Tab 5)
+# ============================================================================
 class JointRunTab:
     """Joint Run: groups every Joint_Loads_<SetName>.h5 into its own Set
     folder, copies the Example Joint Input Excel template and the Util

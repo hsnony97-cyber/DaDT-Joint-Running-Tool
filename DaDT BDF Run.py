@@ -4401,23 +4401,30 @@ class JointRunTab:
     exe (finds the H5 on its own, cwd'd into that folder), writes the
     matching Cap/Skin Joint Loads CSV rows (scaled by a user factor) into
     the 'Limit Stress Check' sheet, and finally runs the Joint Run exe."""
+    # Türkçe özet: Her Joint_Loads_<SetName>.h5 dosyası kendi "Set" klasörüne
+    # taşınır; o klasöre şablon Excel + Util Folder kopyalanır, Excel'in
+    # "Spectrum Joint Input" sayfası Main Input Excel'den o Set'e ait
+    # satırlarla doldurulur. Sırasıyla: License Checker (bir kez, başta),
+    # her Set için Load Modifying (H5'i "Arranged" hale getirir), RSS Case
+    # Finding, Limit Stress Check sayfasının doldurulması, ve son olarak
+    # Joint Run exe çalıştırılır - hepsi bu sekmenin tek RUN butonundan.
 
     def __init__(self, parent_frame, root):
         self.root = root
         self.parent_frame = parent_frame
 
-        self.h5_folder = tk.StringVar()
-        self.main_input_excel_path = tk.StringVar()
-        self.example_joint_excel_path = tk.StringVar()
-        self.util_folder = tk.StringVar()
-        self.license_checker_exe_path = tk.StringVar()
-        self.load_modifying_exe_path = tk.StringVar()
-        self.rss_exe_path = tk.StringVar()
-        self.joint_run_exe_path = tk.StringVar()
-        self.output_folder = tk.StringVar()
-        self.max_parallel_runs = tk.StringVar(value="4")
-        self.scale_factor = tk.StringVar(value="1")
-        self.h5_files = []
+        self.h5_folder = tk.StringVar()                  # Joint_Loads_<Set>.h5 dosyalarının bulunduğu klasör
+        self.main_input_excel_path = tk.StringVar()      # DTCG_Input_Excel_Data sayfasını içeren ana Excel
+        self.example_joint_excel_path = tk.StringVar()   # her Set klasörüne kopyalanacak şablon Excel
+        self.util_folder = tk.StringVar()                # her Set klasörüne kopyalanacak yardımcı dosyalar klasörü
+        self.license_checker_exe_path = tk.StringVar()   # bir kez, en başta çalıştırılan lisans kontrol programı
+        self.load_modifying_exe_path = tk.StringVar()    # her Set klasöründe çalıştırılan yük düzenleme programı
+        self.rss_exe_path = tk.StringVar()                # RSS Case Finding programı
+        self.joint_run_exe_path = tk.StringVar()          # son adımda çalıştırılan Joint Run programı
+        self.output_folder = tk.StringVar()               # Set klasörlerinin oluşturulacağı kök çıktı klasörü
+        self.max_parallel_runs = tk.StringVar(value="4")  # aynı anda kaç Set'in paralel işleneceği
+        self.scale_factor = tk.StringVar(value="1")       # Limit Stress Check'e yazılan yük değerlerine uygulanan çarpan
+        self.h5_files = []                                 # List butonuyla bulunan H5 dosyaları (önizleme)
 
         self.is_running = False
 
@@ -4628,6 +4635,9 @@ class JointRunTab:
         self.log_text.delete(1.0, tk.END)
 
     # ==================== H5 LISTING ====================
+    # _scan_joint_h5_files: H5 Folder altında (rekürsif), adı "joint_loads_"
+    # ile başlayıp ".h5" ile biten tüm dosyaları bul - bunlar işlenecek
+    # "Set" dosyalarıdır.
     @staticmethod
     def _scan_joint_h5_files(folder):
         files = []
@@ -4639,6 +4649,9 @@ class JointRunTab:
         files.sort()
         return files
 
+    # _set_name_from_h5: "Joint_Loads_<SetName>.h5" dosya adından SetName
+    # kısmını çıkar - bu ad hem Set klasörünün adı hem de şablon Excel'in
+    # yeniden adlandırılacağı ad olarak kullanılır.
     @staticmethod
     def _set_name_from_h5(h5_path):
         base = os.path.splitext(os.path.basename(h5_path))[0]
@@ -4668,10 +4681,13 @@ class JointRunTab:
         self.log(f"  Found {len(self.h5_files)} Joint_Loads_*.h5 file(s)")
 
     # ==================== SHARED HELPERS ====================
+    # _normalize_header: sütun/sayfa adlarını karşılaştırmak için boşluk ve
+    # alt çizgiyi silip küçük harfe çevirir ("Bar Element ID" == "bar_element_id").
     @staticmethod
     def _normalize_header(h):
         return str(h).strip().lower().replace(' ', '').replace('_', '')
 
+    # _find_sheet_by_name: normalize edilmiş sayfa adına göre bir worksheet bul.
     @staticmethod
     def _find_sheet_by_name(wb, normalized_target):
         for ws in wb.worksheets:
@@ -4686,6 +4702,8 @@ class JointRunTab:
         if not base or not os.path.isdir(base):
             return []
         folders = []
+        # Sadece BİRİNCİ seviye alt klasörlere bak (os.walk gibi rekürsif
+        # değil) - her Set klasörü doğrudan Output Folder'ın altındadır.
         for name in os.listdir(base):
             full = os.path.join(base, name)
             if os.path.isdir(full) and any(fn.lower().endswith('.h5') for fn in os.listdir(full)):
@@ -4706,6 +4724,10 @@ class JointRunTab:
                 return full
         return None
 
+    # _read_csv_keyed: RSS Case Finding'in ürettiği Cap/Skin Joint Loads
+    # CSV'sini oku, başlıkları normalize et, "Bar Element ID" sütununu
+    # index yap - böylece sonradan belirli bir eleman ID'si için satır
+    # aramak tek bir .loc[] erişimi olur.
     @classmethod
     def _read_csv_keyed(cls, path):
         """Read a Cap/Skin Joint Loads CSV, normalize its headers, and key
@@ -4721,6 +4743,11 @@ class JointRunTab:
         return df.set_index('barelementid')
 
     # ==================== STAGE 1: GROUP H5s + FILL SPECTRUM JOINT INPUT ====================
+    # _prepare_joint_folders_core: her Joint_Loads_<Set>.h5 için kendi Set
+    # klasörünü oluşturur (H5'i kopyalar, şablon Excel'i <Set>.xlsx olarak
+    # kopyalar, Util Folder'ı kopyalar) ve o Excel'in "Spectrum Joint Input"
+    # sayfasını Main Input Excel'in DTCG_Input_Excel_Data sayfasından o Set'e
+    # (Structure Name) ait satırlarla doldurur.
     def _prepare_joint_folders_core(self):
         """Returns (n_done, n_total)."""
         t_start = time.time()
@@ -4741,6 +4768,7 @@ class JointRunTab:
             return 0, 0
         n = len(self.h5_files)
 
+        # Main Input Excel'den "DTCG_Input_Excel_Data" sayfasını bul.
         xl = pd.ExcelFile(main_excel)
         data_sheet = None
         for sheet in xl.sheet_names:
@@ -4769,23 +4797,28 @@ class JointRunTab:
             dest_folder = os.path.join(out_base, set_name)
             os.makedirs(dest_folder, exist_ok=True)
 
+            # 1. H5 dosyasını kendi Set klasörüne kopyala.
             shutil.copy2(h5_path, os.path.join(dest_folder, os.path.basename(h5_path)))
             self.log(f"    H5 copied to: {dest_folder}")
 
+            # 2. Şablon Excel'i Set'in adıyla (örn. "Spar1_IB.xlsx") kopyala.
             joint_xl_path = os.path.join(dest_folder, set_name + example_ext)
             shutil.copy2(example_excel, joint_xl_path)
 
+            # 3. Util Folder'ın TÜM içeriğini de bu Set klasörüne kopyala.
             util_folder = self.util_folder.get().strip()
             if util_folder:
                 util_dest = os.path.join(dest_folder, os.path.basename(os.path.normpath(util_folder)))
                 shutil.copytree(util_folder, util_dest, dirs_exist_ok=True)
                 self.log(f"    Util Folder copied to: {util_dest}")
 
+            # 4. Main Input Excel'den SADECE bu Set'in (Structure Name) satırlarını filtrele.
             subset_df = main_df[main_df[struct_col].astype(str).str.strip() == set_name]
             self.log(f"    {len(subset_df)} row(s) match Structure Name '{set_name}'")
 
             keep_vba = joint_xl_path.lower().endswith(('.xlsm', '.xltm', '.xlam'))
             wb = openpyxl.load_workbook(joint_xl_path, keep_vba=keep_vba)
+            # 5. "Spectrum Joint Input" sayfasını bul ve filtrelenmiş satırları yapıştır.
             spectrum_ws = self._find_sheet_by_name(wb, 'spectrumjointinput')
             if spectrum_ws is None:
                 self.log("    WARNING: no 'Spectrum Joint Input' sheet found in the copied "
@@ -4818,6 +4851,9 @@ class JointRunTab:
         return n_done, n
 
     # ==================== STAGE 2: LICENSE CHECKER (ONCE) ====================
+    # _run_license_checker_core: License Checker exe'sini TEK SEFERLİK,
+    # argümansız başlat - bir pencere açıp açık kalabileceği için Popen ile
+    # başlatılıp beklenmez, sadece fırlatılır.
     def _run_license_checker_core(self):
         """Launch the License Checker exe exactly once, no arguments - the
         same as double-clicking it. It is not waited on (it may open a

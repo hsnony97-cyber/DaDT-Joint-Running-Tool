@@ -7,23 +7,61 @@ Tab 2: Understanding Structure Type (apply 'Bar Property'/'Skin Property' + offs
 Tab 3: Post Processing (OP2 -> H5 batch conversion, Load Extraction folder prep)
 """
 
+# ==================== KÜTÜPHANE/MODÜL İMPORTLARI ====================
+# Tkinter: Python'un standart GUI (grafik arayüz) kütüphanesi. Bu araç
+# tamamen Tkinter tabanlı masaüstü bir uygulamadır.
 import tkinter as tk
+# ttk: Tkinter'ın "themed" (temalı, daha modern görünümlü) widget seti.
+# filedialog: dosya/klasör seçme pencereleri (Browse butonları için).
+# messagebox: hata/uyarı/bilgi pop-up pencereleri (messagebox.showerror vb.).
+# scrolledtext: otomatik kaydırma çubuklu metin kutusu (Log panelleri için).
 from tkinter import ttk, filedialog, messagebox, scrolledtext
+# os: dosya/klasör yolu işlemleri (os.path.join, os.makedirs, os.listdir, os.walk vb.).
 import os
+# re: düzenli ifadeler (regex) - bazı metin ayrıştırma işlemlerinde kullanılıyor.
 import re
+# threading: arka planda (GUI'yi dondurmadan) uzun süren işleri çalıştırmak için
+# ayrı thread (iş parçacığı) açmaya yarar. Her "RUN" butonu işi bir thread'e atar.
 import threading
+# csv: CSV (virgülle ayrılmış değerler) dosyalarını okuma/yazma.
 import csv
+# shutil: dosya/klasör kopyalama (copy2), taşıma (move), klasör ağacı kopyalama (copytree).
 import shutil
+# tempfile: geçici dosya/klasör oluşturma (bu dosyada şu an aktif kullanılmıyor,
+# ileride geçici dosya ihtiyacı olursa hazır dursun diye import edilmiş olabilir).
 import tempfile
+# subprocess: harici programları (Nastran, dönüştürücü exe'ler, .bat dosyaları vb.)
+# başlatıp çalıştırmak için. subprocess.run (bekleyerek) ve subprocess.Popen
+# (beklemeden, arka planda başlatmak için) ikisi de kullanılıyor.
 import subprocess
+# time: zaman ölçümü (time.time() ile süre hesaplama) ve bekleme (time.sleep()).
 import time
+# concurrent.futures: birden fazla işi (örn. birden fazla Nastran çalıştırması,
+# birden fazla exe çalıştırması) aynı anda, sınırlı sayıda paralel thread ile
+# çalıştırmak için (ThreadPoolExecutor).
 import concurrent.futures
+# datetime: tarih/saat damgası üretmek için (örn. "BaseModel_20260101_120000" gibi
+# klasör isimlerinde kullanılan zaman damgası).
 from datetime import datetime
+# pandas: Excel/CSV dosyalarını tablo (DataFrame) olarak okuyup işlemek için.
 import pandas as pd
+# pyNastran: NASTRAN'ın BDF (Bulk Data File) formatındaki dosyalarını ayrıştırmak
+# (parse etmek) için kullanılan üçüncü parti kütüphane. Sadece BDF sınıfı
+# import ediliyor (tüm pyNastran kütüphanesi değil).
 from pyNastran.bdf.bdf import BDF
+# numpy: sayısal/vektör hesaplamalar için (örn. offset hesaplarında normal vektör
+# işlemleri - np.cross, np.linalg.norm vb.).
 import numpy as np
+# openpyxl: Excel (.xlsx/.xlsm) dosyalarını hücre hücre okuyup YAZMAK için.
+# pandas sadece okuma/toplu analiz için kullanılırken, var olan bir Excel şablonunu
+# (örneğin makrolu bir .xlsm dosyasını) KORUYARAK belirli hücrelerini güncellemek
+# gerektiğinde openpyxl kullanılıyor.
 import openpyxl
 
+# _APP_COLORS: uygulamanın renk paletini tutan global (modül seviyesi) sözlük.
+# Başlangıçta boş, _configure_app_style() çağrıldığında içi dolduruluyor.
+# Tüm sekmeler (tab) bu sözlüğü widget renklerini ayarlarken okuyor
+# (örn. _APP_COLORS['surface'], _APP_COLORS['primary'] gibi).
 _APP_COLORS = {}  # populated by _configure_app_style(); shared palette for both tabs
 
 
@@ -32,155 +70,256 @@ def _configure_app_style(root):
     ttk.Style singleton, so configuring it once here restyles every ttk
     widget in both tabs without touching how any of them behave. Pure
     look-and-feel - no widget's command/callback is affected."""
+    # Uygulamanın tüm renk paleti burada tanımlanıyor. Bu sadece GÖRSEL bir
+    # ayardır - hiçbir butonun/alanın İŞLEVİNİ (ne yaptığını) etkilemez.
     colors = {
-        'bg': '#f1f5f9',
-        'surface': '#ffffff',
-        'text': '#0f172a',
-        'muted': '#64748b',
-        'border': '#cbd5e1',
-        'primary': '#2563eb',
-        'primary_dark': '#1d4ed8',
-        'success': '#16a34a',
-        'success_dark': '#15803d',
-        'danger': '#dc2626',
-        'danger_dark': '#b91c1c',
-        'log_bg': '#0f172a',
-        'log_fg': '#e2e8f0',
+        'bg': '#f1f5f9',           # genel arka plan rengi (açık gri-mavi)
+        'surface': '#ffffff',      # kutu/alan (entry, listbox vb.) arka planı (beyaz)
+        'text': '#0f172a',         # normal yazı rengi (koyu lacivert/siyah)
+        'muted': '#64748b',        # soluk/ikincil yazı rengi (açıklama metinleri için)
+        'border': '#cbd5e1',       # kenarlık rengi (açık gri)
+        'primary': '#2563eb',      # ana vurgu rengi (mavi) - örn. RUN butonu
+        'primary_dark': '#1d4ed8', # ana vurgu renginin koyu tonu (hover/başlık rengi)
+        'success': '#16a34a',      # başarı rengi (yeşil)
+        'success_dark': '#15803d', # başarı renginin koyu tonu
+        'danger': '#dc2626',       # hata/tehlike rengi (kırmızı)
+        'danger_dark': '#b91c1c',  # hata renginin koyu tonu
+        'log_bg': '#0f172a',       # Log panelinin arka planı (koyu - terminal gibi görünsün diye)
+        'log_fg': '#e2e8f0',       # Log panelindeki yazı rengi (açık renk, koyu zemin üzerinde okunsun diye)
     }
 
+    # Ana pencerenin (root) arka plan rengini ayarla.
     root.configure(bg=colors['bg'])
 
+    # ttk.Style nesnesi: Tkinter'ın temalı widget'larının (ttk.Button, ttk.Label
+    # vb.) görünümünü merkezi olarak kontrol eden nesne.
     style = ttk.Style(root)
     try:
+        # 'clam' teması: platformdan bağımsız, daha modern/düz görünümlü bir tema.
+        # Bazı sistemlerde bu tema bulunmayabilir, o yüzden try/except içinde.
         style.theme_use('clam')
     except tk.TclError:
+        # Tema bulunamazsa sessizce devam et - varsayılan tema kullanılır,
+        # uygulama yine de çalışır, sadece görünüm biraz farklı olur.
         pass
 
+    # Normal yazı tipi (etiketler, butonlar vb. için).
     base_font = ('Segoe UI', 10)
+    # Bölüm başlıkları için kalın yazı tipi (örn. "1. Input Files" gibi başlıklar).
     section_font = ('Segoe UI', 10, 'bold')
 
+    # Aşağıdaki style.configure() çağrıları, her bir ttk widget TÜRÜ için
+    # (ör. tüm TFrame'ler, tüm TLabel'lar) ortak varsayılan görünüm ayarlıyor.
+    # '.' = tüm widget'lar için en genel/kök ayar.
     style.configure('.', background=colors['bg'], foreground=colors['text'], font=base_font)
     style.configure('TFrame', background=colors['bg'])
     style.configure('TLabel', background=colors['bg'], foreground=colors['text'])
     style.configure('TCheckbutton', background=colors['bg'])
 
+    # 'Header.TLabel' stili: sekme başlıklarında kullanılan büyük, kalın,
+    # vurgulu başlık etiketi (örn. "Post Processing", "Joint Run" gibi başlıklar).
     style.configure('Header.TLabel', font=('Segoe UI', 15, 'bold'),
                     foreground=colors['primary_dark'], background=colors['bg'])
+    # 'Subtitle.TLabel' stili: başlığın altındaki küçük açıklama satırı.
     style.configure('Subtitle.TLabel', font=('Segoe UI', 9),
                     foreground=colors['muted'], background=colors['bg'])
 
+    # LabelFrame (örn. "1. Input Files" çerçeveli kutular) ve onun başlık yazısı.
     style.configure('TLabelframe', background=colors['bg'], bordercolor=colors['border'])
     style.configure('TLabelframe.Label', background=colors['bg'],
                     foreground=colors['primary_dark'], font=section_font)
 
+    # Notebook = sekme (tab) çubuğunun kendisi.
     style.configure('TNotebook', background=colors['bg'], borderwidth=0)
+    # Her bir sekme sekmesi (örn. "Post Processing" yazan tıklanabilir kulakçık).
     style.configure('TNotebook.Tab', font=('Segoe UI', 10, 'bold'), padding=(16, 8),
                     background=colors['border'], foreground=colors['text'])
+    # style.map(): widget'ın DURUMUNA göre (örn. seçili/seçili değil) farklı
+    # renk uygulamak için kullanılır. Burada: seçili (aktif) sekme beyaz zeminli
+    # ve koyu mavi yazılı olsun diye ayarlanıyor.
     style.map('TNotebook.Tab',
               background=[('selected', colors['surface'])],
               foreground=[('selected', colors['primary_dark'])])
 
+    # Normal (vurgusuz) buton görünümü - örn. "Browse", "Clear Log" butonları.
     style.configure('TButton', font=base_font, padding=(10, 5),
                     background=colors['surface'], foreground=colors['text'])
+    # Butona tıklanıp basılı tutulduğunda (active) arka planı değişsin.
     style.map('TButton', background=[('active', colors['border'])])
 
+    # 'Accent.TButton' stili: vurgulu/önemli butonlar için (örn. RUN butonları,
+    # SOLVE BASE MODEL butonu). Mavi zemin, beyaz yazı - dikkat çeksin diye.
     style.configure('Accent.TButton', font=('Segoe UI', 10, 'bold'), padding=(14, 7),
                     background=colors['primary'], foreground='white')
+    # active (tıklanırken) daha koyu mavi, disabled (pasif/gri) iken kenarlık rengi.
     style.map('Accent.TButton',
               background=[('active', colors['primary_dark']), ('disabled', colors['border'])],
               foreground=[('disabled', colors['muted'])])
 
+    # 'Danger.TButton' stili: tehlikeli/geri alınamaz işlemler için kırmızı buton
+    # (bu dosyada şu an için tanımlı ama hiçbir yerde kullanılmıyor olabilir -
+    # ileride silme/sıfırlama gibi bir buton eklenirse hazır dursun diye).
     style.configure('Danger.TButton', font=('Segoe UI', 10, 'bold'), padding=(14, 7),
                     background=colors['danger'], foreground='white')
     style.map('Danger.TButton',
               background=[('active', colors['danger_dark']), ('disabled', colors['border'])],
               foreground=[('disabled', colors['muted'])])
 
+    # Metin giriş kutuları (Entry) ve açılır liste kutuları (Combobox) görünümü.
     style.configure('TEntry', padding=4, fieldbackground=colors['surface'], bordercolor=colors['border'])
     style.configure('TCombobox', padding=4)
 
+    # İlerleme çubuğu (Progressbar) görünümü - her sekmenin altındaki mavi
+    # ilerleme çubuklarının rengi/kalınlığı burada ayarlanıyor.
     style.configure('Horizontal.TProgressbar', troughcolor=colors['border'],
                     background=colors['primary'], bordercolor=colors['border'], thickness=14)
 
+    # Yukarıda tanımlanan renk sözlüğünü global _APP_COLORS içine kopyala,
+    # böylece diğer tüm sınıflar (PostProcessingTab, JointRunTab vb.)
+    # bu renklere _APP_COLORS['...'] şeklinde erişebilsin.
     _APP_COLORS.update(colors)
     return colors
 
 
+# ==================== ANA UYGULAMA SINIFI ====================
+# IntegratedBDFRFTool: tüm uygulamanın "çatı" sınıfı. Ana pencereyi (root),
+# üstteki başlık şeridini (banner) ve sekme (Notebook) çubuğunu oluşturur;
+# her bir sekmenin kendi sınıfını (BarPropertySolverTab, PostProcessingTab,
+# JointRunTab, FullRunTab, IterativeFullRunTab) örnekleyip Notebook'a ekler.
+# "BDF Merge Preparation" sekmesinin arayüzü ise ayrı bir sınıfa çıkarılmamış,
+# doğrudan bu sınıfın içinde (setup_tab1 metodunda) tanımlı.
 class IntegratedBDFRFTool:
     def __init__(self, root):
+        # root: Tkinter'ın ana pencere nesnesi (tk.Tk() ile main() fonksiyonunda
+        # oluşturulup buraya parametre olarak geçiriliyor).
         self.root = root
+        # Pencere başlığı (Windows'ta pencerenin üst çubuğunda görünen yazı).
         self.root.title("DaDT Structure Definition Tool v16.0")
+        # Pencerenin açılış boyutu (genişlik x yükseklik, piksel).
         self.root.geometry("1150x950")
+        # Pencerenin küçültülebileceği en küçük boyut sınırı.
         self.root.minsize(1000, 700)
+        # Yukarıda tanımlanan _configure_app_style() fonksiyonunu çağırıp
+        # tüm uygulamanın renk/tema ayarlarını bir kere, en başta uyguluyoruz.
+        # Dönen renk sözlüğü self.colors içinde de saklanıyor (ayrıca global
+        # _APP_COLORS içine de yazılmıştı).
         self.colors = _configure_app_style(self.root)
 
-        # Tab 1 variables
-        self.thermal_bdfs = []
-        self.maneuver_bdfs = []
-        self.excel_path = tk.StringVar()
-        self.output_folder = tk.StringVar()
-        self.output_thermal_name = tk.StringVar(value="merged_thermal.bdf")
-        self.output_maneuver_name = tk.StringVar(value="merged_maneuver.bdf")
-        self.set_id = tk.StringVar(value="99")
-        self.node_set_id = tk.StringVar(value="199")
-        self.temp_initial = tk.StringVar(value="10")
-        
+        # ---- Tab 1 (BDF Merge Preparation) değişkenleri ----
+        # Bu sekmeye özel veriler; BarPropertySolverTab/PostProcessingTab gibi
+        # ayrı sınıflara çıkarılmadığı için doğrudan bu ana sınıfın (self)
+        # özellikleri (attribute) olarak tutuluyor.
+        self.thermal_bdfs = []    # kullanıcının eklediği "Thermal" BDF dosya yolları listesi
+        self.maneuver_bdfs = []   # kullanıcının eklediği "Maneuver" BDF dosya yolları listesi
+        self.excel_path = tk.StringVar()   # birleştirme ayarlarını içeren Excel dosyasının yolu
+        self.output_folder = tk.StringVar()   # birleştirilmiş BDF'lerin yazılacağı çıktı klasörü
+        self.output_thermal_name = tk.StringVar(value="merged_thermal.bdf")   # çıktı thermal BDF'in varsayılan dosya adı
+        self.output_maneuver_name = tk.StringVar(value="merged_maneuver.bdf")  # çıktı maneuver BDF'in varsayılan dosya adı
+        self.set_id = tk.StringVar(value="99")         # NASTRAN SET kart ID'si (varsayılan 99)
+        self.node_set_id = tk.StringVar(value="199")   # NASTRAN düğüm (node) SET kart ID'si (varsayılan 199)
+        self.temp_initial = tk.StringVar(value="10")   # başlangıç sıcaklığı değeri (varsayılan 10)
 
+
+        # Arayüzü (tüm sekmeleri) kuran metodu çağır - bu metod aşağıda tanımlı.
         self.setup_ui()
-    
+
     def setup_ui(self):
+        # ---- Üst başlık şeridi (banner) ----
+        # Pencerenin en üstünde görünen "🔧 DaDT Structure Definition Tool  v16.0"
+        # yazısını içeren çerçeve.
         banner = ttk.Frame(self.root, padding=(16, 12))
         banner.pack(fill=tk.X)
         ttk.Label(banner, text="\U0001F527 DaDT Structure Definition Tool", style='Header.TLabel').pack(side=tk.LEFT)
         ttk.Label(banner, text="  v16.0", style='Subtitle.TLabel').pack(side=tk.LEFT, pady=(6, 0))
+        # Banner ile sekme çubuğu arasına yatay bir ayraç (ince çizgi) çiz.
         ttk.Separator(self.root, orient='horizontal').pack(fill=tk.X)
 
+        # ---- Sekme (Notebook) çubuğu ----
+        # Notebook: üstte tıklanabilir sekme kulakçıkları (tabs) gösteren,
+        # her sekmenin kendi içeriğini barındıran Tkinter widget'ı.
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
+        # ---- Sekme 1: BDF Merge Preparation ----
+        # Bu sekmenin içeriği ayrı bir sınıfa çıkarılmamış; setup_tab1()
+        # metodu doğrudan bu notebook'un ilk sekmesinin (self.tab1) içini dolduruyor.
         self.tab1 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab1, text="\U0001F4C4  BDF Merge Preparation")
         self.setup_tab1()
 
+        # ---- Sekme 2: Understanding Structure Type ----
+        # BarPropertySolverTab sınıfının bir örneği (self.tab3_tool) oluşturulup
+        # self.tab3 çerçevesinin içine yerleştiriliyor. Bu örnek referansı daha
+        # sonra Full Run / Iterative Full Run sekmeleri tarafından da (dışarıdan,
+        # bu sınıfın kodu hiç değiştirilmeden) kullanılacak.
         self.tab3 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab3, text="\U0001F9EE  Understanding Structure Type")
         self.tab3_tool = BarPropertySolverTab(self.tab3, self.root)
 
+        # ---- Sekme 3: Post Processing ----
+        # OP2 -> H5 dönüşümü ve Load Extraction klasör hazırlığını yapan sekme.
         self.tab4 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab4, text="\U0001F4E6  Post Processing")
         self.tab4_tool = PostProcessingTab(self.tab4, self.root)
 
+        # ---- Sekme 4: Joint Run ----
+        # Joint Load H5'lerini Set bazında gruplayıp RSS Case Finding / Load
+        # Modifying / Joint Run exe'lerini çalıştıran sekme.
         self.tab5 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab5, text="\U0001F517  Joint Run")
         self.tab5_tool = JointRunTab(self.tab5, self.root)
 
+        # ---- Sekme 5: Full Run ----
+        # Understanding Structure Type + Post Processing + Joint Run'ı uç uca
+        # zincirleyen sekme. Dikkat: tab3_tool/tab4_tool/tab5_tool nesne
+        # referansları FullRunTab'e PARAMETRE olarak geçiriliyor - yani Full Run
+        # kendi kopyasını oluşturmuyor, doğrudan yukarıdaki aynı 3 sekme
+        # nesnesini (onların StringVar'larını set edip metodlarını çağırarak)
+        # dışarıdan yönetiyor.
         self.tab6 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab6, text="⚡  Full Run")
         self.tab6_tool = FullRunTab(self.tab6, self.root, self.tab3_tool, self.tab4_tool, self.tab5_tool)
 
+        # ---- Sekme 6: Iterative Full Run ----
+        # Full Run'ın aynı mantığının N kez döngüye alınmış hali (her
+        # iterasyonun sonucu bir sonraki iterasyonun girdisine besleniyor).
+        # Aynı şekilde tab3_tool/tab4_tool/tab5_tool referansları paylaşılıyor.
         self.tab7 = ttk.Frame(self.notebook)
         self.notebook.add(self.tab7, text="\U0001F501  Iterative Full Run")
         self.tab7_tool = IterativeFullRunTab(self.tab7, self.root, self.tab3_tool, self.tab4_tool, self.tab5_tool)
 
 
+    # setup_tab1: "BDF Merge Preparation" sekmesinin tüm arayüzünü (Thermal
+    # ve Maneuver BDF listeleri, ayarlar, PROCESS butonu, Log paneli) kurar.
+    # Bu sekmenin iş mantığı (gerçek BDF birleştirme işlemi) ayrı metodlarda
+    # (start_processing, collect_all_lines_from_masters vb., aşağıda).
     def setup_tab1(self):
+        # Sekmenin içini dolduracak ana (en dış) çerçeve.
         main = ttk.Frame(self.tab1, padding="10")
         main.pack(fill=tk.BOTH, expand=True)
-        
+
+        # Sekme başlığı.
         ttk.Label(main, text="BDF Merge Preparation v8", style='Header.TLabel').pack(pady=(0,10))
 
-        # === THERMAL SECTION ===
+        # === THERMAL BÖLÜMÜ ===
+        # "Thermal" tipi master BDF dosyalarının eklenip listelendiği kutu.
         thermal_main = ttk.LabelFrame(main, text="\U0001F321  THERMAL", padding="8")
         thermal_main.pack(fill=tk.X, pady=5)
-        
+
+        # "MASTER BDFs:" etiketi + "Add..."/"Clear" butonları + kaç dosya
+        # seçildiğini gösteren sayaç etiketini içeren tek satırlık çerçeve.
         thm_master_f = ttk.Frame(thermal_main)
         thm_master_f.pack(fill=tk.X, pady=2)
         ttk.Label(thm_master_f, text="MASTER BDFs:", width=12).pack(side=tk.LEFT)
+        # "Add..." butonu: dosya seçme penceresi açıp self.thermal_bdfs listesine ekler.
         ttk.Button(thm_master_f, text="Add...", command=self.add_thermal_bdfs).pack(side=tk.LEFT, padx=2)
+        # "Clear" butonu: self.thermal_bdfs listesini ve listbox'ı temizler.
         ttk.Button(thm_master_f, text="Clear", command=self.clear_thermal_bdfs).pack(side=tk.LEFT, padx=2)
+        # Kaç dosya seçildiğini gösteren metin (örn. "3 files") - dinamik güncellenir.
         self.thermal_count = tk.StringVar(value="0 files")
         ttk.Label(thm_master_f, textvariable=self.thermal_count).pack(side=tk.LEFT, padx=5)
-        
+
+        # Seçilen Thermal BDF dosyalarının isimlerini listeleyen kutu (Listbox).
         self.thermal_listbox = tk.Listbox(thermal_main, height=3, width=100, font=('Segoe UI', 9),
                                            bg=self.colors['surface'], fg=self.colors['text'],
                                            selectbackground=self.colors['primary'], selectforeground='white',
@@ -188,11 +327,13 @@ class IntegratedBDFRFTool:
                                            highlightbackground=self.colors['border'],
                                            highlightcolor=self.colors['primary'])
         self.thermal_listbox.pack(fill=tk.X, pady=2)
-        
-        # === MANEUVER SECTION ===
+
+        # === MANEUVER BÖLÜMÜ ===
+        # Yukarıdaki Thermal bölümüyle BİREBİR AYNI yapı, sadece "Maneuver"
+        # tipi master BDF dosyaları için (ayrı liste, ayrı listbox, ayrı butonlar).
         maneuver_main = ttk.LabelFrame(main, text="\U0001F6EB  MANEUVER", padding="8")
         maneuver_main.pack(fill=tk.X, pady=5)
-        
+
         man_master_f = ttk.Frame(maneuver_main)
         man_master_f.pack(fill=tk.X, pady=2)
         ttk.Label(man_master_f, text="MASTER BDFs:", width=12).pack(side=tk.LEFT)
@@ -200,7 +341,7 @@ class IntegratedBDFRFTool:
         ttk.Button(man_master_f, text="Clear", command=self.clear_maneuver_bdfs).pack(side=tk.LEFT, padx=2)
         self.maneuver_count = tk.StringVar(value="0 files")
         ttk.Label(man_master_f, textvariable=self.maneuver_count).pack(side=tk.LEFT, padx=5)
-        
+
         self.maneuver_listbox = tk.Listbox(maneuver_main, height=3, width=100, font=('Segoe UI', 9),
                                             bg=self.colors['surface'], fg=self.colors['text'],
                                             selectbackground=self.colors['primary'], selectforeground='white',
@@ -208,33 +349,51 @@ class IntegratedBDFRFTool:
                                             highlightbackground=self.colors['border'],
                                             highlightcolor=self.colors['primary'])
         self.maneuver_listbox.pack(fill=tk.X, pady=2)
-        
-        # === SETTINGS ===
+
+        # === AYARLAR (SETTINGS) BÖLÜMÜ ===
+        # Birleştirme işlemi için gereken Excel ayar dosyası, çıktı klasörü ve
+        # NASTRAN kart ID'leri (SET ID, NODE SET ID) ile başlangıç sıcaklığı.
+        # grid() ile satır/sütun tablosu şeklinde hizalanmış bir form oluşturuluyor.
         sf = ttk.LabelFrame(main, text="⚙  Settings", padding="10")
         sf.pack(fill=tk.X, pady=5)
+        # Satır 0: birleştirme ayarlarını içeren Excel dosyasının yolu.
         ttk.Label(sf, text="Excel:").grid(row=0, column=0, sticky=tk.W)
         ttk.Entry(sf, textvariable=self.excel_path, width=70).grid(row=0, column=1, padx=5)
         ttk.Button(sf, text="Browse", command=self.browse_excel).grid(row=0, column=2)
+        # Satır 1: birleştirilmiş BDF'lerin yazılacağı çıktı klasörü.
         ttk.Label(sf, text="Output:").grid(row=1, column=0, sticky=tk.W)
         ttk.Entry(sf, textvariable=self.output_folder, width=70).grid(row=1, column=1, padx=5)
         ttk.Button(sf, text="Browse", command=self.browse_output).grid(row=1, column=2)
+        # Satır 2: oluşturulacak NASTRAN SET kartının ID numarası.
         ttk.Label(sf, text="SET ID:").grid(row=2, column=0, sticky=tk.W)
         ttk.Entry(sf, textvariable=self.set_id, width=10).grid(row=2, column=1, sticky=tk.W, padx=5)
+        # Satır 3: oluşturulacak NASTRAN düğüm (node) SET kartının ID numarası.
         ttk.Label(sf, text="NODE SET ID:").grid(row=3, column=0, sticky=tk.W)
         ttk.Entry(sf, textvariable=self.node_set_id, width=10).grid(row=3, column=1, sticky=tk.W, padx=5)
+        # Satır 4: başlangıç sıcaklığı (TEMP(INIT) kartı için).
         ttk.Label(sf, text="TEMP(INIT):").grid(row=4, column=0, sticky=tk.W)
         ttk.Entry(sf, textvariable=self.temp_initial, width=10).grid(row=4, column=1, sticky=tk.W, padx=5)
-        
+
+        # === İŞLEM BUTONLARI ===
         bf = ttk.Frame(main)
         bf.pack(fill=tk.X, pady=10)
+        # Ana işlem butonu: tıklanınca start_processing() çağrılır (aşağıda
+        # tanımlı - arka planda thread açıp gerçek birleştirme işlemini başlatır).
         self.process_btn = ttk.Button(bf, text="▶  PROCESS & MERGE", command=self.start_processing,
                                        style='Accent.TButton')
         self.process_btn.pack(side=tk.LEFT, padx=5)
+        # Log panelini temizleyen buton.
         ttk.Button(bf, text="Clear Log", command=self.clear_log1).pack(side=tk.LEFT)
 
+        # İlerleme çubuğu: mode='indeterminate' -> belirsiz süreli işlemler için
+        # (belirli bir yüzde göstermek yerine sürekli ileri-geri hareket eden
+        # animasyonlu bir çubuk). Diğer sekmelerdeki progress bar'lardan farklı
+        # olarak burada belirli bir ilerleme yüzdesi hesaplanmıyor.
         self.progress1 = ttk.Progressbar(main, mode='indeterminate')
         self.progress1.pack(fill=tk.X, pady=5)
 
+        # === LOG PANELİ ===
+        # İşlem sırasındaki tüm log mesajlarının yazıldığı kaydırılabilir metin kutusu.
         lf = ttk.LabelFrame(main, text="\U0001F4DC  Log", padding="10")
         lf.pack(fill=tk.BOTH, expand=True)
         self.log_text1 = scrolledtext.ScrolledText(lf, height=15, font=('Consolas', 10),
@@ -242,21 +401,32 @@ class IntegratedBDFRFTool:
                                                     insertbackground=self.colors['log_fg'], relief='flat',
                                                     borderwidth=0)
         self.log_text1.pack(fill=tk.BOTH, expand=True)
-    
+
     # ============= TAB 1 HELPERS =============
+    # add_thermal_bdfs: "Add..." butonuna basılınca çağrılır. Dosya seçme
+    # penceresi açar, seçilen her BDF dosyasını (zaten listede yoksa)
+    # self.thermal_bdfs listesine ve görünen listbox'a ekler, sayaç etiketini günceller.
     def add_thermal_bdfs(self):
+        # Çoklu dosya seçimine izin veren (askopenfilenames - sonunda 's' var)
+        # standart Windows "Aç" penceresi. Sadece .bdf/.dat/.nas uzantılı
+        # dosyalar ya da "Tümü" filtresiyle her dosya seçilebilir.
         files = filedialog.askopenfilenames(filetypes=[("BDF","*.bdf *.dat *.nas"),("All","*.*")])
         for f in files:
+            # Aynı dosya iki kere eklenmesin diye kontrol.
             if f not in self.thermal_bdfs:
                 self.thermal_bdfs.append(f)
                 self.thermal_listbox.insert(tk.END, f)
+        # "X files" sayaç etiketini güncel dosya sayısına göre yeniden yaz.
         self.thermal_count.set(f"{len(self.thermal_bdfs)} files")
-    
+
+    # clear_thermal_bdfs: "Clear" butonu - Thermal listesini ve listbox'ı tamamen boşaltır.
     def clear_thermal_bdfs(self):
         self.thermal_bdfs.clear()
         self.thermal_listbox.delete(0, tk.END)
         self.thermal_count.set("0 files")
-    
+
+    # add_maneuver_bdfs: add_thermal_bdfs ile BİREBİR AYNI mantık, sadece
+    # Maneuver listesi/listbox'ı için.
     def add_maneuver_bdfs(self):
         files = filedialog.askopenfilenames(filetypes=[("BDF","*.bdf *.dat *.nas"),("All","*.*")])
         for f in files:
@@ -264,50 +434,74 @@ class IntegratedBDFRFTool:
                 self.maneuver_bdfs.append(f)
                 self.maneuver_listbox.insert(tk.END, f)
         self.maneuver_count.set(f"{len(self.maneuver_bdfs)} files")
-    
+
+    # clear_maneuver_bdfs: Maneuver listesini temizler.
     def clear_maneuver_bdfs(self):
         self.maneuver_bdfs.clear()
         self.maneuver_listbox.delete(0, tk.END)
         self.maneuver_count.set("0 files")
-    
+
+    # browse_excel: tek bir Excel dosyası seçtirip self.excel_path'e yazar.
     def browse_excel(self):
         f = filedialog.askopenfilename(filetypes=[("Excel","*.xlsx *.xls")])
         if f: self.excel_path.set(f)
-    
+
+    # browse_output: bir klasör seçtirip self.output_folder'a yazar.
     def browse_output(self):
         f = filedialog.askdirectory()
         if f: self.output_folder.set(f)
-    
+
+    # log1: Tab 1'in Log paneline bir satır mesaj ekler, otomatik en alta
+    # kaydırır (see) ve update_idletasks() ile pencerenin HEMEN (bekletmeden)
+    # yeniden çizilmesini sağlar - böylece uzun süren işlem sırasında log
+    # mesajları anlık olarak ekranda görünür.
+    # NOT: Diğer sekmelerdeki log(self, msg) metodları self.root.after(0, ...)
+    # kullanarak thread-safe çalışır; bu eski (Tab 1'e özel) log1 metodu ise
+    # doğrudan widget'a yazıyor - Tab 1'in işlemi zaten doğrudan (thread
+    # içinden) bu şekilde çağırdığı için bugüne kadar sorun çıkarmamış.
     def log1(self, msg):
         self.log_text1.insert(tk.END, msg + "\n")
         self.log_text1.see(tk.END)
         self.root.update_idletasks()
-    
+
+    # clear_log1: "Clear Log" butonu - Tab 1'in log panelini boşaltır.
     def clear_log1(self):
         self.log_text1.delete(1.0, tk.END)
-    
+
+    # format_include_nastran: NASTRAN'ın BDF formatında her satırın en fazla
+    # 72 karakter olması gerektiği kuralına uyacak şekilde, uzun bir dosya
+    # yolunu içeren INCLUDE kartını birden fazla satıra böler.
     def format_include_nastran(self, abs_path):
         """Uzun INCLUDE path'lerini Nastran formatına uygun böler."""
+        # Önce tek satıra sığıyor mu diye dene - sığıyorsa bölmeye gerek yok.
         include_line = f"INCLUDE '{abs_path}'"
         if len(include_line) <= 72:
             return [include_line]
+        # Sığmıyorsa: yolu '/' karakterinden parçalara ayırıp, 72 karakter
+        # sınırını aşmayacak şekilde parça parça yeni satırlara dağıt.
         parts = abs_path.split('/')
         lines = []
         current_line = "INCLUDE '"
         for i, part in enumerate(parts):
+            # Son parça mı (dosya adının kendisi), yoksa ara bir klasör mü?
+            # Ara klasörlerin sonuna tekrar '/' eklenir (yol bütünlüğü için).
             is_last = (i == len(parts) - 1)
             segment = part if is_last else part + '/'
             if len(current_line + segment) <= 72:
+                # Bu parça mevcut satıra sığıyorsa satıra ekle.
                 current_line += segment
             else:
+                # Sığmıyorsa mevcut satırı listeye kaydet (boş değilse) ve
+                # yeni bir satır başlat.
                 if current_line != "INCLUDE '":
                     lines.append(current_line)
                 current_line = segment
+        # Son kalan satırı da (tırnak kapatarak) listeye ekle.
         if current_line:
             current_line += "'"
             lines.append(current_line)
         return lines
-    
+
     def read_file_safe(self, fpath):
         """Dosyayı güvenli şekilde oku."""
         for enc in ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']:

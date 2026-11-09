@@ -5836,6 +5836,9 @@ class FullRunTab:
         self.log(f"  WARNING: gave up waiting for '{exe_name}' after {waited}s - proceeding anyway.")
 
     # ==================== RUN (FULL PIPELINE) ====================
+    # start_run: 3 aşamanın (Understanding Structure Type, Post Processing,
+    # Joint Run) TÜM girdilerini önceden doğrular, sonra gerçek zincirlemeyi
+    # (_run_pipeline) arka plan thread'inde başlatır.
     def start_run(self):
         if not self.bdf_paths:
             messagebox.showerror("Error", "Add at least one All BDF File")
@@ -5923,6 +5926,9 @@ class FullRunTab:
             self.log("STAGE 1/3: SOLVING BASE MODEL")
             self.log("#" * 70)
 
+            # Bu sekmenin kendi girdi alanlarını DOĞRUDAN BarPropertySolverTab
+            # (tab3_tool) nesnesinin gerçek state'ine yaz - sanki kullanıcı o
+            # sekmeye geçip aynı değerleri kendisi girmiş gibi.
             t3 = self.tab3_tool
             t3.bdf_paths = list(self.bdf_paths)
             t3.maneuver_bdfs = list(self.maneuver_bdfs)
@@ -5944,10 +5950,15 @@ class FullRunTab:
             if self.element_excel_path.get().strip():
                 t3.load_element_ids()
 
+            # Solve'den ÖNCEKİ BaseModel_* klasörlerini kaydet - solve'den
+            # SONRA aradaki farka (set farkı) bakarak YENİ oluşan klasörü bul.
             output_base = self.isu_output_folder.get().strip()
             before_folders = self._list_base_model_folders(output_base)
 
             self.root.after(0, lambda: self.progress_var.set(5))
+            # t3'ün kendi RUN butonunun arka planda çağırdığı AYNI metod -
+            # burada senkron (bloklayarak) çağrılıyor, çünkü zaten biz kendi
+            # arka plan thread'imizdeyiz.
             t3._run_solve()
             self.root.after(0, lambda: self.progress_var.set(33))
 
@@ -5956,6 +5967,8 @@ class FullRunTab:
             if len(new_folders) == 1:
                 run_folder = os.path.join(output_base, new_folders.pop())
             elif new_folders:
+                # Birden fazla yeni klasör varsa (beklenmez ama olası), en
+                # son değiştirilmiş olanı (en güncel) seç.
                 candidates = [os.path.join(output_base, n) for n in new_folders]
                 run_folder = max(candidates, key=os.path.getmtime)
             else:
@@ -5984,6 +5997,8 @@ class FullRunTab:
             self.log("STAGE 2/3: POST PROCESSING")
             self.log("#" * 70)
 
+            # Bu Full Run'a özel 3 alt klasör: OP2'lerin toplanacağı yer,
+            # H5 dönüşüm sonuçları, ve Load Extraction grup klasörleri.
             op2_results_dir = os.path.join(base_model_folder, "OP2_Results")
             h5_results_dir = os.path.join(base_model_folder, "H5_Results")
             le_results_dir = os.path.join(base_model_folder, "Load_Extraction_Results")
@@ -5991,9 +6006,16 @@ class FullRunTab:
             os.makedirs(h5_results_dir, exist_ok=True)
             os.makedirs(le_results_dir, exist_ok=True)
 
+            # Solve'ün her alt klasöre (run1/run2/... veya bdf_N_.../) dağıtık
+            # şekilde yazdığı .op2'leri TEK bir klasörde topla - Post
+            # Processing'in OP2 Folder taraması zaten rekürsif olduğundan bu
+            # adım zorunlu değil ama sonuçların tek yerde olmasını sağlıyor.
             n_moved = self._move_op2_files(base_model_folder, op2_results_dir)
             self.log(f"  Moved {n_moved} .op2 file(s) into {op2_results_dir}")
 
+            # Post Processing'in "BDF (Maneuver)"/"BDF (Thermal)" alanlarını
+            # otomatik doldurmak için, solve'ün ürettiği structure-only
+            # BDF'lerden adında "maneuver"/"thermal" geçenleri bul.
             maneuver_stru = self._find_stru_bdf(base_model_folder, "maneuver")
             thermal_stru = self._find_stru_bdf(base_model_folder, "thermal")
             if not maneuver_stru:
@@ -6006,6 +6028,10 @@ class FullRunTab:
             self.log(f"  BDF (Maneuver) -> {maneuver_stru}")
             self.log(f"  BDF (Thermal) -> {thermal_stru}")
 
+            # PostProcessingTab (tab4_tool) nesnesinin alanlarını, bu
+            # aşamada hesapladığımız otomatik yollarla (op2_results_dir,
+            # h5_results_dir, maneuver_stru/thermal_stru, le_results_dir)
+            # ve kullanıcının bu sekmeye girdiği değerlerle doldur.
             t4 = self.tab4_tool
             t4.op2_folder.set(op2_results_dir)
             t4.converter_exe_path.set(self.converter_exe_path.get())
@@ -6034,6 +6060,10 @@ class FullRunTab:
                 return
             self.log(f"  {len(group_folders_found)} LoadExtraction_NN group folder(s) found")
 
+            # t4._run_pipeline() döndüğünde loadext.bat'ların hepsi SADECE
+            # BAŞLATILMIŞTIR (fire-and-forget) - gerçekten bitmelerini
+            # tasklist ile bekle, çünkü Joint Run'ın H5 taraması onların
+            # Joint_Loads_*.h5 çıktısına bağımlı.
             self._wait_for_exe_to_finish(os.path.basename(self.le_exe_path.get().strip()))
             self.root.after(0, lambda: self.progress_var.set(70))
 
@@ -6045,6 +6075,9 @@ class FullRunTab:
             joint_run_dir = os.path.join(base_model_folder, "Joint_Run")
             os.makedirs(joint_run_dir, exist_ok=True)
 
+            # JointRunTab (tab5_tool) nesnesinin alanlarını doldur - H5
+            # Folder = Post Processing'in ÜRETTİĞİ le_results_dir (JointRunTab
+            # kendi H5 taraması rekürsif olduğundan ayrıca kopyalamaya gerek yok).
             t5 = self.tab5_tool
             t5.h5_folder.set(le_results_dir)
             t5.main_input_excel_path.set(self.jr_main_input_excel_path.get())
@@ -6076,6 +6109,10 @@ class FullRunTab:
             self.is_running = False
             self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
 
+    # _refresh_tab3_listboxes: t3.bdf_paths/maneuver_bdfs listelerine
+    # yukarıda doğrudan yazdığımız için, o sekmenin GUI listbox'ları
+    # otomatik güncellenmez - kullanıcı o sekmeye geçip baktığında doğru
+    # listeyi görsün diye burada manuel senkronize ediliyor.
     def _refresh_tab3_listboxes(self):
         t3 = self.tab3_tool
         t3.bdf_listbox.delete(0, tk.END)
@@ -6086,6 +6123,9 @@ class FullRunTab:
             t3.maneuver_listbox.insert(tk.END, os.path.basename(p))
 
 
+# ============================================================================
+# IterativeFullRunTab  --  "Iterative Full Run" sekmesi (Tab 7)
+# ============================================================================
 class IterativeFullRunTab:
     """Same chaining as Full Run (Understanding Structure Type -> Post
     Processing -> Joint Run, driving the three existing tab objects

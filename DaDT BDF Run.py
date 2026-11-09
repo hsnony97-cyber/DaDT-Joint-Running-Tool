@@ -3139,6 +3139,8 @@ class BarPropertySolverTab:
         entry unless splitting produced more."""
         n_bdfs = len(self.bdf_models) if self.bdf_models else 1
 
+        # Bu iterasyonun kalınlıklarına göre offsets.csv'yi YENİDEN hesapla
+        # (maneuver BDF'inin geometrisi her iterasyonda değişebileceği için).
         offset_csv = self._calculate_offset_csv(thickness_overrides, iter_folder, label=label)
 
         try:
@@ -3147,6 +3149,10 @@ class BarPropertySolverTab:
             cases_per_split = 0
 
         per_bdf = []
+        # Her yüklü BDF modeli için: önce kalınlık override'larını uygula,
+        # sonra (varsa) hesaplanan offsetleri uygula, sonra referans amaçlı
+        # "structure-only" (INCLUDE'suz) bir kopya yaz, son olarak
+        # Cases per Split ayarına göre run1/run2/... dosyalarına böl.
         for bdf_idx, bdf_info in enumerate(self.bdf_models):
             bdf_name = bdf_info['name']
             bdf_subfolder = os.path.join(iter_folder, f"bdf_{bdf_idx + 1}_{os.path.splitext(bdf_name)[0]}") if n_bdfs > 1 else iter_folder
@@ -3183,21 +3189,29 @@ class BarPropertySolverTab:
             self.log(f"    {label}Split error reading {os.path.basename(bdf_path)}: {e}")
             return [bdf_path]
 
+        # Dosyadaki her "SUBCASE" satırının index'ini bul - bölme sadece
+        # gerçekten cases_per_split'ten FAZLA SUBCASE varsa yapılır.
         subcase_idxs = [i for i, l in enumerate(lines) if l.strip().upper().startswith('SUBCASE')]
         if len(subcase_idxs) <= cases_per_split:
             return [bdf_path]
 
         bulk_idx = next((i for i, l in enumerate(lines) if l.strip().upper().startswith('BEGIN BULK')), len(lines))
 
+        # header_lines: ilk SUBCASE'den önceki her şey (SOL/CEND/TITLE/SET/
+        # çıktı istek kartları) - her run dosyasında DEĞİŞMEDEN tekrarlanır.
+        # bulk_lines: BEGIN BULK'tan sonraki her şey - o da değişmeden tekrarlanır.
         header_lines = lines[:subcase_idxs[0]]
         bulk_lines = lines[bulk_idx:]
         block_bounds = subcase_idxs + [bulk_idx]
 
         base, ext = os.path.splitext(bdf_path)
         n_subcases = len(subcase_idxs)
-        n_runs = (n_subcases + cases_per_split - 1) // cases_per_split
+        n_runs = (n_subcases + cases_per_split - 1) // cases_per_split  # yukarı yuvarlama (ceiling division)
         run_paths = []
 
+        # Her run dosyası: aynı header + o run'a ait SUBCASE blokları + aynı
+        # bulk data (ve INCLUDE'lar) - sadece hangi SUBCASE'lerin dahil
+        # olduğu run'dan run'a değişir.
         for run_idx in range(n_runs):
             start_sc = run_idx * cases_per_split
             end_sc = min(start_sc + cases_per_split, n_subcases)
@@ -3226,6 +3240,9 @@ class BarPropertySolverTab:
             with open(bdf_path, 'r', encoding='latin-1') as f:
                 lines = f.readlines()
 
+            # "INCLUDE" ile başlayan tüm satırları at - geriye sadece
+            # dosyanın kendi içindeki yapısal kartlar kalır (harici dosyalara
+            # bağımlılık olmadan tek bakışta okunabilir referans çıktısı).
             new_lines = [l for l in lines if not l.strip().upper().startswith('INCLUDE')]
             removed = len(lines) - len(new_lines)
 
@@ -3269,6 +3286,11 @@ class BarPropertySolverTab:
         try:
             env = None
             if scratch_base:
+                # Scratch Folder verilmişse: o klasörün altında bu run'a özel,
+                # benzersiz bir alt klasör oluştur ve TEMP/TMP ortam
+                # değişkenlerini SADECE bu alt process için bu klasöre yönlendir
+                # (os.environ.copy() ile - gerçek ortam değişkenleri/diğer
+                # süreçler etkilenmez).
                 os.makedirs(scratch_base, exist_ok=True)
                 run_scratch_dir = tempfile.mkdtemp(prefix="nastran_scr_", dir=scratch_base)
                 made_temp_scratch = True
@@ -3279,6 +3301,8 @@ class BarPropertySolverTab:
 
             cwd_dir = run_scratch_dir or folder
 
+            # Nastran komut satırı: out= sonuç çıktı klasörü, scratch=yes
+            # geçici dosyalar kullanılsın, batch=no etkileşimsiz/arka plan modu.
             cmd = [nastran, bdf_path, f"out={folder}", "scratch=yes", "batch=no"]
             mem = self.nastran_memory.get().strip()
             if mem:
@@ -3291,6 +3315,9 @@ class BarPropertySolverTab:
                     self.log(f"    {label}stderr: {result.stderr.strip()[:500]}")
 
             if made_temp_scratch:
+                # Nastran gerçekten bu özel scratch klasörünü mü kullandı,
+                # yoksa kendi varsayılan konumuna mı yazdı - klasörün boş
+                # olup olmamasına bakarak kullanıcıyı uyar.
                 scratch_files = os.listdir(run_scratch_dir)
                 if scratch_files:
                     self.log(f"    {label}Scratch folder in use: {len(scratch_files)} file(s) in {run_scratch_dir}")
@@ -3323,6 +3350,10 @@ class BarPropertySolverTab:
         output files exist yet in the watched folder(s), and their size."""
         parts = []
         seen = set()
+        # Her izlenen klasörde (çıktı klasörü + varsa scratch klasörü) olası
+        # Nastran çıktı uzantılarını (.f04/.f06/.log/.op2) kontrol et ve
+        # var olanların boyutunu raporla - bu sadece teşhis/log amaçlı,
+        # gerçek "bitti mi?" kararı _wait_for_op2 içinde verilir.
         for d in dirs:
             if not d or d in seen or not os.path.isdir(d):
                 continue

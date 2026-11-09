@@ -2790,6 +2790,9 @@ class BarPropertySolverTab:
         t_build_start = time.time()
         t_props_start = time.time()
 
+        # Maneuver (offset kaynağı) BDF'ine de Excel Bar/Skin değerlerini uygula.
+        # Listede birden fazla maneuver BDF olsa da sadece İLKİ (maneuver_bdfs[0])
+        # offset kaynağı olarak kullanılır.
         self.maneuver_base_path = None
         if self.maneuver_bdfs:
             man_folder = os.path.join(base_folder, "maneuver")
@@ -2799,6 +2802,9 @@ class BarPropertySolverTab:
         else:
             self.log("  No maneuver BDF provided - no offsets will be computed.")
 
+        # "All BDF Files" listesindeki HER BDF için kendi alt klasörüne
+        # Excel özelliklerini uygulanmış bir kopya yaz; sonucu bdf_info
+        # sözlüğüne 'base_path' olarak geri kaydet (sonraki adımlar bunu kullanacak).
         for bdf_idx, bdf_info in enumerate(self.bdf_models):
             bdf_folder = os.path.join(base_folder, f"bdf_{bdf_idx + 1}_{os.path.splitext(bdf_info['name'])[0]}")
             os.makedirs(bdf_folder, exist_ok=True)
@@ -2808,9 +2814,10 @@ class BarPropertySolverTab:
 
         self.log(f"  Properties applied in {time.time() - t_props_start:.1f}s")
 
-        # Run Nastran on the base model. thickness_overrides={} means every
-        # PID uses its self.bar_properties base value - offsets get computed
-        # fresh from the maneuver BDF at that same base thickness.
+        # Base model üzerinde Nastran'ı çalıştır. thickness_overrides={} demek,
+        # her PID'in self.bar_properties'teki temel (Excel) değerini kullanacağı
+        # anlamına gelir - offsetler bu aynı temel kalınlıktaki maneuver BDF'inden
+        # yeniden hesaplanır.
         self.log("\n  Running Nastran on the BASE MODEL...")
         t_nastran_start = time.time()
         n_ok, n_total = self._run_single_iteration(base_folder, {}, label="[BASE] ")
@@ -2845,11 +2852,16 @@ class BarPropertySolverTab:
         t_offset_start = time.time()
         man_folder = os.path.join(folder, "maneuver_for_offset")
         os.makedirs(man_folder, exist_ok=True)
+        # Bu iterasyonun thickness_overrides'ını maneuver BDF'ine uygulayarak,
+        # offset hesabının HER ZAMAN o anki (iterasyona özgü) geometriyi
+        # kullanmasını sağla - geometri (dolayısıyla offsetler) kalınlıkla değişir.
         maneuver_path = self._write_bdf_for_model(man_folder, None, self.maneuver_base_path, thickness_overrides)
 
         try:
             t_parse_start = time.time()
             bdf = BDF(debug=False)
+            # xref=True burada GEREKLİ - aşağıda node.get_position() ve
+            # elem.node_ids üzerinden gerçek 3B koordinatlar okunacak.
             bdf.read_bdf(maneuver_path, validate=False, xref=True, read_includes=False, encoding='latin-1')
             self.log(f"    {label}Maneuver BDF parsed for offsets in {time.time() - t_parse_start:.1f}s")
         except Exception as e:
@@ -2857,7 +2869,11 @@ class BarPropertySolverTab:
             return None
 
         try:
-            # Landing (shell) offsets: zoffset = -t/2
+            # ---- Landing (shell) offsetleri: zoffset = -t/2 ----
+            # "Landing" (göçme) elemanı, kalınlığının yarısı kadar kendi yüzey
+            # normali yönünün TERSİNE (-normal) kaydırılır - bu klasik bir
+            # "shell offset to the surface" yaklaşımıdır (shell orta düzlemi
+            # yerine gerçek yüzeyde modellensin diye).
             landing_normals = {}
             rows = []
 
@@ -2869,10 +2885,13 @@ class BarPropertySolverTab:
                 if pid is None:
                     continue
 
+                # Bu PID'in etkin skin kalınlığını al (Excel öncelikli, yoksa BDF); yoksa 3.0 varsayılan.
                 t = self.current_skin_thicknesses.get(pid, 3.0)
                 t = max(0.1, t)
                 zoffset = -t / 2.0
 
+                # Üçgen/quad'ın ilk 3 düğümünden iki kenar vektörü oluşturup
+                # çapraz çarpımla (cross product) birim yüzey normalini hesapla.
                 normal = None
                 if elem.type in ['CQUAD4', 'CTRIA3']:
                     try:
@@ -2886,18 +2905,24 @@ class BarPropertySolverTab:
                                 normal = nvec / nl
                     except Exception:
                         pass
-                landing_normals[eid] = normal
+                landing_normals[eid] = normal  # bar offsetleri için sonra tekrar kullanılacak
                 rows.append({'Type': 'Landing', 'Element': eid, 'ZOffset': zoffset,
                              'WA_X': '', 'WA_Y': '', 'WA_Z': ''})
 
-            # Node -> shell mapping for bar offset
+            # Her düğümün hangi shell (CQUAD4/CTRIA3) elemanlarına ait olduğunun
+            # haritasını çıkar - bir bar elemanının "hangi landing shell'in
+            # üzerinde oturduğunu" bulmak için kullanılacak.
             node_to_shells = {}
             for eid, elem in bdf.elements.items():
                 if elem.type in ['CQUAD4', 'CTRIA3']:
                     for nid in elem.node_ids:
                         node_to_shells.setdefault(nid, []).append(eid)
 
-            # Bar offsets: WA = WB = -normal * (landing_t + bar_t/2)
+            # ---- Bar offsetleri: WA = WB = -normal * (landing_t + bar_t/2) ----
+            # Bir bar elemanı, iki ucunun oturduğu landing shell'in üstünde
+            # duruyor kabul edilir; bu yüzden offset vektörü, o shell'in
+            # normali yönünün tersine, (shell kalınlığı + bar kalınlığının
+            # yarısı) kadar kaydırılır.
             bar_min = self.default_bar_thickness
             for eid in self.bar_offset_elem_ids:
                 if eid not in bdf.elements:
@@ -2909,14 +2934,21 @@ class BarPropertySolverTab:
                 if pid is None:
                     continue
 
+                # Bu iterasyonda uygulanan override varsa onu, yoksa Excel
+                # temel değerini, o da yoksa varsayılan bar kalınlığını kullan.
                 bar_t = thickness_overrides.get(pid, self.bar_properties.get(pid, {}).get('dim1', bar_min))
                 bar_t = max(0.1, bar_t)
 
+                # Bar'ın iki ucunun (node_ids[:2]) ortak oturduğu shell
+                # eleman(lar)ını bul (iki düğümün de ait olduğu shell kümelerinin kesişimi).
                 bar_nodes = elem.node_ids[:2]
                 if bar_nodes[0] in node_to_shells and bar_nodes[1] in node_to_shells:
                     common = set(node_to_shells[bar_nodes[0]]) & set(node_to_shells[bar_nodes[1]])
                     max_t = 0
                     best_normal = None
+                    # Ortak shell'ler arasından EN KALIN olanı seç (en kalın
+                    # landing kalınlığı, bar'ın gerçekte hangi yüzeyde
+                    # oturduğunu en iyi temsil eden varsayım).
                     for shell_eid in common:
                         if shell_eid in landing_normals:
                             shell_elem = bdf.elements[shell_eid]
@@ -2936,6 +2968,7 @@ class BarPropertySolverTab:
             if not rows:
                 return None
 
+            # Hesaplanan tüm offsetleri (landing + bar) offsets.csv'ye yaz.
             n_landing = sum(1 for r in rows if r['Type'] == 'Landing')
             n_bar = sum(1 for r in rows if r['Type'] == 'Bar')
             csv_path = os.path.join(folder, 'offsets.csv')
@@ -2957,6 +2990,8 @@ class BarPropertySolverTab:
         <name>_offseted.bdf in `folder`."""
         landing_offsets = {}
         bar_offsets = {}
+        # offsets.csv'yi geri oku: Landing satırları {eid: zoffset}, Bar
+        # satırları {eid: (WA_X, WA_Y, WA_Z)} sözlüklerine dönüştürülür.
         try:
             with open(csv_path, 'r', newline='') as f:
                 for row in csv.DictReader(f):
@@ -2973,6 +3008,9 @@ class BarPropertySolverTab:
             with open(bdf_path, 'r', encoding='latin-1') as f:
                 lines = f.readlines()
 
+            # fmt: bir sayıyı Nastran'ın 8 karakterlik sabit alan genişliğine
+            # sığdır - normal ondalık gösterim (.4f) 8 karaktere sığmazsa
+            # (çok büyük/küçük sayı), bilimsel gösterime (.2E) düş.
             def fmt(v, w=8):
                 s = f"{v:.4f}"
                 return s[:w].ljust(w) if len(s) <= w else f"{v:.2E}"[:w].ljust(w)
@@ -2985,6 +3023,9 @@ class BarPropertySolverTab:
             while i < len(lines):
                 line = lines[i]
 
+                # CQUAD4 kartında ZOFFSET alanı 65-72. karakterler (0-index [64:72])
+                # - satırı önce 72 karaktere kadar boşlukla doldur, sonra o
+                # alana yeni zoffset değerini yaz.
                 if line.startswith('CQUAD4'):
                     try:
                         eid = int(line[8:16].strip())
@@ -2997,6 +3038,9 @@ class BarPropertySolverTab:
                     except:
                         pass
 
+                # CTRIA3'te ZOFFSET alanı CQUAD4'e göre bir alan daha erken
+                # başlar (49-56. karakter, [48:56]) çünkü CTRIA3'ün 4. düğüm
+                # alanı (G4) yoktur.
                 elif line.startswith('CTRIA3'):
                     try:
                         eid = int(line[8:16].strip())
@@ -3009,12 +3053,18 @@ class BarPropertySolverTab:
                     except:
                         pass
 
+                # CBAR'da WA (uç A ofseti) ve WB (uç B ofseti) devam satırında
+                # yer alır - bu tool WA=WB=offset_vec uyguluyor (bar'ın her iki
+                # ucu da aynı miktarda kaydırılıyor).
                 elif line.startswith('CBAR'):
                     try:
                         eid = int(line[8:16].strip())
                         if eid in bar_offsets:
                             offset_vec = bar_offsets[eid]
 
+                            # Kartın zaten bir devam satırı varsa (PA/PB
+                            # alanlarını [:24] olarak koruyup) WA/WB alanlarını
+                            # (24'ten sonraki 6x8 karakter) üzerine yaz.
                             if i + 1 < len(lines) and (
                                 lines[i + 1].startswith('+') or lines[i + 1].startswith('*') or
                                 (lines[i + 1][0] == ' ' and lines[i + 1].strip())
@@ -3037,6 +3087,11 @@ class BarPropertySolverTab:
                                 i += 2
                                 continue
                             else:
+                                # Devam satırı yoksa SIFIRDAN bir devam satırı
+                                # üret: benzersiz bir süreklilik etiketi
+                                # ("+CB" + eleman ID'sinin son 4 hanesi) ile
+                                # ana satıra ekle, PA/PB alanlarını boş
+                                # (varsayılan pin bağlantısı) bırakıp WA/WB'yi doldur.
                                 cont_name = '+CB' + str(eid)[-4:]
                                 new_lines.append(line.rstrip() + cont_name + '\n')
 

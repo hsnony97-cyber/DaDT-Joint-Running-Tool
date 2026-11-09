@@ -2092,8 +2092,15 @@ class BarPropertySolverTab:
 
         # ---- Girdi yolları (Input paths) ----
         self.bdf_paths = []                    # "All BDF Files" listbox'ındaki tüm BDF dosya yolları
-        self.property_excel_path = tk.StringVar()   # Bar/Skin Property Excel dosya yolu
-        self.element_excel_path = tk.StringVar()    # Offset Element IDs Excel dosya yolu
+        # Master Input Excel: Bar/Skin Property VE Offset Element ID
+        # sayfalarının ikisini de içeren TEK Excel dosyası. Arayüzde artık
+        # tek bir "Master Input Excel" alanı olarak gösterildiği için
+        # element_excel_path, property_excel_path ile AYNI StringVar
+        # nesnesini paylaşır (ikisi de aynı dosya yolunu gösterir) -
+        # load_properties()/load_element_ids() metodlarının kendisi hiç
+        # değişmedi, sadece ikisi de artık aynı dosyayı okuyor.
+        self.property_excel_path = tk.StringVar()   # Master Input Excel dosya yolu
+        self.element_excel_path = self.property_excel_path    # aynı Master Input Excel
         self.nastran_path = tk.StringVar()     # Nastran çalıştırılabilir dosyasının (.exe) yolu
         self.nastran_memory = tk.StringVar(value="")  # opsiyonel bellek sınırı (örn. "4gb") - boşsa Nastran varsayılanı kullanılır
         self.scratch_folder = tk.StringVar(value="")  # optional; blank = each run's own output folder (still collision-free)
@@ -2207,14 +2214,13 @@ class BarPropertySolverTab:
         ttk.Button(man_btn_frame, text="Remove", command=self._remove_maneuver_bdf).pack(fill=tk.X, pady=1)
 
 
-        # Property Excel satırı (yol kutusu + Browse + Load butonu, bkz. _add_file_row).
-        # "Load" butonu load_properties()'i tetikler.
-        self._add_file_row(f1, "Property Excel:", self.property_excel_path, self.load_properties)
+        # Master Input Excel satırı (yol kutusu + Browse + Load butonu, bkz.
+        # _add_file_row). Bar/Skin Property ve Offset Element ID sayfalarının
+        # İKİSİ de bu TEK Excel'de bulunur; "Load" butonu her ikisini de
+        # yükler (bkz. _load_master_input).
+        self._add_file_row(f1, "Master Input Excel:", self.property_excel_path, self._load_master_input)
         self.prop_status = ttk.Label(f1, text="Not loaded", foreground="gray")
         self.prop_status.pack(anchor=tk.W)
-
-        # Offset Element IDs satırı - "Load" butonu load_element_ids()'i tetikler.
-        self._add_file_row(f1, "Offset Element IDs:", self.element_excel_path, self.load_element_ids)
         self.elem_status = ttk.Label(f1, text="Not loaded", foreground="gray")
         self.elem_status.pack(anchor=tk.W)
 
@@ -2506,6 +2512,15 @@ class BarPropertySolverTab:
             import traceback
             self.log(traceback.format_exc())
             self.root.after(0, lambda: self.bdf_status.config(text="Error", foreground="red"))
+
+    # _load_master_input: Master Input Excel satırının tek "Load" butonuna
+    # bağlı arayüz fonksiyonu - property_excel_path ve element_excel_path
+    # zaten AYNI StringVar olduğu için, burada sadece load_properties() ve
+    # load_element_ids()'i SIRAYLA çağırmak yeterli; o iki metodun kendi
+    # içeriği hiç değişmedi.
+    def _load_master_input(self):
+        self.load_properties()
+        self.load_element_ids()
 
     # ==================== PROPERTY LOADING ====================
     def load_properties(self):
@@ -3769,7 +3784,7 @@ class PostProcessingTab:
         # Settings Excel ('Load_Extraction' sayfasını okur)
         le_xl_frame = ttk.Frame(f2)
         le_xl_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(le_xl_frame, text="Input Excel:", width=18).pack(side=tk.LEFT)
+        ttk.Label(le_xl_frame, text="Master Input Excel:", width=18).pack(side=tk.LEFT)
         ttk.Entry(le_xl_frame, textvariable=self.le_input_excel_path, width=45).pack(side=tk.LEFT, padx=5)
         ttk.Button(le_xl_frame, text="Browse", command=lambda: self.le_input_excel_path.set(
             filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
@@ -4515,10 +4530,10 @@ class JointRunTab:
                             "a preview, RUN always re-scans)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
 
-        # Main Input Excel
+        # Master Input Excel
         main_xl_frame = ttk.Frame(f1)
         main_xl_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(main_xl_frame, text="Main Input Excel:", width=20).pack(side=tk.LEFT)
+        ttk.Label(main_xl_frame, text="Master Input Excel:", width=20).pack(side=tk.LEFT)
         ttk.Entry(main_xl_frame, textvariable=self.main_input_excel_path, width=45).pack(side=tk.LEFT, padx=5)
         ttk.Button(main_xl_frame, text="Browse", command=lambda: self.main_input_excel_path.set(
             filedialog.askopenfilename(filetypes=[("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
@@ -5477,11 +5492,21 @@ class FullRunTab:
         self.tab4_tool = tab4_tool
         self.tab5_tool = tab5_tool
 
+        # Master Input Excel: Bar/Skin Property, Offset Element ID,
+        # Load_Extraction ve DTCG_Input_Excel_Data sayfalarının HEPSİNİ
+        # içeren TEK Excel dosyası (Iterative Full Run sekmesiyle aynı
+        # mantık). Arayüzde tek bir "Master Input Excel" alanı gösterildiği
+        # için, aşağıdaki 4 StringVar (property_excel_path, element_excel_path,
+        # le_input_excel_path, jr_main_input_excel_path) hepsi AYNI StringVar
+        # nesnesini paylaşır - _run_pipeline'daki t3/t4/t5'e aktarma kodu
+        # hiç değişmedi, sadece hepsi artık aynı dosyayı okuyor.
+        self.master_input_excel_path = tk.StringVar()
+
         # ---- Section 1: Understanding Structure Type ----
         self.bdf_paths = []
         self.maneuver_bdfs = []
-        self.property_excel_path = tk.StringVar()
-        self.element_excel_path = tk.StringVar()
+        self.property_excel_path = self.master_input_excel_path
+        self.element_excel_path = self.master_input_excel_path
         self.nastran_path = tk.StringVar()
         self.nastran_memory = tk.StringVar()
         self.scratch_folder = tk.StringVar()
@@ -5491,7 +5516,7 @@ class FullRunTab:
 
         # ---- Section 2: Post Processing ----
         self.converter_exe_path = tk.StringVar()
-        self.le_input_excel_path = tk.StringVar()
+        self.le_input_excel_path = self.master_input_excel_path
         self.le_example_folder = tk.StringVar()
         self.le_pickle_path = tk.StringVar()
         self.le_split_count = tk.StringVar(value="10")
@@ -5499,7 +5524,7 @@ class FullRunTab:
         self.le_max_memory = tk.StringVar(value="50")
 
         # ---- Section 3: Joint Run ----
-        self.jr_main_input_excel_path = tk.StringVar()
+        self.jr_main_input_excel_path = self.master_input_excel_path
         self.jr_example_joint_excel_path = tk.StringVar()
         self.jr_util_folder = tk.StringVar()
         self.jr_license_checker_exe_path = tk.StringVar()
@@ -5585,10 +5610,11 @@ class FullRunTab:
                             "for Post Processing's Thermal BDF to be auto-found)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
 
-        self._add_file_row(f1, "Property Excel:", self.property_excel_path,
-                            [("Excel", "*.xlsx *.xls"), ("All", "*.*")])
-        self._add_file_row(f1, "Offset Element IDs:", self.element_excel_path,
-                            [("Excel", "*.xlsx *.xls"), ("All", "*.*")])
+        self._add_file_row(f1, "Master Input Excel:", self.master_input_excel_path,
+                            [("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
+        ttk.Label(f1, text="(one excel with every sheet needed: Bar Property, Skin Property, "
+                            "Landing_Offset, Bar_Offset, Load_Extraction, DTCG_Input_Excel_Data)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
         self._add_file_row(f1, "Nastran Exe:", self.nastran_path,
                             [("Executable", "*.exe"), ("All", "*.*")])
 
@@ -5624,10 +5650,6 @@ class FullRunTab:
 
         self._add_file_row(f2, "Converter Exe:", self.converter_exe_path,
                             [("Executable", "*.exe"), ("All", "*.*")])
-        self._add_file_row(f2, "Input Excel:", self.le_input_excel_path,
-                            [("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
-        ttk.Label(f2, text="(the settings excel with the 'Load_Extraction' sheet)",
-                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
         self._add_folder_row(f2, "Example LE Folder:", self.le_example_folder)
         self._add_file_row(f2, "Pickle File:", self.le_pickle_path,
                             [("Pickle", "*.pickle *.pkl"), ("All", "*.*")])
@@ -5646,16 +5668,14 @@ class FullRunTab:
         ttk.Label(mem2_frame, text="Max Memory (GB):", width=18).pack(side=tk.LEFT)
         ttk.Entry(mem2_frame, textvariable=self.le_max_memory, width=10).pack(side=tk.LEFT, padx=5)
 
-        ttk.Label(f2, text="(OP2 Folder, Output Folder H5, BDF Maneuver/Thermal and the LE split "
-                            "Output Folder are all auto-wired from stage 1's results)",
+        ttk.Label(f2, text="(Input Excel, OP2 Folder, Output Folder H5, BDF Maneuver/Thermal and "
+                            "the LE split Output Folder are all auto-wired from stage 1's results)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(4, 2))
 
         # ---- Section 3: Joint Run ----
         f3 = ttk.LabelFrame(main, text="\U0001F517  3. Joint Run", padding=10)
         f3.pack(fill=tk.X, pady=5, padx=10)
 
-        self._add_file_row(f3, "Main Input Excel:", self.jr_main_input_excel_path,
-                            [("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
         self._add_file_row(f3, "Example Joint Input Excel:", self.jr_example_joint_excel_path,
                             [("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
         self._add_folder_row(f3, "Util Folder:", self.jr_util_folder)
@@ -5678,8 +5698,8 @@ class FullRunTab:
         ttk.Label(scale_frame, text="LSC Scale Factor:", width=18).pack(side=tk.LEFT)
         ttk.Entry(scale_frame, textvariable=self.jr_scale_factor, width=10).pack(side=tk.LEFT, padx=5)
 
-        ttk.Label(f3, text="(Joint Load H5 Folder and Output Folder are auto-wired from stage 2's "
-                            "Load Extraction Results)",
+        ttk.Label(f3, text="(Main Input Excel, Joint Load H5 Folder and Output Folder are all "
+                            "auto-wired from stage 1/2's results)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(4, 2))
 
         # ---- Section 4: Actions (RUN sits at the very bottom) ----
@@ -5874,8 +5894,8 @@ class FullRunTab:
         if not self.bdf_paths:
             messagebox.showerror("Error", "Add at least one All BDF File")
             return
-        if not self.property_excel_path.get().strip() or not os.path.exists(self.property_excel_path.get().strip()):
-            messagebox.showerror("Error", "Select a valid Property Excel")
+        if not self.master_input_excel_path.get().strip() or not os.path.exists(self.master_input_excel_path.get().strip()):
+            messagebox.showerror("Error", "Select a valid Master Input Excel")
             return
         if not self.nastran_path.get().strip() or not os.path.exists(self.nastran_path.get().strip()):
             messagebox.showerror("Error", "Select a valid Nastran Exe")
@@ -5886,17 +5906,11 @@ class FullRunTab:
         if not self.converter_exe_path.get().strip() or not os.path.exists(self.converter_exe_path.get().strip()):
             messagebox.showerror("Error", "Select a valid Converter Exe")
             return
-        if not self.le_input_excel_path.get().strip() or not os.path.exists(self.le_input_excel_path.get().strip()):
-            messagebox.showerror("Error", "Select a valid Post Processing Input Excel")
-            return
         if not self.le_example_folder.get().strip() or not os.path.isdir(self.le_example_folder.get().strip()):
             messagebox.showerror("Error", "Select a valid Example LE Folder")
             return
         if not self.le_exe_path.get().strip() or not os.path.exists(self.le_exe_path.get().strip()):
             messagebox.showerror("Error", "Select a valid Load Extraction Exe")
-            return
-        if not self.jr_main_input_excel_path.get().strip() or not os.path.exists(self.jr_main_input_excel_path.get().strip()):
-            messagebox.showerror("Error", "Select a valid Joint Run Main Input Excel")
             return
         if not self.jr_example_joint_excel_path.get().strip() or not os.path.exists(self.jr_example_joint_excel_path.get().strip()):
             messagebox.showerror("Error", "Select a valid Example Joint Input Excel")

@@ -6524,6 +6524,11 @@ class IterativeFullRunTab:
                     matches.append(os.path.join(dirpath, fn))
         return matches[0] if matches else None
 
+    # _find_all_stru_bdfs: _find_stru_bdf'in "keyword" ile tek dosya arayan
+    # halinden farklı olarak, base_model klasörü altındaki TÜM "..._stru.bdf"
+    # dosyalarını (maneuver VE thermal, hepsi) döndürür - PBARL dim1
+    # değerlerini DTCG_Input_Excel_Data'ya geri yazarken HER BDF'teki
+    # değerler taranmalı (hangi BDF'te olduğu önemli değil, PID aynı PID'dir).
     @staticmethod
     def _find_all_stru_bdfs(base_model_folder):
         matches = []
@@ -6533,6 +6538,10 @@ class IterativeFullRunTab:
                     matches.append(os.path.join(dirpath, fn))
         return matches
 
+    # _extract_pbarl_dim1: BarPropertySolverTab'ın PBARL yazarken kullandığı
+    # AYNI sabit-genişlik alan okuma yaklaşımı (PID [8:16], devam satırında
+    # dim1 [8:16]) - burada sadece OKUMA için, tam bir pyNastran parse
+    # gerekmediğinden hafif bir metin taraması olarak yapılıyor.
     @staticmethod
     def _extract_pbarl_dim1(bdf_path):
         """Lightweight text-scan for PBARL dim1 per PID - the same
@@ -6567,6 +6576,10 @@ class IterativeFullRunTab:
             i += 1
         return dim1_by_pid
 
+    # _update_dtcg_t1_tfem: DTCG_Input_Excel_Data sayfasının 't1(mm)' ve
+    # 'tfem' sütunlarını (Bar Property ID'ye göre eşleştirerek), solve'ün
+    # gerçekten yazdığı PBARL dim1 değerleriyle doldur - böylece Joint
+    # Run'a giden Excel, "istenen" değil "gerçekten çözülen" kalınlığı yansıtır.
     def _update_dtcg_t1_tfem(self, excel_path, dim1_by_pid):
         """Fill DTCG_Input_Excel_Data's 't1(mm)'/'tfem' columns (by 'Bar
         Property ID') from dim1_by_pid. t2(mm) and every other column are
@@ -6618,6 +6631,11 @@ class IterativeFullRunTab:
                   f"from the solved BDF")
         return n_updated
 
+    # _update_bar_property_dim1: bir sonraki iterasyon için "Bar Property"
+    # sayfasının Dim1 sütununu (B sütunu, PID A sütununda - load_properties()
+    # bunu başlığa göre değil POZİSYONA göre okuduğu için buradaki yazma da
+    # pozisyonel) prop_map'teki ({pid: yeni_dim1}) değerlerle güncelle.
+    # Dim2'ye HİÇ dokunulmaz.
     def _update_bar_property_dim1(self, excel_path, prop_map):
         """Overwrite the 'Bar Property' sheet's Dim1 column (column B,
         PID in column A - load_properties() reads it positionally, not by
@@ -6653,6 +6671,12 @@ class IterativeFullRunTab:
                   f"iteration's sizing summary")
         return n_updated
 
+    # _build_flight_hours_summary: referans Summary_Creating.py script'inin
+    # flight_hours_summary() fonksiyonunun Python/pandas'a taşınmış hali.
+    # Amaç: tüm Set'lerin "Nasgro Final Summary" CSV'lerini birleştirip,
+    # her bar elemanı/property için "HEDEF uçuş saatini karşılayan, mümkün
+    # olan EN İNCE (en hafif) kalınlığı" bulmak - bu, bir sonraki
+    # iterasyonun Bar Property Dim1 değeri olarak kullanılacak.
     def _build_flight_hours_summary(self, joint_run_folder, wanted_flight_hours):
         """Port of the reference Summary_Creating.py's flight_hours_summary():
         every '...Nasgro Final Summary...' csv under joint_run_folder is
@@ -6667,6 +6691,8 @@ class IterativeFullRunTab:
         self.log("BUILDING FLIGHT HOURS SUMMARY")
         self.log("=" * 70)
 
+        # Joint Run klasörü altındaki (her Set'in kendi alt klasöründe)
+        # TÜM "Nasgro Final Summary" CSV'lerini bul.
         csv_files = []
         for dirpath, _, filenames in os.walk(joint_run_folder):
             for fn in filenames:
@@ -6676,6 +6702,10 @@ class IterativeFullRunTab:
         if not csv_files:
             return None, None
 
+        # Her CSV'nin joint_run_folder'a göre RELATİF yolundan Structure_Name
+        # (1. klasör - yani Set adı) ve Fastened_Parts (2. klasör, varsa)
+        # çıkarılıp CSV'ye ek sütun olarak eklenir - böylece birleştirilmiş
+        # tabloda her satırın hangi Set/parçadan geldiği izlenebilir.
         frames = []
         for each_csv in csv_files:
             rel = os.path.relpath(each_csv, joint_run_folder)
@@ -6695,6 +6725,7 @@ class IterativeFullRunTab:
             self.log("  WARNING: none of the 'Nasgro Final Summary' csvs could be read.")
             return None, None
 
+        # TÜM Set'lerin satırlarını tek bir "DT_FULL_SUMMARY" tablosunda birleştir.
         full_summary = pd.concat(frames, ignore_index=True)
         full_summary.to_csv(os.path.join(joint_run_folder, 'DT_FULL_SUMMARY.csv'),
                              encoding='utf-8', index=False)
@@ -6709,6 +6740,13 @@ class IterativeFullRunTab:
                       "sizing/life-check summaries.")
             return None, None
 
+        # ---- Boyutlandırma (sizing) mantığı ----
+        # 1. Önce SADECE hedef uçuş saatini (Life >= wanted_flight_hours)
+        #    KARŞILAYAN satırları filtrele.
+        # 2. Bu satırları kalınlığa (t_col) göre KÜÇÜKTEN BÜYÜĞE sırala,
+        #    her eleman için (Bar Element ID [+ Type]) İLK (yani EN İNCE,
+        #    hedefi hâlâ karşılayan) satırı tut - drop_duplicates varsayılan
+        #    olarak ilk görüleni tutar.
         filtered_for_life = full_summary[full_summary['Life'] >= wanted_flight_hours]
         filtered_sorted = filtered_for_life.sort_values(by=t_col, ascending=True)
         dedup_cols = ['Bar Element ID', 'Bar Element Type'] if 'Bar Element Type' in full_summary.columns \
@@ -6716,6 +6754,15 @@ class IterativeFullRunTab:
         filtered_sorted_rmd = filtered_sorted.drop_duplicates(subset=dedup_cols)
         filtered_sorted_rmd = filtered_sorted_rmd.sort_values(by=t_col, ascending=False)
 
+        # 3. Hedefi karşılayan (en ince) satırları, TÜM satırların kalınlığa
+        #    göre büyükten küçüğe sıralanmış haliyle birleştir, sonra aynı
+        #    elemanlar için yine drop_duplicates uygula. Bu sırada
+        #    filtered_sorted_rmd (hedefi karşılayan, zaten ince) satırlar
+        #    ÖNCE geldiği için, bir eleman hedefi karşılıyorsa o SEÇİLİR;
+        #    hiçbir satır hedefi karşılamıyorsa (filtered_sorted_rmd'de o
+        #    eleman için satır yoksa) full_summary_th_sort'taki EN KALIN
+        #    (en güvenli/muhafazakâr) satır kullanılır - yani "hedefi
+        #    karşılayamayan elemanlar için en kalın (en güvenli) değere geri dön" davranışı.
         full_summary_th_sort = full_summary.sort_values(by=t_col, ascending=False)
         df_bar_sum = pd.concat([filtered_sorted_rmd, full_summary_th_sort], ignore_index=True)
         df_bar_sum = df_bar_sum.drop_duplicates(subset=dedup_cols)
@@ -6724,11 +6771,18 @@ class IterativeFullRunTab:
         df_bar_sum.to_csv(os.path.join(joint_run_folder, 'DT_SIZING_BAR_SUMMARY.csv'),
                            encoding='utf-8', index=False)
 
+        # Eleman bazlı özeti (df_bar_sum), her PROPERTY için en kalın (en
+        # muhafazakâr/yönetici) satırı tutarak Property bazlı özete indir -
+        # bir Property'ye bağlı birden fazla eleman varsa, hepsini güvenle
+        # kapsayan en kalın değer seçilir. Bu df_prop_sum, bir sonraki
+        # iterasyonun Bar Property Dim1 değerlerinin KAYNAĞIDIR.
         df_prop_sum = df_bar_sum.sort_values(by=t_col, ascending=False)
         df_prop_sum = df_prop_sum.drop_duplicates(subset=['Bar Property ID'])
         df_prop_sum.to_csv(os.path.join(joint_run_folder, 'DT_SIZING_PROP_SUMMARY.csv'),
                             encoding='utf-8', index=False)
 
+        # ---- Ömür kontrolü (life check) özetleri - sadece raporlama,
+        # sizing kararı için kullanılmaz: en KISA ömürlü satırı öne çıkarır. ----
         life_check_summary = full_summary.sort_values(by='Life', ascending=True)
         life_check_summary.drop_duplicates(subset=['Bar Element ID']).to_csv(
             os.path.join(joint_run_folder, 'DT_LIFE_CHECK_BAR_SUMMARY.csv'), encoding='utf-8', index=False)
@@ -6739,6 +6793,10 @@ class IterativeFullRunTab:
                   f"{len(df_bar_sum)} rows, DT_SIZING_PROP_SUMMARY: {len(df_prop_sum)} rows")
         return df_prop_sum, t_col
 
+    # _delete_h5_files: verilen klasör altındaki (rekürsif) TÜM .h5
+    # dosyalarını sil - son iterasyon DIŞINDAKİ her iterasyonun Load
+    # Extraction/Joint Run sonuçlarından disk yer açmak için çağrılır
+    # (H5'ler büyük olabilir ve ara iterasyonlarda saklanmasına gerek yok).
     @staticmethod
     def _delete_h5_files(folder):
         n = 0

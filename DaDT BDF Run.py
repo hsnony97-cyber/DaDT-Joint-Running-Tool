@@ -502,42 +502,72 @@ class IntegratedBDFRFTool:
             lines.append(current_line)
         return lines
 
+    # read_file_safe: bir dosyayı okurken karşılaşılabilecek farklı karakter
+    # kodlamalarına (encoding) karşı dayanıklı okuma yapar. BDF dosyaları
+    # farklı programlarla/işletim sistemleriyle üretilmiş olabileceğinden
+    # kodlaması garanti değildir; bu yüzden sırayla birkaç kodlama denenir.
     def read_file_safe(self, fpath):
         """Dosyayı güvenli şekilde oku."""
+        # Sırasıyla utf-8, latin-1, cp1252 (Windows Batı Avrupa), iso-8859-1
+        # kodlamalarını dene - ilk BAŞARILI olan (hata fırlatmayan) kodlamayla
+        # dosyanın tamamı okunup döndürülür.
         for enc in ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']:
             try:
+                # errors='replace': o kodlamada geçersiz bir bayt dizisi
+                # bulunursa hata fırlatmak yerine onu bir "?" benzeri
+                # yer tutucu karakterle değiştirip okumaya devam eder.
                 with open(fpath, 'r', encoding=enc, errors='replace') as f:
                     return f.read()
             except:
+                # Bu kodlama açma/okuma sırasında hata verdiyse bir sonraki
+                # kodlamayı dene.
                 continue
+        # Hiçbir kodlama işe yaramadıysa (çok nadir bir durum) boş string döndür
+        # - çağıran kod bunu "dosya okunamadı" gibi değerlendirebilir.
         return ""
-    
+
+    # extract_subcase_load_info: bir BDF dosyasının İÇERİĞİNİ (metin olarak)
+    # tarayıp, içindeki HER BİR SUBCASE bloğu için SUBCASE numarası, o
+    # subcase'in kullandığı LOAD kart ID'si, TEMPERATURE(LOAD) kart ID'si ve
+    # varsa SUBTITLE metnini çıkarır. Bu bilgi daha sonra farklı master
+    # BDF'lerdeki subcase'leri birbiriyle eşleştirip birleştirmek için kullanılır.
     def extract_subcase_load_info(self, bdf_content):
         """
         BDF içeriğinden TÜM SUBCASE bilgilerini çıkarır.
         Bir dosyada birden fazla SUBCASE olabilir (MASTER_GUST.BDF gibi).
-        
+
         Returns: list of dicts, her biri:
             - subcase_id
             - load_id
             - temp_load_id
             - subtitle
         """
+        # Bulunan her subcase'in bilgisini biriktireceğimiz sonuç listesi.
         results = []
+        # Dosya içeriğini satır satır işlemek için '\n' karakterinden böl.
         lines = bdf_content.split('\n')
-        
+
+        # "Şu an işlenmekte olan" subcase'in bilgilerini tutan geçici
+        # değişkenler. Yeni bir SUBCASE satırına rastlandığında bir önceki
+        # subcase'in bilgisi results listesine kaydedilip bu değişkenler sıfırlanır.
         current_subcase = None
         current_load = None
         current_temp_load = None
         current_subtitle = None
-        
+
+        # Dosyanın her satırını tek tek (yukarıdan aşağıya) tara.
         for line in lines:
+            # Anahtar kelime (SUBCASE, LOAD vb.) karşılaştırması büyük/küçük
+            # harfe duyarsız yapılabilsin diye satırın büyük harfli hali.
             upper = line.upper().strip()
+            # SUBTITLE gibi büyük/küçük harfin KORUNMASI gereken metinler
+            # için satırın orijinal (değiştirilmemiş) hali.
             original = line.strip()
-            
-            # SUBCASE satırı
+
+            # --- SUBCASE satırı (örn. "SUBCASE 10") ---
             if upper.startswith('SUBCASE'):
-                # Önceki subcase'i kaydet
+                # Yeni bir SUBCASE'e geçtik demek ki bir önceki subcase'in
+                # toplanan bilgisi tamamlandı - onu sonuç listesine kaydet.
                 if current_subcase is not None:
                     results.append({
                         'subcase_id': current_subcase,
@@ -545,8 +575,11 @@ class IntegratedBDFRFTool:
                         'temp_load_id': current_temp_load,
                         'subtitle': current_subtitle
                     })
-                
-                # Yeni subcase başlat
+
+                # Şimdi yeni subcase'i başlat: "SUBCASE 10" satırını boşluğa
+                # göre parçalara ayırıp 2. kelimeyi (parts[1], subcase ID'si)
+                # tam sayıya çevir. Bu yeni subcase için LOAD/TEMP/SUBTITLE
+                # bilgileri henüz bilinmediğinden None'a sıfırlanır.
                 parts = upper.split()
                 if len(parts) >= 2:
                     try:
@@ -555,31 +588,46 @@ class IntegratedBDFRFTool:
                         current_temp_load = None
                         current_subtitle = None
                     except:
+                        # Sayıya çevrilemiyorsa (beklenmedik format) sessizce atla.
                         pass
-            
-            # LOAD = satırı
+
+            # --- LOAD = satırı (örn. "LOAD = 2001") ---
+            # current_subcase doluyken (yani bir SUBCASE bloğunun içindeyken) geçerli.
             elif current_subcase and upper.startswith('LOAD') and '=' in upper:
+                # Regex ile "LOAD" kelimesinden sonraki '=' işaretini ve
+                # ardından gelen sayıyı yakala.
                 match = re.search(r'LOAD\s*=\s*(\d+)', upper)
                 if match:
                     current_load = int(match.group(1))
-            
-            # TEMPERATURE(LOAD) = satırı
+
+            # --- TEMPERATURE(LOAD) = satırı (örn. "TEMPERATURE(LOAD) = 3001") ---
             elif current_subcase and 'TEMPERATURE' in upper and 'LOAD' in upper and '=' in upper:
+                # Parantez içindeki boşluklara da tolerans gösteren regex.
                 match = re.search(r'TEMPERATURE\s*\(\s*LOAD\s*\)\s*=\s*(\d+)', upper)
                 if match:
                     current_temp_load = int(match.group(1))
-            
-            # SUBTITLE satırı
+
+            # --- SUBTITLE satırı (örn. "SUBTITLE Gust Load Case 1") ---
             elif current_subcase and upper.startswith('SUBTITLE'):
+                # original (büyük/küçük harfi korunmuş) satırdan "SUBTITLE"
+                # kelimesinden sonraki metni yakala - bu, subcase'in okunabilir
+                # başlığıdır.
                 m = re.search(r'SUBTITLE\s+(.+)', original, re.IGNORECASE)
                 if m:
                     current_subtitle = m.group(1).strip()
-            
-            # BEGIN BULK'a ulaştıysak case control bitti
+
+            # --- "BEGIN BULK" satırına ulaşıldıysa ---
+            # Bu, dosyanın "Case Control" (SUBCASE tanımları) bölümünün
+            # bittiği, "Bulk Data" (gerçek kartlar: GRID, CQUAD4 vb.)
+            # bölümünün başladığı anlamına gelir. Artık SUBCASE aranmayacağı
+            # için döngüden tamamen çık (break).
             elif upper.startswith('BEGIN') and 'BULK' in upper:
                 break
-        
-        # Son subcase'i kaydet
+
+        # Döngü bittiğinde elde kalan EN SON subcase'in bilgisi henüz
+        # results listesine eklenmemiş olabilir (çünkü bir sonraki SUBCASE
+        # satırı gelmediği için o "kaydet" adımı hiç tetiklenmedi) - onu da
+        # burada manuel olarak ekle.
         if current_subcase is not None:
             results.append({
                 'subcase_id': current_subcase,
@@ -587,44 +635,65 @@ class IntegratedBDFRFTool:
                 'temp_load_id': current_temp_load,
                 'subtitle': current_subtitle
             })
-        
+
         return results
-    
+
+    # parse_multiline_includes: bir BDF dosyasının içeriğinde geçen tüm
+    # INCLUDE kartlarını bulur. INCLUDE kartı, başka bir BDF dosyasının
+    # içeriğinin bu dosyaya "dahil edilmesini" söyleyen bir NASTRAN kartıdır
+    # (örn. ortak kullanılan GRID/element tanımlarını ayrı bir dosyada tutup
+    # birden fazla ana dosyadan INCLUDE ile çağırmak için kullanılır).
+    # Zorluk: dosya yolu çok uzunsa (format_include_nastran'ın yaptığının
+    # tersi) INCLUDE kartı BİRDEN FAZLA SATIRA yayılabilir - bu fonksiyon
+    # böyle çok satırlı INCLUDE'ları da doğru şekilde tek parça halinde toplar.
     def parse_multiline_includes(self, content, bdf_dir):
         """
         Çok satırlı INCLUDE'ları parse eder.
         Nastran formatında INCLUDE şöyle olabilir:
-        
+
         INCLUDE '../../../_COMMON_/INTERFACE/STRUCTURAL/INTER_AF_HT/
         INTER_AF_HT_STRU.BDF'
-        
+
         Returns: list of dict with keys: lines, full_text, abs_path, start_idx, end_idx
         """
+        # İçeriği satır satır işlemek için böl.
         lines = content.split('\n')
+        # Bulunan her INCLUDE kartının bilgisini tutacağımız sonuç listesi.
         includes = []
         i = 0
-        
+
+        # Satırları baştan sona tek tek tara (while döngüsü kullanılıyor
+        # çünkü bir INCLUDE bulununca birden fazla satır birden "atlanıyor",
+        # bu yüzden normal for yerine elle kontrol edilen indeks (i) gerekiyor).
         while i < len(lines):
             line = lines[i]
             upper = line.upper().strip()
-            
+
             if upper.startswith('INCLUDE'):
-                # INCLUDE başladı - tırnak içindeki path'i bul
+                # Bir INCLUDE kartının başlangıcını bulduk. Şimdi bu kartın
+                # TAMAMINI (tek satır mı çok satırlı mı olduğuna bakmaksızın)
+                # toplamamız gerekiyor.
                 include_lines = [line]
                 full_text = line
-                
-                # Tırnak sayısını kontrol et - tek tırnak veya çift tırnak
+
+                # NASTRAN'da dosya yolu tek tırnak (') veya çift tırnak (")
+                # içinde yazılabilir - hangisi kullanılmışsa onu tespit et.
                 quote_char = None
                 if "'" in line:
                     quote_char = "'"
                 elif '"' in line:
                     quote_char = '"'
-                
+
                 if quote_char:
-                    # Tırnak sayısını say
+                    # Şu ana kadar toplanan metinde kaç tane tırnak karakteri var?
+                    # Tırnak SAYISI ÇİFT ise (0, 2, 4...) tırnaklar açılıp
+                    # kapanmış demektir - INCLUDE kartı tek satırda tamamlanmış.
+                    # Tırnak sayısı TEK ise (1, 3...) tırnak hâlâ açık demektir
+                    # - yani path bir sonraki satıra devam ediyor.
                     quote_count = full_text.count(quote_char)
-                    
-                    # Eğer tek tırnak varsa (açılmış ama kapanmamış), devam satırlarını oku
+
+                    # Tırnak kapanana kadar (quote_count çift olana kadar)
+                    # bir sonraki satırları da bu INCLUDE kartına dahil et.
                     j = i + 1
                     while quote_count % 2 != 0 and j < len(lines):
                         next_line = lines[j]
@@ -632,20 +701,33 @@ class IntegratedBDFRFTool:
                         full_text += '\n' + next_line
                         quote_count = full_text.count(quote_char)
                         j += 1
-                    
-                    # Path'i çıkar - newline'ları temizle
+
+                    # Artık INCLUDE kartının TAM metni elimizde. İçindeki
+                    # satır sonlarını (newline) silip tek bir satırmış gibi
+                    # birleştir, sonra regex ile tırnaklar ARASINDAKİ
+                    # (gerçek dosya yolunu içeren) kısmı yakala.
                     clean_text = full_text.replace('\n', '')
-                    match = re.search(rf"INCLUDE\s*{quote_char}([^{quote_char}]*){quote_char}", 
+                    match = re.search(rf"INCLUDE\s*{quote_char}([^{quote_char}]*){quote_char}",
                                      clean_text, re.IGNORECASE)
                     if match:
                         inc_path = match.group(1).strip()
-                        # Absolute path'e çevir
+                        # Yol GÖRECELİ (relative, örn. "../ortak/dosya.bdf")
+                        # ise, bu BDF dosyasının bulunduğu klasöre (bdf_dir)
+                        # göre MUTLAK (absolute) yola çevir. Yol zaten mutlaksa
+                        # (örn. "C:\..." veya "/...") olduğu gibi normalize et.
                         if not os.path.isabs(inc_path):
                             abs_path = os.path.normpath(os.path.join(bdf_dir, inc_path))
                         else:
                             abs_path = os.path.normpath(inc_path)
+                        # Windows'un ters eğik çizgisini (\) NASTRAN/Unix tarzı
+                        # düz eğik çizgiye (/) çevir - tutarlı/taşınabilir
+                        # bir yol formatı için.
                         abs_path = abs_path.replace('\\', '/')
-                        
+
+                        # Bu INCLUDE kartına ait tüm bilgiyi (orijinal
+                        # satırlar, birleşik metin, çözümlenmiş mutlak yol,
+                        # dosyadaki başlangıç/bitiş satır indeksleri) sonuç
+                        # listesine ekle.
                         includes.append({
                             'lines': include_lines,
                             'full_text': full_text,
@@ -653,64 +735,93 @@ class IntegratedBDFRFTool:
                             'start_idx': i,
                             'end_idx': j - 1 if j > i + 1 else i
                         })
-                    
+
+                    # Tarama indeksini, bu INCLUDE kartının bitişinden
+                    # (j) devam edecek şekilde ileri al - aynı satırları
+                    # tekrar işlememek için.
                     i = j
                 else:
+                    # "INCLUDE" ile başlıyor ama tırnak yoksa (beklenmedik/
+                    # bozuk format) - sadece bir sonraki satıra geç.
                     i += 1
             else:
+                # Bu satır INCLUDE ile ilgili değil - bir sonraki satıra geç.
                 i += 1
-        
+
         return includes
-    
+
+    # collect_all_lines_from_masters: birleştirme işleminin KALBİ olan metod.
+    # Kullanıcının seçtiği tüm "Master BDF" dosyalarını tek tek açar, Excel'de
+    # istenen SUBCASE ID'lerle eşleşen dosyaları bulur, o dosyaların TÜM
+    # satırlarını (case-control komutları hariç) tek bir büyük satır listesinde
+    # toplar, INCLUDE kartlarını COMMON (ortak, ayrı tutulacak) ve diğer
+    # (STRUCTURE/INTERFACE gibi, doğrudan satıra eklenecek) olarak ikiye
+    # ayırır, ve en sonunda tekrar eden (duplicate) satırları temizler.
     def collect_all_lines_from_masters(self, bdf_files, load_case_set, common_type):
         """
         Tüm MASTER BDF'lerden TÜM SATIRLARI toplar.
-        
+
         1. Excel'deki SUBCASE ID'lere uyan MASTER BDF'leri bulur
         2. Her birinden TÜM satırları alır ve alt alta yapıştırır
         3. INCLUDE'ları kategorize et:
            - COMMON LOAD/THERMAL → Ayrı tut (sonra INCLUDE olarak eklenecek)
            - Diğerleri (STRUCTURE, INTERFACE, vs.) → Satır olarak ekle (pyNastran açacak)
         4. Duplicate satırları çıkar
-        
+
         NOT: Bir BDF birden fazla SUBCASE içerebilir (MASTER_GUST.BDF gibi)
-        
+
         common_type: 'LOAD' veya 'THERMAL'
-        
+
         Returns: (all_lines, common_includes, subcase_info_map)
         """
         all_lines_raw = []  # Tüm satırlar (INCLUDE satırları dahil - COMMON hariç)
         common_includes_raw = []  # COMMON INCLUDE path'leri
+        # subcase_info_map: her SUBCASE ID'si için (load_id/temp_load_id,
+        # subtitle) bilgisini tutan sözlük - process_thermal_bdf/
+        # process_maneuver_bdf tarafından yeni SUBCASE kartları yazarken kullanılacak.
         subcase_info_map = {}
-        processed_files = set()  # Aynı dosyayı birden fazla kez işlememek için
-        
+        # Aynı dosyayı (birden fazla subcase'i Excel listesiyle eşleştiği
+        # için) iki kere tam olarak işlememek amacıyla "zaten işlendi" takibi.
+        processed_files = set()
+
         self.log1(f"    Reading ALL lines from {len(bdf_files)} MASTER BDFs...")
         matched_count = 0
         matched_subcases = 0
-        
+
+        # ---- Her bir Master BDF dosyasını tek tek işle ----
         for bdf_path in bdf_files:
+            # INCLUDE yollarını bu dosyanın bulunduğu klasöre göre
+            # mutlaklaştırabilmek için dosyanın klasörünü al.
             bdf_dir = os.path.dirname(os.path.abspath(bdf_path))
+            # Dosyayı (kodlama sorunlarına dayanıklı şekilde) oku.
             content = self.read_file_safe(bdf_path)
-            
-            # INREL dosyalarını atla
+
+            # Dosya adında "INREL" geçiyorsa bu dosyayı tamamen atla -
+            # (muhtemelen bir ara/yardımcı dosya türü, birleştirmeye dahil edilmiyor).
             bdf_basename = os.path.basename(bdf_path).upper()
             if 'INREL' in bdf_basename:
                 self.log1(f"      SKIP (INREL): {os.path.basename(bdf_path)}")
                 continue
-            
-            # TÜM SUBCASE bilgilerini al (birden fazla olabilir)
+
+            # Bu dosyadaki TÜM SUBCASE bloklarının bilgisini çıkar (bir
+            # dosyada birden fazla subcase olabileceğini unutmayın).
             all_subcases = self.extract_subcase_load_info(content)
-            
-            # Bu dosyadaki hangi subcase'ler Excel listesinde?
+
+            # Bu dosyadaki subcase'lerden hangileri, kullanıcının Excel'de
+            # istediği SUBCASE ID kümesiyle (load_case_set) eşleşiyor?
             matching_subcases = []
             for sc_info in all_subcases:
                 sc_id = sc_info['subcase_id']
                 if sc_id and sc_id in load_case_set:
                     matching_subcases.append(sc_info)
-            
-            # Eşleşen subcase varsa bu dosyayı işle
+
+            # En az bir eşleşen subcase varsa bu dosyayı işlemeye devam et.
             if matching_subcases:
-                # Dosya daha önce işlendiyse sadece subcase info'ları ekle
+                # Bu dosya DAHA ÖNCE (başka bir subcase eşleşmesi yüzünden)
+                # tam olarak işlenmişse, satırlarını TEKRAR eklemeye gerek yok
+                # (zaten all_lines_raw içinde) - sadece yeni eşleşen
+                # subcase'lerin bilgi kaydını (subcase_info_map) tamamla ve
+                # bir sonraki dosyaya geç (continue).
                 if bdf_path in processed_files:
                     for sc_info in matching_subcases:
                         sc_id = sc_info['subcase_id']
@@ -727,15 +838,19 @@ class IntegratedBDFRFTool:
                                 }
                             matched_subcases += 1
                     continue
-                
+
+                # Bu dosyayı "işlendi" olarak işaretle (bir daha tam işlenmesin).
                 processed_files.add(bdf_path)
                 matched_count += 1
-                
-                # Log - kaç subcase eşleşti
+
+                # Hangi subcase ID'lerinin eşleştiğini log'a yaz (en fazla 5
+                # tanesi gösterilsin, fazlası "..." ile kısaltılsın).
                 sc_ids = [str(sc['subcase_id']) for sc in matching_subcases]
                 self.log1(f"      MATCH: {os.path.basename(bdf_path)} ({len(matching_subcases)} subcases: {', '.join(sc_ids[:5])}{'...' if len(sc_ids) > 5 else ''})")
-                
-                # Subcase info'ları kaydet
+
+                # Eşleşen her subcase için bilgi kaydı oluştur (LOAD tipindeyse
+                # load_id, THERMAL tipindeyse temp_load_id tutulur; subtitle
+                # yoksa otomatik bir varsayılan metin üretilir).
                 for sc_info in matching_subcases:
                     sc_id = sc_info['subcase_id']
                     matched_subcases += 1
@@ -749,19 +864,29 @@ class IntegratedBDFRFTool:
                             'load_id': sc_info['load_id'] if sc_info['load_id'] else sc_id,
                             'subtitle': sc_info['subtitle'] if sc_info['subtitle'] else f"Manoeuvre {sc_id}"
                         }
-                
-                # Önce tüm INCLUDE'ları parse et (çok satırlı dahil)
+
+                # Bu dosyadaki TÜM INCLUDE kartlarını (çok satırlı olanlar
+                # dahil) önceden ayrıştırılmış halde al.
                 all_includes = self.parse_multiline_includes(content, bdf_dir)
-                
-                # INCLUDE'ları kategorize et
-                common_include_indices = set()  # COMMON INCLUDE satır indeksleri
+
+                # INCLUDE'ları iki kategoriye ayıracağız:
+                # - COMMON (LOAD ya da THERMAL): ayrı tutulup, path olarak
+                #   fonksiyon çıktısında (common_includes_raw) döndürülecek.
+                # - Diğerleri (STRUCTURE/INTERFACE vb.): doğrudan satır
+                #   listesine YENİ bir INCLUDE kartı olarak eklenecek (mutlak
+                #   yol ile, tek satır halinde - pyNastran bu dosyayı kendisi açacak).
+                common_include_indices = set()  # COMMON INCLUDE'a ait, ATLANACAK satır indeksleri
                 structure_include_count = 0
                 common_include_count = 0
-                
+
                 for inc in all_includes:
                     abs_path_upper = inc['abs_path'].upper()
-                    
-                    # Bu INCLUDE COMMON LOAD/THERMAL mı?
+
+                    # Bu INCLUDE'un hedef yolu "_COMMON_/LOAD" veya
+                    # "_COMMON_/THERMAL" gibi bir klasör içeriyor mu? (hem alt
+                    # çizgili hem çizgisiz klasör adı varyasyonu kontrol
+                    # ediliyor). common_type parametresine göre hangisine
+                    # bakılacağı belirleniyor.
                     is_common = False
                     if common_type == 'LOAD':
                         if '_COMMON_/LOAD' in abs_path_upper or '/COMMON/LOAD' in abs_path_upper:
@@ -769,67 +894,97 @@ class IntegratedBDFRFTool:
                     elif common_type == 'THERMAL':
                         if '_COMMON_/THERMAL' in abs_path_upper or '/COMMON/THERMAL' in abs_path_upper:
                             is_common = True
-                    
+
                     if is_common:
-                        # COMMON INCLUDE - path'i kaydet, satırları atla
+                        # COMMON INCLUDE: yolunu ayrı listeye kaydet, bu
+                        # kartın kapladığı satırları (start_idx..end_idx)
+                        # "atlanacaklar" kümesine ekle (aşağıdaki asıl satır
+                        # toplama döngüsünde bu satırlar es geçilecek).
                         common_includes_raw.append(inc['abs_path'])
                         for idx in range(inc['start_idx'], inc['end_idx'] + 1):
                             common_include_indices.add(idx)
                         common_include_count += 1
                     else:
-                        # Structure/Interface/vs INCLUDE - tek satır INCLUDE olarak ekle (pyNastran açacak)
-                        # Absolute path ile yeni INCLUDE satırı oluştur
+                        # COMMON olmayan INCLUDE (örn. STRUCTURE/INTERFACE):
+                        # mutlak yol ile TEK SATIRLIK yeni bir INCLUDE kartı
+                        # oluşturup doğrudan all_lines_raw'a ekle - böylece
+                        # çok satırlı/göreceli orijinal hali yerine tek
+                        # satırlık, mutlak yollu, temiz bir INCLUDE kartı kullanılmış olur.
                         include_line = f"INCLUDE '{inc['abs_path']}'"
                         all_lines_raw.append(include_line)
-                        # Orijinal satırları atla (common_include_indices'e ekle)
+                        # Bu INCLUDE'un orijinal (eski) satırlarını da atlanacaklar kümesine ekle.
                         for idx in range(inc['start_idx'], inc['end_idx'] + 1):
                             common_include_indices.add(idx)
                         structure_include_count += 1
-                
-                # TÜM SATIRLARI oku (INCLUDE satırları hariç - hem COMMON hem diğerleri)
+
+                # Şimdi dosyanın TÜM satırlarını tara ve (INCLUDE satırları
+                # hariç - onları yukarıda zaten ayrıca işledik) gerçek veri
+                # satırlarını topla.
                 lines = content.split('\n')
                 line_count = 0
-                
+
                 for idx, line in enumerate(lines):
-                    # INCLUDE satırı mı? Atla (zaten yukarıda işledik)
+                    # Bu satır, yukarıda işlediğimiz bir INCLUDE kartının
+                    # parçasıysa (COMMON ya da structure fark etmez) atla -
+                    # zaten ya common_includes_raw'a ya da yeni tek satırlık
+                    # haliyle all_lines_raw'a eklendi.
                     if idx in common_include_indices:
                         continue
-                    
+
                     stripped = line.strip()
                     if not stripped:
+                        # Boş satırları atla.
                         continue
-                    
-                    # Case control satırlarını atla
+
+                    # "Case Control" bölümüne ait komut satırlarını (SOL,
+                    # CEND, TITLE, SUBCASE, LOAD=, SPC=, çıktı istek kartları
+                    # DISPLACEMENT/FORCE/vb., BEGIN BULK, ENDDATA gibi)
+                    # ATLA - bunlar birleştirilmiş dosyada YENİDEN,
+                    # process_thermal_bdf/process_maneuver_bdf tarafından
+                    # TEK SEFERDE ve doğru SUBCASE numaralarıyla yazılacak;
+                    # buradan ham haliyle kopyalanırsa birden fazla kez
+                    # tekrarlanıp bozuk bir dosya oluşur.
                     upper = stripped.upper()
-                    skip_keywords = ['SOL ', 'SOL\t', 'CEND', 'TITLE', 'SUBTITLE', 'ECHO', 
-                                    'SUBCASE', 'LOAD =', 'LOAD=', 'SPC =', 'SPC=', 
-                                    'TEMPERATURE', 'DISPLACEMENT', 'FORCE', 'GPFORCE', 
-                                    'OLOAD', 'SPCFORCE', 'SET ', 'BEGIN BULK', 
+                    skip_keywords = ['SOL ', 'SOL\t', 'CEND', 'TITLE', 'SUBTITLE', 'ECHO',
+                                    'SUBCASE', 'LOAD =', 'LOAD=', 'SPC =', 'SPC=',
+                                    'TEMPERATURE', 'DISPLACEMENT', 'FORCE', 'GPFORCE',
+                                    'OLOAD', 'SPCFORCE', 'SET ', 'BEGIN BULK',
                                     'BEGIN,BULK', 'ENDDATA']
                     is_skip = any(upper.startswith(kw) for kw in skip_keywords)
-                    
+
                     if not is_skip:
+                        # Case-control/atlanacak bir satır değilse (yani
+                        # gerçek bir Bulk Data kartıysa, örn. GRID, CQUAD4,
+                        # PARAM...) - orijinal satırı OLDUĞU GİBİ (formatı
+                        # bozmadan) topla.
                         all_lines_raw.append(line)  # Orijinal satırı koru
                         line_count += 1
-                
+
                 self.log1(f"        -> {line_count} data lines, {structure_include_count} structure includes, {common_include_count} common includes")
-        
+
+        # Tüm dosyalar işlendikten sonra özet istatistikleri logla.
         self.log1(f"    Matched {matched_count} MASTER BDFs with {matched_subcases} total subcases")
         self.log1(f"    Total raw lines (including structure includes): {len(all_lines_raw)}")
         self.log1(f"    Total raw COMMON includes: {len(common_includes_raw)}")
-        
-        # Duplicate satırları çıkar
+
+        # ---- Tekrar eden (duplicate) satırları temizle ----
+        # Birden fazla master BDF'den aynı kart (örn. aynı GRID tanımı) iki
+        # farklı dosyada da bulunabilir - bu satırlar birleşik çıktıda SADECE
+        # BİR KERE görünmeli, yoksa NASTRAN "tanım tekrarlandı" hatası verir.
         self.log1("    Removing duplicate lines...")
         seen_lines = set()
         unique_lines = []
         for line in all_lines_raw:
-            # Normalize et (boşlukları düzenle)
+            # Karşılaştırmayı boşluk farklarına duyarsız yapmak için satırı
+            # "normalize" et: baştaki/sondaki/aradaki fazla boşlukları tek
+            # boşluğa indirir (split() + join(' ', ...) kombinasyonu).
             normalized = ' '.join(line.split())
             if normalized not in seen_lines:
                 seen_lines.add(normalized)
-                unique_lines.append(line)
-        
-        # Duplicate COMMON INCLUDE'ları çıkar
+                unique_lines.append(line)  # orijinal (normalize EDİLMEMİŞ) hali saklanır
+
+        # Aynı mantıkla COMMON INCLUDE yollarındaki tekrarları da temizle
+        # (büyük/küçük harf ve \ / ayrımına duyarsız karşılaştırma ile).
         seen_includes = set()
         unique_common_includes = []
         for inc_path in common_includes_raw:
@@ -837,13 +992,13 @@ class IntegratedBDFRFTool:
             if normalized not in seen_includes:
                 seen_includes.add(normalized)
                 unique_common_includes.append(inc_path)
-        
+
         self.log1(f"    After removing duplicates:")
         self.log1(f"      Unique lines: {len(unique_lines)} (removed {len(all_lines_raw) - len(unique_lines)} duplicates)")
         self.log1(f"      Unique COMMON includes: {len(unique_common_includes)}")
-        
+
         return unique_lines, unique_common_includes, subcase_info_map
-    
+
     def extract_param_cards(self, bulk_data):
         """
         Bulk data'dan PARAM kartlarını ayırır.

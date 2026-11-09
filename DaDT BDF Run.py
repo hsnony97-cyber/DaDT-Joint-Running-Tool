@@ -2040,29 +2040,40 @@ class IntegratedBDFRFTool:
         self.log1(f"    COMMON LOAD INCLUDES: {len(common_includes)}")
 
 
+# ============================================================================
+# BarPropertySolverTab  --  "Understanding Structure Type" sekmesi (Tab 3)
+# ============================================================================
+# Bu sınıf kullanıcıdan BDF dosyalarını ve Property/Element Excel'lerini alır,
+# Excel'de verilen Bar (PBARL dim1/dim2) ve Skin (PSHELL t) değerlerini BDF'e
+# uygular, offset (göçme/landing) elemanlarını işler ve ortaya çıkan
+# "base model"i gerçek Nastran çözücüsüyle (tek parça veya SUBCASE'lere göre
+# paralel parçalara bölünmüş olarak) çalıştırır. Diğer sekmeler (Full Run,
+# Iterative Full Run) bu sınıfın nesnesini DOĞRUDAN paylaşır (kopyasını değil)
+# - yani bu sınıftaki self.* alanlarına yazılan her şey diğer sekmelerden de
+# görülür.
 class BarPropertySolverTab:
     def __init__(self, parent_frame, root):
         self.root = root
         self.parent_frame = parent_frame
-        self.maneuver_bdfs = []
+        self.maneuver_bdfs = []  # "Maneuver BDF (Offset Source)" listesi - offset hesaplamasının referans aldığı BDF'ler
         # self.root.title("Joint Structure Type Understanding")
         # self.root.geometry("1300x950")
 
-        # Input paths
-        self.bdf_paths = []
-        self.property_excel_path = tk.StringVar()
-        self.element_excel_path = tk.StringVar()
-        self.nastran_path = tk.StringVar()
-        self.nastran_memory = tk.StringVar(value="")
+        # ---- Girdi yolları (Input paths) ----
+        self.bdf_paths = []                    # "All BDF Files" listbox'ındaki tüm BDF dosya yolları
+        self.property_excel_path = tk.StringVar()   # Bar/Skin Property Excel dosya yolu
+        self.element_excel_path = tk.StringVar()    # Offset Element IDs Excel dosya yolu
+        self.nastran_path = tk.StringVar()     # Nastran çalıştırılabilir dosyasının (.exe) yolu
+        self.nastran_memory = tk.StringVar(value="")  # opsiyonel bellek sınırı (örn. "4gb") - boşsa Nastran varsayılanı kullanılır
         self.scratch_folder = tk.StringVar(value="")  # optional; blank = each run's own output folder (still collision-free)
-        self.output_folder = tk.StringVar()
+        self.output_folder = tk.StringVar()    # çözüm sonuçlarının yazılacağı klasör
         self.cases_per_split = tk.StringVar(value="")   # optional; blank/0 = solve as a single BDF (no split)
         self.max_parallel_runs = tk.StringVar(value="1")  # 1 = sequential
 
-        # Default bar thickness used only when a property has no Excel/BDF value
+        # Hiçbir Excel/BDF değeri bulunamazsa kullanılacak varsayılan bar kalınlığı
         self.default_bar_thickness = 2.0
 
-        # Data storage
+        # ---- Veri saklama alanları (Data storage) ----
         self.bdf_model = None
         self.bdf_models = []
         self.bar_properties = {}          # PID -> {'dim1': val, 'dim2': val} (base model values)
@@ -2073,16 +2084,20 @@ class BarPropertySolverTab:
         self.original_skin_thicknesses = {} # PID -> raw PSHELL thickness from BDF (fallback only)
         self.original_bar_thicknesses = {} # PID -> original dim1 from BDF
         self.maneuver_base_path = None    # Excel-properties-applied maneuver (offset source) BDF, set by _build_base_model
-        self.landing_elem_ids = []
-        self.bar_offset_elem_ids = []
+        self.landing_elem_ids = []        # offset uygulanacak "landing" (göçme) eleman ID'leri
+        self.bar_offset_elem_ids = []     # offset uygulanacak bar eleman ID'leri
 
-        # Run state
-        self.is_running = False
-        self.properties_loaded = False
+        # ---- Çalışma (run) durumu ----
+        self.is_running = False       # bir Nastran çözümü şu an sürüyor mu?
+        self.properties_loaded = False  # Property Excel'i başarıyla yüklendi mi? (SOLVE butonunu aktive etmek için kontrol edilir)
 
         self.setup_ui()
 
     # ==================== GUI ====================
+    # setup_ui: bu sekmenin tüm arayüzünü kurar. İçerik dikeyde kaydırılabilir
+    # (Canvas + Scrollbar + içteki scrollable_frame) bir alana yerleştirilir,
+    # çünkü sekmede 4 ayrı bölüm (Input Files / Parallel Run Splitting /
+    # Actions / Log) alt alta sığdırılır.
     def setup_ui(self):
         canvas = tk.Canvas(self.parent_frame)
         scrollbar = ttk.Scrollbar(self.parent_frame, orient="vertical", command=canvas.yview)
@@ -2095,6 +2110,7 @@ class BarPropertySolverTab:
 
         main = scrollable_frame
 
+        # Başlık ve alt başlık.
         ttk.Label(main, text="Joint Structure Type Understanding", style='Header.TLabel').pack(pady=10)
         ttk.Label(main, text="Apply Property Excel + offsets and solve the base model",
                  style='Subtitle.TLabel').pack()
@@ -2103,7 +2119,9 @@ class BarPropertySolverTab:
         f1 = ttk.LabelFrame(main, text="\U0001F4C1  1. Input Files", padding=10)
         f1.pack(fill=tk.X, pady=5, padx=10)
 
-        # All BDF Files
+        # "All BDF Files" listesi: solve edilecek tüm BDF dosyalarının
+        # (örn. ana yapı + maneuver + thermal) seçildiği, Add/Remove
+        # butonlu bir Listbox.
         bdf_frame = ttk.Frame(f1)
         bdf_frame.pack(fill=tk.X, pady=2)
         ttk.Label(bdf_frame, text="All BDF Files:", width=18).pack(side=tk.LEFT, anchor=tk.N)
@@ -2129,7 +2147,9 @@ class BarPropertySolverTab:
         self.bdf_status = ttk.Label(f1, text="No BDF files loaded", foreground="gray")
         self.bdf_status.pack(anchor=tk.W)
 
-        # Maneuver BDF (Offset Source)
+        # "Maneuver BDF (Offset Source)" listesi: offset hesabının referans
+        # alacağı, SADECE maneuver BDF'lerinin seçildiği ayrı bir liste
+        # (All BDF Files'tan bağımsız - aynı dosya her ikisine de eklenebilir).
         man_frame = ttk.Frame(f1)
         man_frame.pack(fill=tk.X, pady=2)
         man_lbl = ttk.Frame(man_frame)
@@ -2156,17 +2176,18 @@ class BarPropertySolverTab:
         ttk.Button(man_btn_frame, text="Remove", command=self._remove_maneuver_bdf).pack(fill=tk.X, pady=1)
 
 
-        # Property Excel
+        # Property Excel satırı (yol kutusu + Browse + Load butonu, bkz. _add_file_row).
+        # "Load" butonu load_properties()'i tetikler.
         self._add_file_row(f1, "Property Excel:", self.property_excel_path, self.load_properties)
         self.prop_status = ttk.Label(f1, text="Not loaded", foreground="gray")
         self.prop_status.pack(anchor=tk.W)
 
-        # Offset Element IDs
+        # Offset Element IDs satırı - "Load" butonu load_element_ids()'i tetikler.
         self._add_file_row(f1, "Offset Element IDs:", self.element_excel_path, self.load_element_ids)
         self.elem_status = ttk.Label(f1, text="Not loaded", foreground="gray")
         self.elem_status.pack(anchor=tk.W)
 
-        # Nastran Exe
+        # Nastran .exe yolu
         nast_frame = ttk.Frame(f1)
         nast_frame.pack(fill=tk.X, pady=2)
         ttk.Label(nast_frame, text="Nastran Exe:", width=18).pack(side=tk.LEFT)
@@ -2199,7 +2220,7 @@ class BarPropertySolverTab:
                                   "run's TEMP/TMP, so scratch never lands on C: or collides between runs)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
-        # Output Folder
+        # Çözüm sonuçlarının yazılacağı çıktı klasörü.
         out_frame = ttk.Frame(f1)
         out_frame.pack(fill=tk.X, pady=2)
         ttk.Label(out_frame, text="Output Folder:", width=18).pack(side=tk.LEFT)
@@ -2209,6 +2230,8 @@ class BarPropertySolverTab:
         )).pack(side=tk.LEFT)
 
         # ---- Section 2: Parallel Run Splitting ----
+        # Büyük SUBCASE sayılı BDF'leri küçük parçalara bölüp paralel
+        # Nastran süreçleriyle çalıştırmak için ayarlar.
         f2 = ttk.LabelFrame(main, text="\U0001F500  2. Parallel Run Splitting", padding=10)
         f2.pack(fill=tk.X, pady=5, padx=10)
 
@@ -2234,6 +2257,8 @@ class BarPropertySolverTab:
 
         btn_row = ttk.Frame(f3)
         btn_row.pack(fill=tk.X)
+        # SOLVE butonu başlangıçta DISABLED - sadece load_properties() başarıyla
+        # çalışıp properties_loaded=True olunca NORMAL'e çevrilir (bkz. load_properties).
         self.btn_start = ttk.Button(btn_row, text="▶  SOLVE BASE MODEL", command=self.start_solve,
                                      state=tk.DISABLED, style='Accent.TButton')
         self.btn_start.pack(side=tk.LEFT, padx=5)
@@ -2253,6 +2278,10 @@ class BarPropertySolverTab:
                                                     borderwidth=0)
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
+    # _add_file_row: "Label + Entry + Browse + Load" düzenindeki tekrarlayan
+    # satırları (Property Excel, Offset Element IDs) tek yerden üretmek
+    # için küçük bir yardımcı. var: ilgili StringVar; load_cmd: "Load"
+    # butonuna basınca çağrılacak fonksiyon.
     def _add_file_row(self, parent, label, var, load_cmd):
         frame = ttk.Frame(parent)
         frame.pack(fill=tk.X, pady=2)
@@ -2263,6 +2292,8 @@ class BarPropertySolverTab:
         )).pack(side=tk.LEFT)
         ttk.Button(frame, text="Load", command=load_cmd).pack(side=tk.LEFT, padx=2)
 
+    # log: arka plan thread'inden güvenli şekilde log paneline mesaj eklemek
+    # için - gerçek widget güncellemesi root.after(0, ...) ile ana (GUI) thread'e devredilir.
     def log(self, msg):
         def _do():
             self.log_text.insert(tk.END, msg + "\n")
@@ -2274,6 +2305,9 @@ class BarPropertySolverTab:
 
     # ==================== BDF FILE OPS ====================
 
+    # _add_maneuver_bdf / _remove_maneuver_bdf: "Maneuver BDF (Offset Source)"
+    # listesine dosya ekleme/çıkarma. self.maneuver_bdfs listesi ve
+    # maneuver_listbox widget'ı her zaman aynı index sırasında senkron tutulur.
     def _add_maneuver_bdf(self):
         files = filedialog.askopenfilenames(filetypes=[("BDF", "*.bdf *.dat *.nas"), ("All", "*.*")])
         for f in files:
@@ -2288,6 +2322,9 @@ class BarPropertySolverTab:
             self.maneuver_listbox.delete(idx)
             del self.maneuver_bdfs[idx]
 
+    # add_bdf / remove_bdf: "All BDF Files" listesine dosya ekleme/çıkarma -
+    # yukarıdaki maneuver listesiyle aynı mantık, fakat self.bdf_paths/
+    # bdf_listbox çifti üzerinde çalışır ve durum etiketini günceller.
     def add_bdf(self):
         paths = filedialog.askopenfilenames(filetypes=[("BDF", "*.bdf *.dat *.nas"), ("All", "*.*")])
         for p in paths:
@@ -2305,6 +2342,12 @@ class BarPropertySolverTab:
         self.bdf_status.config(text=f"{len(self.bdf_paths)} BDF files selected", foreground="blue")
 
     # ==================== BDF LOADING ====================
+    # load_bdf: "All BDF Files" listesindeki her dosyayı pyNastran BDF() ile
+    # okur (xref=False - cross-reference adımı atlanır, çünkü aşağıda sadece
+    # ham alanlar (.pid, .type, .dim, .t) okunuyor, *_ref nesneleri veya
+    # .Area()/.Centroid() gibi geometri metodları hiç kullanılmıyor), PBARL
+    # dim1/dim2 ve PSHELL kalınlıklarını çıkarır ve "orijinal BDF değeri"
+    # olarak saklar (Excel'den gelen değerler bunların üzerine yazılacaktır).
     def load_bdf(self):
         if not self.bdf_paths:
             messagebox.showerror("Error", "Add at least one BDF file")
@@ -2319,7 +2362,7 @@ class BarPropertySolverTab:
 
         t_load_start = time.time()
         try:
-            path = self.bdf_paths[0]
+            path = self.bdf_paths[0]  # ilk dosya "ana" BDF olarak kabul edilir (self.bdf_model bu olacak)
 
             # Parse every file in All BDF Files exactly once. self.bdf_model
             # below is just an alias for the first one - it used to be parsed
@@ -2334,6 +2377,12 @@ class BarPropertySolverTab:
             # geometry methods like .Area()/.Centroid(), none of which this
             # tool calls anymore. Skipping that whole extra cross-reference
             # pass cuts a real chunk off every BDF load.
+            # Her BDF dosyası için: boş bir BDF() nesnesi oluştur, dosyayı oku
+            # (validate=False: pyNastran'ın kart doğrulamasını atla - zaten
+            # bu dosyalar gerçek Nastran tarafından önceden doğrulandı;
+            # read_includes=False: INCLUDE kartlarının içeriğini bu aşamada
+            # genişletme - burada sadece ana dosyanın property/eleman
+            # bilgisi gerekiyor), ve sonucu bdf_models listesine ekle.
             self.bdf_models = []
             for bdf_path in self.bdf_paths:
                 self.log(f"\n  Loading: {os.path.basename(bdf_path)}")
@@ -2344,6 +2393,8 @@ class BarPropertySolverTab:
                           f"({len(model.nodes)} nodes, {len(model.elements)} elements)")
                 self.bdf_models.append({'path': bdf_path, 'model': model, 'name': os.path.basename(bdf_path)})
 
+            # self.bdf_model: geriye dönük uyumluluk için - ilk dosyanın
+            # modeline kısayol (alias), ayrı bir parse değil.
             self.bdf_model = self.bdf_models[0]['model']
 
             self.log(f"\n  Main BDF: {os.path.basename(path)}")
@@ -2363,7 +2414,8 @@ class BarPropertySolverTab:
                 elif elem.type in ['CBAR', 'CBEAM']:
                     bar_count += 1
 
-            # Extract PBARL dimensions from BDF
+            # PBARL kartlarından dim1/dim2 boyutlarını çıkar. dims[0]=dim1,
+            # dims[1]=dim2; sadece bir boyut varsa ikisi de ona eşitlenir.
             self.pbarl_dims = {}
             for pid, prop in self.bdf_model.properties.items():
                 if prop.type == 'PBARL':
@@ -2373,7 +2425,9 @@ class BarPropertySolverTab:
                     elif len(dims) == 1:
                         self.pbarl_dims[pid] = {'dim1': dims[0], 'dim2': dims[0]}
 
-            # Store original dim1 from BDF as the original thicknesses
+            # BDF'teki orijinal dim1 değerlerini "original_bar_thicknesses"
+            # olarak sakla - bunlar Excel'de bu PID için değer YOKSA
+            # kullanılacak referans değerlerdir.
             self.original_bar_thicknesses = {}
             if self.pbarl_dims:
                 self.log(f"  PBARL dimensions extracted: {len(self.pbarl_dims)} properties")
@@ -2397,6 +2451,9 @@ class BarPropertySolverTab:
                         self.original_skin_thicknesses[pid] = t
             if self.original_skin_thicknesses:
                 self.log(f"  PSHELL thicknesses extracted: {len(self.original_skin_thicknesses)} properties (fallback for offset calc)")
+            # Excel değerleri varsa onları, yoksa BDF'ten okunan bu
+            # orijinal PSHELL kalınlıklarını "etkin" (current_skin_thicknesses)
+            # değer olarak birleştir.
             self._refresh_effective_skin_thicknesses()
 
             self.log(f"  Shells: {shell_count}, Bars: {bar_count}")
@@ -2408,6 +2465,7 @@ class BarPropertySolverTab:
                 foreground="green"
             ))
 
+            # Çıktı klasörü henüz boşsa, ilk BDF'in bulunduğu klasörü varsayılan olarak öner.
             if not self.output_folder.get():
                 out_dir = os.path.dirname(path)
                 self.root.after(0, lambda: self.output_folder.set(out_dir))
@@ -2436,7 +2494,7 @@ class BarPropertySolverTab:
         t_start = time.time()
         try:
             xl = pd.ExcelFile(path)
-            self.log(f"  Sheets: {xl.sheet_names}")
+            self.log(f"  Sheets: {xl.sheet_names}")  # kullanıcıya hangi sayfaların bulunduğunu göster (teşhis amaçlı)
 
             # ---- Locate the Bar/Skin Property sheets. No structure-grouping
             # sheet is read anymore - there is no sweep to group by, only a
@@ -2444,13 +2502,16 @@ class BarPropertySolverTab:
             # 'Bar Property'/'Skin Property' gets that value applied; any PID
             # without one keeps its original BDF value untouched. ----
             bar_dim_sheet = skin_sheet = None
+            # 1. geçiş: sayfa adını normalize et (alt çizgi/boşluk/tire sil,
+            # küçük harfe çevir) ve TAM eşleşme ara ("Bar_Property", "bar property" vb. hepsi "barproperty" olur).
             for sheet in xl.sheet_names:
                 sl = sheet.lower().replace('_', '').replace(' ', '').replace('-', '')
                 if sl == 'barproperty':
                     bar_dim_sheet = sheet
                 elif sl == 'skinproperty':
                     skin_sheet = sheet
-            # Fallback partial match for Bar/Skin Property sheets
+            # 2. geçiş: tam eşleşme bulunamadıysa, normalize edilmiş adda
+            # "bar"+"prop" veya "skin"+"prop" alt dizisi arayan daha gevşek eşleşme.
             for sheet in xl.sheet_names:
                 sl = sheet.lower().replace('_', '').replace(' ', '').replace('-', '')
                 if bar_dim_sheet is None and 'bar' in sl and 'prop' in sl:
@@ -2464,6 +2525,7 @@ class BarPropertySolverTab:
             if bar_dim_sheet:
                 self.log(f"\n  Reading bar Dim1/Dim2 from '{bar_dim_sheet}'...")
                 df_bar = pd.read_excel(xl, sheet_name=bar_dim_sheet)
+                # Sütunlar sırasıyla: PID, Dim1, (opsiyonel) Dim2. Dim2 yoksa Dim1 ile aynı kabul edilir.
                 for _, row in df_bar.iterrows():
                     try:
                         pid = int(row.iloc[0])
@@ -2472,7 +2534,7 @@ class BarPropertySolverTab:
                         self.bar_properties[pid] = {'dim1': d1, 'dim2': d2}
                         self.current_bar_thicknesses[pid] = d1
                     except Exception:
-                        pass
+                        pass  # sayıya çevrilemeyen/eksik satırı sessizce atla
                 self.log(f"    Bar dimensions loaded: {len(self.bar_properties)} properties")
             else:
                 self.log("  No 'Bar Property' sheet found - bar dimensions will be left as-is (BDF values).")
@@ -2492,8 +2554,8 @@ class BarPropertySolverTab:
                 self.log(f"    Skin thicknesses loaded: {len(self.skin_properties)} properties")
             else:
                 self.log("  No 'Skin Property' sheet found - skin thickness will be left as-is (BDF values).")
-            # Recompute the effective thickness (Excel first, BDF fallback) now,
-            # regardless of whether load_bdf() has run yet or not.
+            # Etkin kalınlığı (önce Excel, yoksa BDF) şimdi yeniden hesapla -
+            # load_bdf() bundan önce çalışmış olsun ya da olmasın bu çağrı güvenlidir.
             self._refresh_effective_skin_thicknesses()
 
             total = len(self.bar_properties)
@@ -2503,7 +2565,7 @@ class BarPropertySolverTab:
                 foreground="green"
             )
             self.properties_loaded = True
-            self.btn_start.config(state=tk.NORMAL)
+            self.btn_start.config(state=tk.NORMAL)  # artık SOLVE butonu tıklanabilir
 
         except Exception as e:
             self.log(f"ERROR after {time.time() - t_start:.1f}s: {e}")
@@ -2528,6 +2590,10 @@ class BarPropertySolverTab:
         self.current_skin_thicknesses = merged
 
     # ==================== ELEMENT IDs (OFFSET) ====================
+    # load_element_ids: "Offset Element IDs" Excel'ini oku. Bu Excel'de iki
+    # tür sayfa olabilir - adında "landing" geçen (göçme/landing elemanları)
+    # ve adında hem "bar" hem "offset" geçen (bar offset elemanları). Her
+    # sayfanın ilk sütunu eleman ID listesi olarak okunur.
     def load_element_ids(self):
         path = self.element_excel_path.get()
         if not path:
@@ -2575,6 +2641,11 @@ class BarPropertySolverTab:
 
         new_lines = []
         i = 0
+        # Dosyayı satır satır tara. Her "PBARL" ana kartı için PID'i sabit
+        # genişlikli (8-karakter) alan olarak oku (line[8:16]); bu PID
+        # thickness_overrides içindeyse kartın DEVAM satırını (continuation -
+        # "+" veya "*" ile başlayan ya da boşlukla başlayıp içerik taşıyan
+        # satır) bulup dim1/dim2 alanlarını yeni kalınlıkla değiştir.
         while i < len(lines):
             line = lines[i]
 
@@ -2582,8 +2653,8 @@ class BarPropertySolverTab:
                 try:
                     pid = int(line[8:16].strip())
                     if pid in thickness_overrides:
-                        t = max(0.1, thickness_overrides[pid])
-                        new_lines.append(line)
+                        t = max(0.1, thickness_overrides[pid])  # kalınlık 0'ın altına/sıfıra düşmesin
+                        new_lines.append(line)  # PBARL ana satırı değişmeden kalır (PID/tip burada)
                         i += 1
                         while i < len(lines) and (
                             lines[i].startswith('+') or lines[i].startswith('*') or
@@ -2592,12 +2663,13 @@ class BarPropertySolverTab:
                             cont = lines[i]
                             if cont.strip() and not cont.strip().startswith('$'):
                                 try:
+                                    # dim2'yi devam satırından oku (16:24) - eksikse yeni dim1 (t) ile aynı kabul et.
                                     original_dim2 = cont[16:24].strip()
                                     dim2_val = float(original_dim2) if original_dim2 else t
                                 except:
                                     dim2_val = t
-                                cont_name = cont[:8]
-                                rest = cont[24:] if len(cont) > 24 else '\n'
+                                cont_name = cont[:8]  # devam satırının ilk 8 karakteri ("+" süreklilik işareti vb.) korunur
+                                rest = cont[24:] if len(cont) > 24 else '\n'  # dim2'den sonraki alanlar (varsa) değişmeden kalır
                                 new_cont = f"{cont_name}{t:8.4f}{dim2_val:8.4f}{rest}"
                                 new_lines.append(new_cont)
                             else:
@@ -2647,6 +2719,10 @@ class BarPropertySolverTab:
         i = 0
         bar_updated = 0
         skin_updated = 0
+        # _write_bdf_for_model'deki PBARL mantığıyla aynı sabit-genişlik
+        # alan okuma/yazma yaklaşımı, ama burada TÜM self.bar_properties
+        # PID'leri (sweep grubu kısıtlaması yok) ve ayrıca PSHELL kalınlığı
+        # da işleniyor.
         while i < len(lines):
             line = lines[i]
 
@@ -2674,6 +2750,8 @@ class BarPropertySolverTab:
 
             elif line.startswith('PSHELL'):
                 try:
+                    # PSHELL kart formatı: PID alanı [8:16], ardından MID1 [16:24],
+                    # kalınlık (t) alanı [24:32] - bu yüzden [:24] + yeni t + [32:] sonrası.
                     pid = int(line[8:16].strip())
                     if pid in self.skin_properties:
                         t = self.skin_properties[pid]['thickness']

@@ -5284,6 +5284,10 @@ class JointRunTab:
         return n_ok, n
 
     # ==================== RUN (FULL PIPELINE) ====================
+    # start_run: "RUN" butonunun komutu - 6 aşamanın (License Checker,
+    # klasör hazırlığı, Load Modifying, RSS Case Finding, Limit Stress
+    # Check, Joint Run) TÜM girdilerini önceden doğrular, sonra gerçek işi
+    # (_run_pipeline) arka plan thread'inde başlatır.
     def start_run(self):
         if not self.h5_folder.get().strip() or not os.path.isdir(self.h5_folder.get().strip()):
             messagebox.showerror("Error", "Select a valid Joint Load H5 Folder")
@@ -5342,8 +5346,10 @@ class JointRunTab:
                       "RSS CASE FINDING -> LIMIT STRESS CHECK -> JOINT RUN")
             self.log("#" * 70)
 
+            # Aşama 1: Lisans kontrolü (bir kez, beklenmeden).
             self._run_license_checker_core()
 
+            # Aşama 2: her Set için klasör hazırlığı.
             n_done, n_total = self._prepare_joint_folders_core()
             if n_total == 0:
                 self.log("\nSTOPPED: no Joint_Loads_*.h5 files found - nothing to run.")
@@ -5352,18 +5358,22 @@ class JointRunTab:
                 self.log("\nSTOPPED: no Set folder was prepared - Load Modifying not started.")
                 return
 
+            # Aşama 3: Load Modifying (paralel).
             n_lm_ok, n_lm = self._run_load_modifying_core()
             if n_lm == 0:
                 self.log("\nSTOPPED: no Set folder found for Load Modifying.")
                 return
 
+            # Aşama 4: RSS Case Finding (paralel).
             n_ok, n_rss = self._run_rss_case_finding_core()
             if n_rss == 0:
                 self.log("\nSTOPPED: no Set folder found for RSS Case Finding.")
                 return
 
+            # Aşama 5: Limit Stress Check sayfalarının doldurulması.
             n_written, n_lsc = self._write_limit_stress_check_core()
 
+            # Aşama 6: Joint Run exe (paralel havuz).
             n_jr_ok, n_jr = self._run_joint_run_exe_core()
 
             self.root.after(0, lambda: self.progress_var.set(100))
@@ -5384,6 +5394,9 @@ class JointRunTab:
             self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
 
 
+# ============================================================================
+# FullRunTab  --  "Full Run" sekmesi (Tab 6)
+# ============================================================================
 class FullRunTab:
     """Chains Understanding Structure Type -> Post Processing -> Joint Run
     end to end from one button, by driving the three existing tab objects

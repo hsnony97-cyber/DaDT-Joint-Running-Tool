@@ -999,81 +999,128 @@ class IntegratedBDFRFTool:
 
         return unique_lines, unique_common_includes, subcase_info_map
 
+    # extract_param_cards: Bulk Data içindeki tüm PARAM kartlarını (örn.
+    # "PARAM,POST,-1" gibi NASTRAN çözüm parametreleri) bulur, aynı isimli
+    # PARAM'ın BİRDEN FAZLA KEZ geçmesini (duplicate) engeller, ve PARAM
+    # kartlarını diğer kartlardan AYRI bir listeye çıkarır (çağıran kod
+    # bunları muhtemelen dosyanın başka bir yerine, örn. en üste, topluca
+    # yazmak istiyor).
     def extract_param_cards(self, bulk_data):
         """
         Bulk data'dan PARAM kartlarını ayırır.
         Returns: (param_lines, remaining_bulk_data)
         """
         lines = bulk_data.split('\n')
-        param_lines = []
-        other_lines = []
-        
-        seen_params = set()  # Duplicate PARAM kontrolü
-        
+        param_lines = []    # Bulunan PARAM kartları (ve devam satırları) burada toplanır
+        other_lines = []    # PARAM olmayan tüm diğer satırlar burada toplanır
+
+        seen_params = set()  # Duplicate PARAM kontrolü - daha önce eklenen PARAM isimleri
+
         i = 0
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
             upper = stripped.upper()
-            
+
             if upper.startswith('PARAM'):
-                # PARAM kartı - continuation satırlarını da al
+                # Bir PARAM kartı bulduk. Bu kart birden fazla satıra
+                # yayılmış (devam/continuation satırları olan) olabilir -
+                # bu bloğu toplayacağımız liste.
                 param_block = [line]
-                
-                # PARAM name'ini çıkar (duplicate kontrolü için)
+
+                # PARAM'ın İSMİNİ çıkar (örn. "PARAM,POST,-1" -> isim "POST")
+                # - bu isim, aynı parametrenin tekrar eklenip eklenmediğini
+                # kontrol etmek için kullanılacak.
                 param_name = None
                 try:
                     if ',' in line:
+                        # Virgülle ayrılmış (free-field) format: "PARAM,POST,-1"
+                        # -> parts[0]="PARAM", parts[1]="POST", isim parts[1].
                         parts = line.split(',')
                         if len(parts) > 1:
                             param_name = parts[1].strip().upper()
                     else:
+                        # Sabit genişlikli (fixed-field) format: isim 8-16.
+                        # karakterler arasında.
                         if len(line) >= 16:
                             param_name = line[8:16].strip().upper()
                 except:
                     pass
-                
+
                 i += 1
-                # Continuation satırlarını kontrol et
+                # Bu PARAM kartının devamı niteliğindeki satırları da topla.
+                # Bir satır şu durumlarda "devam satırı" sayılır:
+                #  - '+' veya '*' ile başlıyorsa (klasik continuation işareti), VEYA
+                #  - 8 boşlukla başlıyor, boş değil, '$' (yorum) ile
+                #    başlamıyor VE bilinen bir kart ismiyle (GRID, CBAR vb.)
+                #    başlamıyorsa (yani yeni bir kart değil, önceki kartın
+                #    devamı gibi görünüyorsa).
                 while i < len(lines):
                     next_line = lines[i]
                     next_stripped = next_line.strip()
-                    is_cont = (next_line.startswith('+') or 
+                    is_cont = (next_line.startswith('+') or
                               next_line.startswith('*') or
-                              (next_line.startswith('        ') and next_stripped and 
+                              (next_line.startswith('        ') and next_stripped and
                                not next_stripped.startswith('$') and
-                               not any(next_stripped.upper().startswith(card) for card in 
-                                      ['PARAM', 'GRID', 'CBAR', 'CBEAM', 'CQUAD', 'CTRIA', 
+                               not any(next_stripped.upper().startswith(card) for card in
+                                      ['PARAM', 'GRID', 'CBAR', 'CBEAM', 'CQUAD', 'CTRIA',
                                        'MAT', 'PBAR', 'PSHELL', 'FORCE', 'MOMENT', 'RBE',
                                        'CORD', 'SPC', 'MPC', 'INCLUDE', 'ENDDATA'])))
                     if is_cont and next_stripped:
                         param_block.append(next_line)
                         i += 1
                     else:
+                        # Devam satırı değilse (yeni bir kart başlıyorsa)
+                        # döngüden çık - bu PARAM bloğu tamamlandı.
                         break
-                
-                # Duplicate kontrolü
+
+                # Bu isimde bir PARAM DAHA ÖNCE eklenmemişse, bloğu sonuç
+                # listesine ekle ve ismini "görüldü" kümesine kaydet. Daha
+                # önce eklenmiş bir isimse (duplicate) bu blok tamamen ATLANIR.
                 if param_name and param_name not in seen_params:
                     seen_params.add(param_name)
                     param_lines.extend(param_block)
             else:
+                # PARAM kartı değilse olduğu gibi "diğer satırlar" listesine ekle.
                 other_lines.append(line)
                 i += 1
-        
+
+        # (PARAM kartları, geri kalan bulk data) ikilisini döndür.
         return param_lines, '\n'.join(other_lines)
-    
+
+    # check_and_remove_duplicates: collect_all_lines_from_masters'tan gelen
+    # devasa, birden fazla dosyadan birleştirilmiş satır listesinde kalan
+    # (orada normalize edilmiş METİN bazlı duplicate temizliğinden kaçabilmiş)
+    # tekrar eden NASTRAN kartlarını, NASTRAN'ın kendi mantığına göre daha
+    # akıllıca tespit edip ayıklar. İki farklı duplicate kontrol stratejisi
+    # kullanılıyor:
+    #   1. "ID bazlı" kartlar (GRID, element'ler, property'ler, materyaller,
+    #      koordinat sistemleri): bu kartlarda asıl kimlik onların ID
+    #      numarasıdır - aynı ID iki kez tanımlanırsa (içerikleri farklı bile
+    #      olsa) NASTRAN hata verir, bu yüzden SADECE ID'ye bakılarak
+    #      ikincisi atılır.
+    #   2. "Satır bazlı" kartlar (SPC, FORCE, MOMENT, MPC, LOAD, TEMP, TEMPD):
+    #      bunlarda aynı ID birden fazla kez meşru olarak görülebilir (örn.
+    #      aynı SET ID'sine farklı düğümler için ayrı SPC kartları), bu
+    #      yüzden sadece kartın TAMAMI (tüm alanlarıyla) birebir AYNI ise
+    #      duplicate sayılır.
     def check_and_remove_duplicates(self, bulk_data):
         """
         Bulk data içindeki duplicate kartları tespit edip kaldırır.
-        
+
         - Element/Property/Material kartları: ID bazlı kontrol (aynı ID → duplicate)
         - SPC/FORCE/MOMENT kartları: Tüm satır bazlı kontrol (birebir aynıysa → duplicate)
         """
         self.log1("    Checking for duplicate entries...")
-        
+
         lines = bulk_data.split('\n')
-        
-        # ID bazlı kontrol yapılacak kartlar
+
+        # ID bazlı kontrol yapılacak kart türleri. Her kart tipi için ayrı
+        # bir set() tutuluyor - "bu tipte, şu ID'ler şu ana kadar görüldü"
+        # bilgisini saklamak için. (GRID düğümleri, çubuk/kabuk/katı
+        # elemanlar, rijit bağlantılar RBE2/RBE3, kesit özellikleri PBAR/
+        # PSHELL/PCOMP vb., malzeme kartları MAT1/MAT2/..., koordinat
+        # sistemleri CORD1x/CORD2x.)
         id_based_cards = {
             'GRID': set(),
             'CBAR': set(),
@@ -1125,121 +1172,155 @@ class IntegratedBDFRFTool:
             'CORD1S': set(),
             'CORD2S': set(),
         }
-        
-        # Tüm satır bazlı kontrol yapılacak kartlar (SPC, FORCE, MOMENT, MPC)
+
+        # Satır bazlı (ID değil, kartın TAMAMI) kontrol yapılacak kart
+        # türleri: yük/sınır şartı kartları.
         line_based_cards = ['SPC', 'SPC1', 'FORCE', 'MOMENT', 'MPC', 'LOAD', 'TEMP', 'TEMPD']
-        seen_full_lines = set()  # Tüm satır için
-        
-        # İstatistikler
+        seen_full_lines = set()  # Satır-bazlı kartlar için "şu ana kadar görülen" normalize edilmiş tam kart metinleri
+
+        # Her kart tipinden kaç tane duplicate (tekrar) bulunup atıldığını
+        # saymak için - en sonda kullanıcıya özet rapor göstermek amacıyla.
         duplicate_counts = {}
-        
+
+        # Sonuçta (duplicate'ler çıkarılmış hali) kalacak satırlar.
         result_lines = []
         i = 0
-        
+
+        # Tüm satırları, continuation (devam) satırlarını blok halinde
+        # atlayabilmek için while döngüsüyle (elle ilerletilen indeksle) tara.
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
-            
-            # Boş veya comment satırı
+
+            # Boş satır veya '$' ile başlayan yorum satırı - duplicate
+            # kontrolüne tabi değil, direkt sonuç listesine ekle ve geç.
             if not stripped or stripped.startswith('$'):
                 result_lines.append(line)
                 i += 1
                 continue
-            
+
             upper = stripped.upper()
-            
-            # Hangi tip kart?
+
+            # Bu satırın hangi kart TÜRÜNE ait olduğunu (varsa) tespit et.
             card_type = None
             is_line_based = False
-            
-            # Önce line-based kartları kontrol et
+
+            # Önce satır-bazlı (line_based_cards) listesinde bir eşleşme var
+            # mı diye bak. Kart ismi tam eşleşmeli VEYA ismin hemen
+            # ardından boşluk/virgül/tab/yıldız gelmeli (örn. "SPC1" satırını
+            # yanlışlıkla "SPC" ile eşleştirmemek için bu kontrol önemli).
             for ctype in line_based_cards:
-                if upper.startswith(ctype) and (len(upper) == len(ctype) or 
+                if upper.startswith(ctype) and (len(upper) == len(ctype) or
                     upper[len(ctype)] in ' ,\t*'):
                     card_type = ctype
                     is_line_based = True
                     break
-            
-            # Sonra ID-based kartları kontrol et
+
+            # Satır-bazlı bir kart değilse, ID-bazlı kart listesinde
+            # (id_based_cards sözlüğünün anahtarları) bir eşleşme ara.
             if not card_type:
                 for ctype in id_based_cards.keys():
-                    if upper.startswith(ctype) and (len(upper) == len(ctype) or 
+                    if upper.startswith(ctype) and (len(upper) == len(ctype) or
                         upper[len(ctype)] in ' ,\t*'):
                         card_type = ctype
                         break
-            
+
+            # Bilinen bir kart türüyle eşleşti mi?
             if card_type:
                 if is_line_based:
-                    # LINE-BASED: Tüm satırı (ve continuation'ları) karşılaştır
+                    # ---- SATIR-BAZLI KONTROL (SPC/FORCE/MOMENT/MPC/LOAD/TEMP/TEMPD) ----
+                    # Bu kartın (varsa devam satırlarıyla birlikte) TÜM
+                    # metnini topla - karşılaştırma TÜM kart üzerinden yapılacak.
                     full_card = [line]
                     j = i + 1
-                    
-                    # Continuation satırlarını topla
+
+                    # Aynı "devam satırı mı?" testi (PARAM/check_and_remove
+                    # fonksiyonlarındaki ile aynı mantık): '+' / '*' ile
+                    # başlıyor, YA DA 8 boşlukla başlayıp boş/yorum olmayan
+                    # ve bilinen bir yeni kart ismiyle başlamayan bir satır.
                     while j < len(lines):
                         next_line = lines[j]
                         next_stripped = next_line.strip()
-                        is_cont = (next_line.startswith('+') or 
+                        is_cont = (next_line.startswith('+') or
                                   next_line.startswith('*') or
-                                  (next_line.startswith('        ') and next_stripped and 
+                                  (next_line.startswith('        ') and next_stripped and
                                    not next_stripped.startswith('$') and
-                                   not any(next_stripped.upper().startswith(ct) for ct in 
+                                   not any(next_stripped.upper().startswith(ct) for ct in
                                           list(id_based_cards.keys()) + line_based_cards)))
                         if is_cont and next_stripped:
                             full_card.append(next_line)
                             j += 1
                         else:
                             break
-                    
-                    # Normalize edilmiş tam kart
+
+                    # Kartın TÜM satırlarını (boşluk farklarına duyarsız
+                    # şekilde normalize edip) '|' karakteriyle birleştirerek
+                    # TEK bir karşılaştırma anahtarı (normalized_card) oluştur.
                     normalized_card = '|'.join(' '.join(l.split()) for l in full_card)
-                    
+
                     if normalized_card in seen_full_lines:
-                        # Duplicate - atla
+                        # Bu TAM kart daha önce görülmüş (birebir aynı) -
+                        # duplicate sayılır, sonuç listesine EKLENMEDEN atlanır.
                         if card_type not in duplicate_counts:
                             duplicate_counts[card_type] = 0
                         duplicate_counts[card_type] += 1
                         i = j
                         continue
                     else:
+                        # İlk kez görülüyor - "görüldü" kümesine ekle ve
+                        # kartın TÜM satırlarını sonuç listesine ekle.
                         seen_full_lines.add(normalized_card)
                         result_lines.extend(full_card)
                         i = j
                         continue
                 else:
-                    # ID-BASED: Sadece ID'ye bak
+                    # ---- ID-BAZLI KONTROL (GRID, elemanlar, property'ler, materyaller, koordinatlar) ----
+                    # Bu kart tipinde sadece ID numarasına bakılır - kartın
+                    # geri kalan içeriği (koordinatlar, malzeme değerleri
+                    # vb.) karşılaştırmaya dahil edilmez.
                     card_id = None
                     try:
                         if ',' in line:
+                            # Virgülle ayrılmış format: 2. alan (parts[1]) ID'dir.
                             parts = line.split(',')
                             if len(parts) > 1:
                                 id_str = parts[1].strip()
                                 if id_str:
                                     card_id = int(float(id_str))
                         else:
+                            # Sabit genişlikli format: ID, 8-16. karakterler arası.
                             if len(line) >= 16:
                                 id_str = line[8:16].strip()
                                 if id_str:
                                     card_id = int(float(id_str))
                     except:
+                        # ID okunamazsa (beklenmedik format) sessizce geç -
+                        # bu durumda card_id None kalır ve aşağıdaki
+                        # "if card_id is not None" bloğuna hiç girilmez,
+                        # satır normal şekilde (duplicate kontrolü yapılmadan) eklenir.
                         pass
-                    
+
                     if card_id is not None:
                         if card_id in id_based_cards[card_type]:
-                            # Duplicate - atla
+                            # Bu ID, bu kart tipinde DAHA ÖNCE görülmüş -
+                            # duplicate. Sayacı artır.
                             if card_type not in duplicate_counts:
                                 duplicate_counts[card_type] = 0
                             duplicate_counts[card_type] += 1
-                            
-                            # Continuation satırlarını da atla
+
+                            # Bu kartın devam satırlarını da (aynı "devam
+                            # satırı mı?" testiyle) bul ve hepsini ATLA -
+                            # sadece ilk satırı değil, kartın TAMAMINI
+                            # sonuçtan çıkarmamız gerekiyor.
                             i += 1
                             while i < len(lines):
                                 next_line = lines[i]
                                 next_stripped = next_line.strip()
-                                is_cont = (next_line.startswith('+') or 
+                                is_cont = (next_line.startswith('+') or
                                           next_line.startswith('*') or
-                                          (next_line.startswith('        ') and next_stripped and 
+                                          (next_line.startswith('        ') and next_stripped and
                                            not next_stripped.startswith('$') and
-                                           not any(next_stripped.upper().startswith(ct) for ct in 
+                                           not any(next_stripped.upper().startswith(ct) for ct in
                                                   list(id_based_cards.keys()) + line_based_cards)))
                                 if is_cont and next_stripped:
                                     i += 1
@@ -1247,12 +1328,24 @@ class IntegratedBDFRFTool:
                                     break
                             continue
                         else:
+                            # Bu ID ilk kez görülüyor - "görüldü" kümesine ekle
+                            # (devam satırları ayrıca işlenmeden, normal akışla
+                            # - yani aşağıdaki result_lines.append(line) ile -
+                            # sonuç listesine eklenecek, çünkü burada sadece
+                            # İLK satır/ID kontrol edildi, continue YOK).
                             id_based_cards[card_type].add(card_id)
-            
+
+            # Buraya gelindiyse: ya bilinen bir kart tipi değildi, ya da
+            # ID-bazlı bir karttı ve ilk kez görülüyordu (duplicate değildi)
+            # - her iki durumda da bu TEK satırı sonuç listesine ekle ve
+            # bir sonraki satıra geç. (ID-bazlı kartların devam satırları da
+            # döngünün bir sonraki turlarında aynı şekilde - "bilinen kart
+            # tipiyle eşleşmedikleri için" - buradan teker teker eklenmiş olur.)
             result_lines.append(line)
             i += 1
-        
-        # Rapor
+
+        # ---- Özet rapor ----
+        # Hangi kart tipinden kaç tane duplicate silindiğini kullanıcıya logla.
         if duplicate_counts:
             self.log1("    Removed duplicates:")
             for ctype, count in sorted(duplicate_counts.items()):
@@ -1261,9 +1354,20 @@ class IntegratedBDFRFTool:
             self.log1(f"      TOTAL: {total} duplicate entries removed")
         else:
             self.log1("    No duplicates found")
-        
+
+        # Duplicate'leri temizlenmiş satırları tekrar tek bir metne
+        # (newline ile birleştirerek) döndür.
         return '\n'.join(result_lines)
-    
+
+    # merge_lines_with_pynastran: collect_all_lines_from_masters'tan gelen
+    # (ve check_and_remove_duplicates ile temizlenmiş) satır listesini GERÇEK
+    # bir BDF dosyası olarak geçici (temp) bir dosyaya yazar, sonra bu dosyayı
+    # pyNastran ile OKUTARAK (içindeki INCLUDE kartlarını da takip ederek)
+    # tam/düzgün bir model haline getirir ve TEKRAR BDF formatında geri yazdırır
+    # - böylece pyNastran'ın kendi iç format düzenlemesinden/doğrulamasından
+    # geçmiş, tutarlı bir bulk data elde edilir. pyNastran bu işlemi
+    # yapamazsa (örn. hâlâ bir duplicate ID hatası varsa), expand_includes_
+    # manually() ile daha "kaba" ama garantili bir yönteme geri düşülür.
     def merge_lines_with_pynastran(self, lines):
         """
         Satırları temp BDF'e yazıp pyNastran ile merge eder.
@@ -1273,13 +1377,17 @@ class IntegratedBDFRFTool:
         if not lines:
             self.log1("    WARNING: No lines to merge!")
             return ""
-        
+
+        # Sistemin geçici dosya klasöründe (örn. Windows'ta %TEMP%) çalışma dosyası yolu.
         temp_bdf_path = os.path.join(tempfile.gettempdir(), "_temp_lines_to_merge.bdf")
-        
+
         self.log1(f"    Writing {len(lines)} lines to temp BDF...")
-        
+
         try:
-            # Temp BDF oluştur
+            # Geçici, GEÇERLİ bir BDF dosyası oluştur: minimal bir case-control
+            # bölümü (SOL 101 / CEND / BEGIN BULK) ekleyip ardından TÜM
+            # toplanan satırları yaz, en sona ENDDATA koy. pyNastran, geçerli
+            # bir BDF dosyası beklediği için bu "iskelet" gerekli.
             with open(temp_bdf_path, 'w', encoding='utf-8') as f:
                 f.write("$ Temporary BDF for merging\n")
                 f.write("SOL 101\n")
@@ -1288,46 +1396,75 @@ class IntegratedBDFRFTool:
                 for line in lines:
                     f.write(line + "\n")
                 f.write("ENDDATA\n")
-            
+
             self.log1(f"    Reading temp BDF with pyNastran (following includes)...")
-            
+
             try:
+                # pyNastran'ın BDF sınıfıyla bu geçici dosyayı oku.
+                # xref=False: cross-reference (referans çözümleme) YAPMA -
+                # sadece ham kartları oku, daha hızlı.
+                # read_includes=True: içindeki INCLUDE kartlarının
+                # gösterdiği dosyaları da OTOMATİK olarak açıp içeriklerini
+                # modele dahil et (asıl istediğimiz bu).
                 bdf = BDF(debug=False)
                 # allow_duplicate_ids ile dene
-                bdf.read_bdf(temp_bdf_path, validate=False, xref=False, 
+                bdf.read_bdf(temp_bdf_path, validate=False, xref=False,
                             read_includes=True, save_file_structure=False)
-                
+
+                # Okuma başarılıysa modeldeki eleman/özellik sayılarını logla
+                # (kullanıcıya "şu kadar düğüm/eleman okundu" bilgisi vermek için).
                 self.log1(f"      Loaded: {len(bdf.nodes)} nodes, {len(bdf.elements)} elements")
                 self.log1(f"      Properties: {len(bdf.properties)}, Materials: {len(bdf.materials)}")
                 self.log1(f"      Coords: {len(bdf.coords)}, MPCs: {len(bdf.mpcs)}, SPCs: {len(bdf.spcs)}")
-                
-                # Merge edilmiş BDF'i yaz
+
+                # pyNastran'ın kendi write_bdf() metoduyla modeli TEKRAR bir
+                # BDF dosyasına yaz - bu, pyNastran'ın kartları kendi
+                # standart formatında (tutarlı sütun genişlikleri vb. ile)
+                # yeniden ürettiği, "temizlenmiş" bir çıktı dosyasıdır.
+                # size=8: sabit 8 karakterlik (small field) format kullan.
                 merged_temp_path = os.path.join(tempfile.gettempdir(), "_temp_merged.bdf")
                 bdf.write_bdf(merged_temp_path, size=8, is_double=False)
-                
+
+                # pyNastran'ın yazdığı dosyayı tekrar metin olarak oku.
                 with open(merged_temp_path, 'r', errors='ignore') as f:
                     merged_content = f.read()
-                
+
+                # Artık işimiz bitti, geçici "merged" dosyasını sil.
                 if os.path.exists(merged_temp_path): os.remove(merged_temp_path)
-                
+
             except Exception as e:
+                # pyNastran okuma/yazma sırasında bir hata verdi (örn. hâlâ
+                # çözülmemiş bir duplicate ID ya da format sorunu olabilir).
+                # Bu durumda pyNastran'ı tamamen devre dışı bırakıp, daha
+                # basit ama her zaman çalışan bir "manuel INCLUDE açma"
+                # yöntemine (expand_includes_manually) geri dönülüyor.
                 self.log1(f"    pyNastran failed: {str(e)[:100]}")
                 self.log1(f"    Falling back to direct file reading...")
-                
+
                 # pyNastran başarısız oldu - INCLUDE'ları manuel aç
                 merged_content = self.expand_includes_manually(temp_bdf_path)
-            
-            # Temizlik
+
+            # Başta oluşturduğumuz geçici giriş dosyasını (artık gerek
+            # kalmadığı için) temizle.
             if os.path.exists(temp_bdf_path): os.remove(temp_bdf_path)
-            
-            # BEGIN BULK sonrasını al
+
+            # Elimizdeki içerik hem case-control hem bulk data bölümünü
+            # içeriyor olabilir - sadece "BEGIN BULK"tan SONRAKİ kısmı (gerçek
+            # bulk data kartlarını) almak istiyoruz, bu yüzden regex ile
+            # "BEGIN BULK" (ya da "BEGIN,BULK") metnini bulup ondan sonrasını kes.
             bulk_match = re.search(r'BEGIN\s*,?\s*BULK', merged_content, re.IGNORECASE)
             if bulk_match:
                 bulk_data = merged_content[bulk_match.end():]
             else:
+                # "BEGIN BULK" hiç bulunamadıysa (beklenmedik durum) tüm
+                # içeriği bulk data olarak kabul et.
                 bulk_data = merged_content
-            
-            # Gereksiz satırları temizle
+
+            # pyNastran'ın kendi eklediği yorum satırlarını ($pyNastran ile
+            # başlayanlar) ve artık gereksiz olan ENDDATA/INCLUDE/SOL/CEND/
+            # BEGIN gibi "iskelet" satırlarını (bunlar zaten üst seviyede,
+            # process_thermal_bdf/process_maneuver_bdf tarafından YENİDEN
+            # oluşturulacağı için) temizle.
             result_lines = []
             for l in bulk_data.split('\n'):
                 if l.startswith('$pyNastran'): continue
@@ -1337,69 +1474,99 @@ class IntegratedBDFRFTool:
                 if l.strip().upper().startswith('CEND'): continue
                 if l.strip().upper().startswith('BEGIN'): continue
                 result_lines.append(l)
-            
+
             result = '\n'.join(result_lines)
             self.log1(f"      Merged bulk data: {len(result)} characters")
             return result
-            
+
         except Exception as e:
+            # Beklenmedik herhangi bir hata (dosya yazma izni, disk dolu
+            # vb.) olursa logla, hata izini (traceback) göster, geçici
+            # dosyayı temizlemeye çalış ve boş string döndür (işlem
+            # başarısız oldu anlamına gelir, çağıran kod bunu kontrol eder).
             self.log1(f"    ERROR merging: {e}")
             import traceback
             self.log1(traceback.format_exc())
             if os.path.exists(temp_bdf_path): os.remove(temp_bdf_path)
             return ""
-    
+
+    # expand_includes_manually: pyNastran'ın BDF okuma/INCLUDE-takip etme
+    # işlemi BAŞARISIZ olduğunda devreye giren "yedek plan" (fallback)
+    # yöntem. pyNastran'ın karmaşık ayrıştırma mantığına güvenmeden, sadece
+    # INCLUDE kartlarını BULUP, gösterdikleri dosyanın içeriğini OLDUĞU GİBİ
+    # (metin olarak) o INCLUDE satırının yerine yapıştırır. Daha basit/kaba
+    # bir yöntem ama pyNastran'ın takıldığı durumlarda bile çalışır.
     def expand_includes_manually(self, bdf_path):
         """
         INCLUDE'ları manuel olarak açar (pyNastran başarısız olduğunda).
         """
         self.log1("    Expanding includes manually...")
-        
+
         content = self.read_file_safe(bdf_path)
         bdf_dir = os.path.dirname(os.path.abspath(bdf_path))
-        
-        # INCLUDE'ları bul ve aç
+
+        # Bu dosyadaki tüm INCLUDE kartlarını (çok satırlı olanlar dahil) bul.
         all_includes = self.parse_multiline_includes(content, bdf_dir)
-        
+
         # Satırları işle
         lines = content.split('\n')
         result_lines = []
-        
-        # INCLUDE satır indekslerini topla
+
+        # Her INCLUDE kartının kapladığı satır indekslerini (başlangıç-bitiş
+        # arası HER satır indeksi), o INCLUDE'un bilgisine eşleyen bir
+        # sözlük oluştur - aşağıdaki ana döngüde "bu satır bir INCLUDE'un
+        # parçası mı, öyleyse hangisinin?" sorusuna hızlıca cevap vermek için.
         include_indices = {}
         for inc in all_includes:
             for idx in range(inc['start_idx'], inc['end_idx'] + 1):
                 include_indices[idx] = inc
-        
+
+        # Aynı dosyanın birden fazla INCLUDE kartıyla (nadiren) iki kez
+        # çağrılması durumunda onu sadece BİR KEZ açmak için takip kümesi.
         processed_includes = set()
-        
+
         for idx, line in enumerate(lines):
             if idx in include_indices:
                 inc = include_indices[idx]
-                # Sadece start_idx'te işle (continuation satırlarını atla)
+                # Bu INCLUDE'un (olası çok satırlı bloğunun) sadece İLK
+                # satırında (start_idx) gerçek açma işlemini yap - devam
+                # satırlarında (start_idx'ten sonraki satırlarda) hiçbir
+                # şey eklenmez, yani o satırlar sessizce atlanmış olur.
                 if idx == inc['start_idx']:
                     inc_path = inc['abs_path']
                     if inc_path not in processed_includes:
                         processed_includes.add(inc_path)
-                        # INCLUDE dosyasını oku
+                        # INCLUDE'un gösterdiği hedef dosyayı oku ve
+                        # içeriğini, nereden geldiğini belirten bir yorum
+                        # satırıyla birlikte sonuç listesine ekle.
                         if os.path.exists(inc_path):
                             try:
                                 inc_content = self.read_file_safe(inc_path)
                                 result_lines.append(f"$ === EXPANDED: {os.path.basename(inc_path)} ===")
                                 for inc_line in inc_content.split('\n'):
-                                    # Recursive INCLUDE'ları atla (basit tutuyoruz)
+                                    # Bu dosyanın İÇİNDE başka bir INCLUDE
+                                    # kartı varsa (iç içe/recursive INCLUDE),
+                                    # onu AÇMAYA ÇALIŞMADAN sadece atla -
+                                    # bu fonksiyon sadece TEK SEVİYE açma
+                                    # yapıyor, basit tutuluyor.
                                     if not inc_line.strip().upper().startswith('INCLUDE'):
                                         result_lines.append(inc_line)
                             except Exception as e:
+                                # Hedef dosya okunamadıysa (bozuk/erişim
+                                # hatası vb.) bunu bir yorum satırı olarak
+                                # çıktıya yaz - en azından sorun görünür olsun.
                                 result_lines.append(f"$ ERROR reading {inc_path}: {e}")
                         else:
+                            # Hedef dosya hiç yoksa (silinmiş/yanlış yol)
+                            # bunu da bir yorum satırıyla belirt.
                             result_lines.append(f"$ FILE NOT FOUND: {inc_path}")
             else:
+                # INCLUDE ile ilgisi olmayan normal bir satır - olduğu gibi aktar.
                 result_lines.append(line)
-        
+
         self.log1(f"      Expanded {len(processed_includes)} includes")
         return '\n'.join(result_lines)
-    
+
     def start_processing(self):
         if not self.thermal_bdfs and not self.maneuver_bdfs:
             messagebox.showerror("Error","Add BDF files"); return

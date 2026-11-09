@@ -7380,11 +7380,29 @@ class VisualizationResultsTab:
         self.scale_levels_entry.pack(side=tk.LEFT)
         for entry in (self.scale_min_entry, self.scale_max_entry, self.scale_levels_entry):
             entry.bind('<Return>', lambda e: self._on_setting_changed())
+        self.scale_generate_btn = ttk.Button(scale_frame, text="Generate Levels",
+                                             command=self._generate_boundary_entries, state='disabled')
+        self.scale_generate_btn.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(scale_frame, text="Apply", command=self._on_setting_changed).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(scale_frame, text="(uncheck Auto to set your own min/max and how many color bands "
-                                     "the legend is split into - only applies when the selected Color "
-                                     "By column is numeric; text columns use a legend instead)",
+        ttk.Label(scale_frame, text="(uncheck Auto, set Min/Max/Levels, then click Generate Levels to "
+                                     "get editable band values below - edit any of them by hand for a "
+                                     "non-uniform scale, then Apply. Only applies when Color By is "
+                                     "numeric; text columns use a legend instead)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=8)
+
+        # ---- Ara değer (boundary) düzenleme satırı ----
+        # "Generate Levels" butonu, Min/Max/Levels'e göre eşit aralıklı
+        # N+1 ara değer üretip burada birer kutu olarak gösterir - kullanıcı
+        # her bir ara değeri TEK TEK elle değiştirebilir (artık eşit aralıklı
+        # kalması zorunlu değil). "Apply"a basıldığında, bu kutulardaki
+        # (varsa) değerler AYNEN kullanılır - sadece Min/Max/Levels'ten
+        # otomatik hesaplanmaz.
+        boundaries_outer = ttk.Frame(f2)
+        boundaries_outer.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(boundaries_outer, text="Level Values:", width=16).pack(side=tk.LEFT, anchor=tk.N)
+        self.boundaries_inner = ttk.Frame(boundaries_outer)
+        self.boundaries_inner.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.scale_boundary_vars = []  # her ara değer kutusu için bir StringVar
 
         # ---- Görünüm satırı ----
         view_frame = ttk.Frame(f2)
@@ -7446,14 +7464,48 @@ class VisualizationResultsTab:
             self.plot()
 
     # _on_scale_auto_toggled: "Auto" kutusu işaretlenip/kaldırıldığında
-    # Min/Max giriş kutularını etkinleştir/devre dışı bırak (Levels her
-    # zaman düzenlenebilir kalır - bant sayısı Auto modda da geçerli),
-    # sonra bir çizim varsa yeniden çiz.
+    # Min/Max giriş kutularını ve "Generate Levels" butonunu etkinleştir/
+    # devre dışı bırak (Levels her zaman düzenlenebilir kalır - bant sayısı
+    # Auto modda da geçerli), sonra bir çizim varsa yeniden çiz.
     def _on_scale_auto_toggled(self):
         state = 'disabled' if self.scale_auto.get() else 'normal'
         self.scale_min_entry.config(state=state)
         self.scale_max_entry.config(state=state)
+        self.scale_generate_btn.config(state=state)
         self._on_setting_changed()
+
+    # _rebuild_boundary_entries: "Level Values" satırını, verilen değer
+    # listesine göre (her biri için bir Entry kutusu) sıfırdan kurar.
+    # Çok sayıda kademe varsa satır sarılsın diye grid kullanılıyor.
+    def _rebuild_boundary_entries(self, values):
+        for child in self.boundaries_inner.winfo_children():
+            child.destroy()
+        self.scale_boundary_vars = []
+        cols_per_row = 10
+        for i, v in enumerate(values):
+            var = tk.StringVar(value=self._fmt_fixed(v))
+            self.scale_boundary_vars.append(var)
+            entry = ttk.Entry(self.boundaries_inner, textvariable=var, width=9)
+            entry.grid(row=i // cols_per_row, column=i % cols_per_row, padx=2, pady=2, sticky='w')
+            entry.bind('<Return>', lambda e: self._on_setting_changed())
+
+    # _generate_boundary_entries: "Generate Levels" butonu - Min/Max/Levels
+    # kutularından eşit aralıklı (N+1 adet) ara değer üretip "Level Values"
+    # satırını bu değerlerle doldurur. Kullanıcı bundan SONRA tek tek
+    # düzenleyip "Apply"a basabilir - Generate, DÜZENLEMEYE başlanacak bir
+    # taslak üretir, otomatik olarak çizimi değiştirmez.
+    def _generate_boundary_entries(self):
+        try:
+            vmin = float(self.scale_min.get())
+            vmax = float(self.scale_max.get())
+            n_levels = int(float(self.scale_levels.get()))
+            if vmin >= vmax or n_levels < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            messagebox.showerror("Error", "Enter a valid Min < Max and a positive Levels count first")
+            return
+        values = [vmin + (vmax - vmin) * i / n_levels for i in range(n_levels + 1)]
+        self._rebuild_boundary_entries(values)
 
     # _on_scroll_zoom: fare tekerleği ile SADECE 3B eksenler üzerindeyken
     # yakınlaştır/uzaklaştır - mevcut görünümün merkezini sabit tutarak
@@ -7895,10 +7947,35 @@ class VisualizationResultsTab:
                     n_levels = 10
                     self.scale_levels.set("10")
 
-                # BoundaryNorm + ayrık (discrete) renk haritası: değer
-                # aralığını n_levels eşit banda bölüp her banda sabit bir
-                # renk atar - HyperMesh'teki "contour legend" görünümü.
-                boundaries = [vmin + (vmax - vmin) * i / n_levels for i in range(n_levels + 1)]
+                # ---- Kullanıcının "Generate Levels" ile oluşturup tek tek
+                # elle düzenleyebileceği ara değerler: Auto kapalıyken ve bu
+                # kutular geçerli (artan, >=2 adet) sayılarla doluysa, bu
+                # TAM değerleri bant sınırı (boundary) olarak kullan - eşit
+                # aralıklı hesaplamayı atla. Boş/geçersizse (henüz "Generate
+                # Levels"e basılmadıysa) eski eşit-aralıklı davranışa dön. ----
+                custom_boundaries = None
+                if not self.scale_auto.get() and self.scale_boundary_vars:
+                    try:
+                        candidate = [float(v.get()) for v in self.scale_boundary_vars]
+                        if len(candidate) >= 2 and all(
+                                candidate[i] < candidate[i + 1] for i in range(len(candidate) - 1)):
+                            custom_boundaries = candidate
+                    except (TypeError, ValueError):
+                        custom_boundaries = None
+
+                if custom_boundaries is not None:
+                    boundaries = custom_boundaries
+                    vmin, vmax = boundaries[0], boundaries[-1]
+                    n_levels = len(boundaries) - 1
+                    self.scale_min.set(self._fmt_fixed(vmin))
+                    self.scale_max.set(self._fmt_fixed(vmax))
+                    self.scale_levels.set(str(n_levels))
+                else:
+                    # BoundaryNorm + ayrık (discrete) renk haritası: değer
+                    # aralığını n_levels eşit banda bölüp her banda sabit bir
+                    # renk atar - HyperMesh'teki "contour legend" görünümü.
+                    boundaries = [vmin + (vmax - vmin) * i / n_levels for i in range(n_levels + 1)]
+
                 cmap = self._get_cmap(cmap_name, n_levels)
                 norm = mpl_colors.BoundaryNorm(boundaries, cmap.N, clip=True)
 

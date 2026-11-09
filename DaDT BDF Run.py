@@ -72,6 +72,7 @@ try:
     from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
     import matplotlib.cm as mpl_cm
     import matplotlib.colors as mpl_colors
+    import matplotlib.ticker as mpl_ticker
     from matplotlib.patches import Patch
     _MATPLOTLIB_AVAILABLE = True
 except Exception:
@@ -7260,7 +7261,7 @@ class VisualizationResultsTab:
 
         # ---- Çizim ayarları ----
         self.group_by = tk.StringVar(value="Bar Property ID")  # "Bar Property ID" | "Bar Element ID"
-        self.color_by = tk.StringVar(value="Life")              # "Life" | "t (mm)" | "d" | "Material"
+        self.color_by = tk.StringVar(value="Life")              # yüklenen CSV'nin sütunlarından biri - sabit bir liste değil, bkz. _refresh_metric_options
 
         # ---- Renk skalası (contour) ayarları ----
         # scale_auto açıkken Min/Max veriden otomatik hesaplanır (eski
@@ -7295,8 +7296,8 @@ class VisualizationResultsTab:
         main.pack(fill=tk.BOTH, expand=True)
 
         ttk.Label(main, text="Visualization Results", style='Header.TLabel').pack(pady=(0, 4))
-        ttk.Label(main, text="Load a BDF + a sizing summary folder, then color the FEM mesh by "
-                              "t / d / Material / Life, grouped by Bar Property ID or Bar Element ID",
+        ttk.Label(main, text="Load a BDF + a sizing summary folder, then color the FEM mesh by any "
+                              "column from that CSV, grouped by Bar Property ID or Bar Element ID",
                  style='Subtitle.TLabel').pack(pady=(0, 8))
 
         # matplotlib kurulu değilse, sekmenin geri kalanını hiç kurmadan
@@ -7343,17 +7344,21 @@ class VisualizationResultsTab:
         gb_frame.pack(fill=tk.X, pady=2)
         ttk.Label(gb_frame, text="Group By:", width=16).pack(side=tk.LEFT)
         ttk.Radiobutton(gb_frame, text="Bar Property ID", variable=self.group_by,
-                        value="Bar Property ID", command=self._on_setting_changed).pack(side=tk.LEFT, padx=5)
+                        value="Bar Property ID", command=self._on_group_by_changed).pack(side=tk.LEFT, padx=5)
         ttk.Radiobutton(gb_frame, text="Bar Element ID", variable=self.group_by,
-                        value="Bar Element ID", command=self._on_setting_changed).pack(side=tk.LEFT, padx=5)
+                        value="Bar Element ID", command=self._on_group_by_changed).pack(side=tk.LEFT, padx=5)
 
         cb_frame = ttk.Frame(f2)
         cb_frame.pack(fill=tk.X, pady=2)
         ttk.Label(cb_frame, text="Color By:", width=16).pack(side=tk.LEFT)
-        color_combo = ttk.Combobox(cb_frame, textvariable=self.color_by, state='readonly', width=14,
-                                    values=['Life', 't (mm)', 'd', 'Material'])
-        color_combo.pack(side=tk.LEFT, padx=5)
-        color_combo.bind('<<ComboboxSelected>>', lambda e: self._on_setting_changed())
+        # Bu a\u00E7\u0131l\u0131r listenin i\u00E7eri\u011Fi SAB\u0130T de\u011Fil - "Bar Element ID"/"Bar
+        # Property ID" d\u0131\u015F\u0131ndaki T\u00DCM s\u00FCtunlar, y\u00FCklenen CSV neyse ona g\u00F6re
+        # _refresh_metric_options() taraf\u0131ndan doldurulur (bkz. load_summary
+        # ve _on_group_by_changed). B\u00F6ylece farkl\u0131 bir CSV format\u0131
+        # verildi\u011Finde (s\u00FCtun adlar\u0131 farkl\u0131 olsa bile) otomatik uyum sa\u011Flan\u0131r.
+        self.color_combo = ttk.Combobox(cb_frame, textvariable=self.color_by, state='readonly', width=22, values=[])
+        self.color_combo.pack(side=tk.LEFT, padx=5)
+        self.color_combo.bind('<<ComboboxSelected>>', lambda e: self._on_setting_changed())
         ttk.Button(cb_frame, text="\u25B6  Plot", command=self.plot, style='Accent.TButton').pack(side=tk.LEFT, padx=15)
         # ---- Renk skalası (contour) ayar satırı ----
         # "Auto" işaretliyken Min/Max veriden hesaplanır (eski davranış);
@@ -7377,7 +7382,8 @@ class VisualizationResultsTab:
             entry.bind('<Return>', lambda e: self._on_setting_changed())
         ttk.Button(scale_frame, text="Apply", command=self._on_setting_changed).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Label(scale_frame, text="(uncheck Auto to set your own min/max and how many color bands "
-                                     "the legend is split into - for Life/t (mm)/d only)",
+                                     "the legend is split into - only applies when the selected Color "
+                                     "By column is numeric; text columns use a legend instead)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=8)
 
         # ---- Görünüm satırı ----
@@ -7547,41 +7553,84 @@ class VisualizationResultsTab:
     def _normalize_header(h):
         return str(h).strip().lower().replace('\n', '').replace(' ', '').replace('(', '').replace(')', '')
 
-    # _standardize_summary_df: bir Nasgro özet CSV'sinin sütun adlarını
-    # (gerçek dosyalarda "t", "t(mm)", "Plate Material" gibi farklı şekillerde
-    # yazılabiliyor) tanıyıp, aşağı akan çizim kodunun her zaman aynı sabit
-    # isimlerle çalışabilmesi için standart adlara (Bar Element ID, Bar
-    # Property ID, t (mm), d, Material, Life) yeniden adlandırır.
+    # _standardize_summary_df: bir özet CSV'sinin SADECE iki ID sütununu
+    # ("Bar Element ID"/"Bar Property ID" - gerçek dosyalarda farklı
+    # yazılabiliyor, örn. "BarElementID") tanıyıp sabit isimlere çevirir;
+    # bu ikisi gruplama/indeksleme için özel anlam taşıdığından sabit
+    # kalmaları gerekiyor. DİĞER TÜM sütunlar (t, d, Material, Life, ya da
+    # kullanıcının getirdiği BAŞKA herhangi bir sütun - örn. "Stress",
+    # "Margin of Safety") OLDUĞU GİBİ bırakılır, sadece görünüm için
+    # (satır sonu/boşluk fazlalığı) temizlenir - böylece "Color By" listesi
+    # hangi CSV verilirse verilsin o CSV'nin GERÇEK sütunlarını gösterir.
     def _standardize_summary_df(self, df):
         rename = {}
-        found = {'beid': None, 'bpid': None, 't': None, 'd': None, 'mat': None, 'life': None}
+        beid_col = bpid_col = None
         for c in df.columns:
             norm = self._normalize_header(c)
-            if found['beid'] is None and norm == 'barelementid':
-                found['beid'] = c
-            elif found['bpid'] is None and norm == 'barpropertyid':
-                found['bpid'] = c
-            elif found['t'] is None and (norm == 't' or norm.startswith('tmm') or norm.startswith('t(')):
-                found['t'] = c
-            elif found['d'] is None and (norm == 'd' or norm.startswith('dmm') or norm.startswith('d(')):
-                found['d'] = c
-            elif found['mat'] is None and 'material' in norm:
-                found['mat'] = c
-            elif found['life'] is None and norm == 'life':
-                found['life'] = c
-        if found['beid']:
-            rename[found['beid']] = 'Bar Element ID'
-        if found['bpid']:
-            rename[found['bpid']] = 'Bar Property ID'
-        if found['t']:
-            rename[found['t']] = 't (mm)'
-        if found['d']:
-            rename[found['d']] = 'd'
-        if found['mat']:
-            rename[found['mat']] = 'Material'
-        if found['life']:
-            rename[found['life']] = 'Life'
+            if beid_col is None and norm == 'barelementid':
+                beid_col = c
+            elif bpid_col is None and norm == 'barpropertyid':
+                bpid_col = c
+        if beid_col:
+            rename[beid_col] = 'Bar Element ID'
+        if bpid_col:
+            rename[bpid_col] = 'Bar Property ID'
+        for c in df.columns:
+            if c in rename:
+                continue
+            clean = ' '.join(str(c).strip().replace('\n', ' ').split())
+            if clean and clean != c:
+                rename[c] = clean
         return df.rename(columns=rename)
+
+    # _metric_columns: bir özet DataFrame'inde, iki ID sütunu DIŞINDA kalan
+    # - yani "Color By" açılır listesinde gösterilecek - tüm sütun adlarını
+    # döndürür. Bu, uygulamanın sütun isimlerini SABİT olarak bilmesini
+    # gerektirmez; kullanıcı farklı bir CSV formatı getirse bile (Bar
+    # Element ID / Bar Property ID sütunları olduğu sürece) otomatik uyum sağlar.
+    @staticmethod
+    def _metric_columns(df):
+        if df is None:
+            return []
+        id_cols = {'Bar Element ID', 'Bar Property ID'}
+        return [c for c in df.columns if c not in id_cols]
+
+    # _is_numeric_column: verilen sütunun değerlerinin (en az yarısının)
+    # sayıya çevrilebilir olup olmadığına bakarak, bu metriğin sürekli bir
+    # renk skalasıyla mı (contour), yoksa kategorik bir lejantla mı
+    # ("Material" sütunu gibi) gösterilmesi gerektiğine karar verir.
+    @staticmethod
+    def _is_numeric_column(series):
+        try:
+            if len(series) == 0:
+                return False
+            coerced = pd.to_numeric(series, errors='coerce')
+            return coerced.notna().mean() >= 0.5
+        except Exception:
+            return False
+
+    # _fmt_fixed: bir sayıyı HER ZAMAN sabit ondalıklı (fixed-point)
+    # gösterimle döndürür - Python'un varsayılan/genel (":.3g" gibi)
+    # biçimlendirmesi büyük/küçük sayılarda "2.25e+04" gibi bilimsel
+    # gösterime kayabiliyor; Min/Max kutuları ve renk skalası (contour)
+    # etiketleri kullanıcı için her zaman okunaklı sabit ondalık göstersin diye.
+    @staticmethod
+    def _fmt_fixed(x):
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            return str(x)
+        if x == 0:
+            return "0"
+        a = abs(x)
+        if a >= 1000:
+            return f"{x:.0f}"
+        elif a >= 1:
+            return f"{x:.2f}"
+        elif a >= 0.001:
+            return f"{x:.4f}"
+        else:
+            return f"{x:.6f}"
 
     # _scan_summary_files: Summary Folder altında (rekürsif) DT_SIZING_BAR_
     # SUMMARY.csv / DT_SIZING_PROP_SUMMARY.csv / DT_FULL_SUMMARY.csv dosyalarını ara.
@@ -7649,12 +7698,39 @@ class VisualizationResultsTab:
             self.summary_status.config(text="; ".join(msgs), foreground="green")
             for m in msgs:
                 self._log(f"  {m}")
+            # Yeni yüklenen CSV'nin GERÇEK sütunlarına göre "Color By"
+            # listesini yeniden doldur - farklı bir CSV formatı (farklı
+            # sütun adları) verilmiş olsa bile otomatik uyum sağlanır.
+            self._refresh_metric_options()
             if self.bdf_model is not None:
                 self.plot()
         except Exception as e:
             self.summary_status.config(text="Error", foreground="red")
             self._log(f"ERROR loading summary: {e}")
             messagebox.showerror("Error", f"Could not load summary CSV(s):\n{e}")
+
+    # _refresh_metric_options: şu an seçili Group By'a (Bar Element ID /
+    # Bar Property ID) karşılık gelen DataFrame'in sütunlarından "Color By"
+    # açılır listesini yeniden kurar. Mevcut seçim artık mevcut değilse
+    # ("life" içeren bir sütun varsa onu, yoksa ilk sütunu) makul bir
+    # varsayılana geçer.
+    def _refresh_metric_options(self):
+        df = self.bar_summary_df if self.group_by.get() == 'Bar Element ID' else self.prop_summary_df
+        cols = self._metric_columns(df)
+        self.color_combo['values'] = cols
+        if not cols:
+            self.color_by.set("")
+        elif self.color_by.get() not in cols:
+            preferred = next((c for c in cols if 'life' in c.lower()), cols[0])
+            self.color_by.set(preferred)
+
+    # _on_group_by_changed: Group By değiştiğinde - iki özet CSV'nin
+    # (DT_SIZING_BAR_SUMMARY.csv / DT_SIZING_PROP_SUMMARY.csv) sütunları
+    # birbirinden farklı olabileceğinden - önce Color By listesini o
+    # grubun gerçek sütunlarına göre tazele, sonra (bir model yüklüyse) yeniden çiz.
+    def _on_group_by_changed(self):
+        self._refresh_metric_options()
+        self._on_setting_changed()
 
     # ==================== ÇİZİM (PLOT) ====================
     def _draw_placeholder(self):
@@ -7712,7 +7788,18 @@ class VisualizationResultsTab:
             group_by = self.group_by.get()
             metric = self.color_by.get()
             df = self.bar_summary_df if group_by == 'Bar Element ID' else self.prop_summary_df
-            is_material = (metric == 'Material')
+            if not metric:
+                messagebox.showerror("Error", "Load a Summary Folder first (no Color By column available)")
+                return
+            # Seçili metrik sütunu SAYISAL mı (örn. Life, t, d, ya da
+            # kullanıcının CSV'sindeki herhangi bir sayısal sütun) yoksa
+            # METİN/KATEGORİK mi (örn. Material) - bu, sütun adına göre
+            # DEĞİL, DEĞERLERE bakarak otomatik belirlenir, böylece farklı
+            # bir CSV formatı verildiğinde de doğru görselleştirme seçilir.
+            if df is not None and metric in df.columns:
+                is_material = not self._is_numeric_column(df[metric])
+            else:
+                is_material = False  # bu grup için hiç veri yok - sayısal yoldaki "veri yok" mesajı daha açıklayıcı
 
             self.fig.clear()
             # "Maximize 3D View" işaretliyse yan 2B grafiği hiç oluşturma -
@@ -7765,7 +7852,11 @@ class VisualizationResultsTab:
                             numeric_vals.append(float(v))
                     except (TypeError, ValueError):
                         pass
-                cmap_name = 'RdYlGn' if metric == 'Life' else 'viridis'
+                # "Life" (ya da "life" geçen başka bir metrik adı) için
+                # kırmızı(düşük)-yeşil(yüksek) renk skalası anlamlı - diğer
+                # TÜM sayısal sütunlar (sabit bir liste değil, kullanıcının
+                # getirdiği herhangi bir metrik) için genel amaçlı viridis.
+                cmap_name = 'RdYlGn' if 'life' in metric.lower() else 'viridis'
 
                 # ---- Renk skalası aralığı: Auto ise veriden, değilse
                 # kullanıcının Min/Max kutularından al. Kademe (Levels)
@@ -7781,8 +7872,8 @@ class VisualizationResultsTab:
                     vmin, vmax = auto_vmin, auto_vmax
                     # Kullanıcı Auto'yu kapatırsa düzenlemeye başlayacağı
                     # makul bir başlangıç değeri görsün diye kutuları güncelle.
-                    self.scale_min.set(f"{vmin:.4g}")
-                    self.scale_max.set(f"{vmax:.4g}")
+                    self.scale_min.set(self._fmt_fixed(vmin))
+                    self.scale_max.set(self._fmt_fixed(vmax))
                 else:
                     try:
                         vmin = float(self.scale_min.get())
@@ -7874,14 +7965,18 @@ class VisualizationResultsTab:
                 # boundaries/ticks=boundaries + spacing='uniform': renk
                 # çubuğunu HyperMesh'teki gibi n_levels adet eşit genişlikte
                 # bant olarak çizer, her bandın sınır değerini etiket yapar.
+                # format yerine FuncFormatter: "%.3g" büyük/küçük sayılarda
+                # bilimsel gösterime (2.25e+04) kayabiliyor - kullanıcı her
+                # zaman sabit ondalıklı (fixed-point) etiket görsün diye.
                 self.fig.colorbar(mappable, ax=ax3d, boundaries=boundaries, ticks=boundaries,
                                   spacing='uniform', shrink=0.7, pad=0.08, label=metric,
-                                  format='%.3g')
+                                  format=mpl_ticker.FuncFormatter(lambda v, pos: self._fmt_fixed(v)))
 
             # ---- İstatistik satırı: ax2d olsun olmasın (Maximize 3D View
             # açıkken bile) HER ZAMAN güncellenir. ----
             if is_material:
-                self.stats_label.config(text=f"{len(records)} bar element(s), {len(materials)} distinct material(s)")
+                self.stats_label.config(
+                    text=f"{len(records)} bar element(s), {len(materials)} distinct '{metric}' value(s)")
             else:
                 ys_vals_all = []
                 for _, _, val in records:
@@ -7894,9 +7989,9 @@ class VisualizationResultsTab:
                 if ys_vals_all:
                     self.stats_label.config(
                         text=f"{len(ys_vals_all)}/{len(records)} bar element(s) have {metric} data - "
-                             f"min={min(ys_vals_all):.3g}  max={max(ys_vals_all):.3g}  "
-                             f"avg={sum(ys_vals_all)/len(ys_vals_all):.3g}  "
-                             f"(scale: {vmin:.3g} to {vmax:.3g}, {n_levels} band(s))")
+                             f"min={self._fmt_fixed(min(ys_vals_all))}  max={self._fmt_fixed(max(ys_vals_all))}  "
+                             f"avg={self._fmt_fixed(sum(ys_vals_all)/len(ys_vals_all))}  "
+                             f"(scale: {self._fmt_fixed(vmin)} to {self._fmt_fixed(vmax)}, {n_levels} band(s))")
                 else:
                     self.stats_label.config(text=f"{len(records)} bar element(s) - no {metric} data loaded")
 
@@ -7918,9 +8013,9 @@ class VisualizationResultsTab:
                     ax2d.set_xticks(range(len(names)))
                     ax2d.set_xticklabels(names, rotation=45, ha='right', fontsize=7)
                     ax2d.set_ylabel('Element count')
-                    ax2d.set_title('Material distribution', fontsize=10)
+                    ax2d.set_title(f"'{metric}' distribution", fontsize=10)
                 else:
-                    ax2d.text(0.5, 0.5, 'No material data', ha='center', va='center')
+                    ax2d.text(0.5, 0.5, f'No {metric} data', ha='center', va='center')
             elif ax2d is not None:
                 xs_ids, ys_vals = [], []
                 for be, key, val in records:

@@ -6840,6 +6840,10 @@ class IterativeFullRunTab:
         self.log(f"  WARNING: gave up waiting for '{exe_name}' after {waited}s - proceeding anyway.")
 
     # ==================== RUN (ITERATIVE FULL PIPELINE) ====================
+    # start_run: tüm iterasyon zincirinin (N kere tekrarlanan Understanding
+    # Structure Type -> Post Processing -> Joint Run) girdilerini önceden
+    # doğrular - target_flight_hours ve n_iterations dahil - sonra
+    # gerçek döngüyü (_run_pipeline) arka plan thread'inde başlatır.
     def start_run(self):
         if not self.bdf_paths:
             messagebox.showerror("Error", "Add at least one All BDF File")
@@ -6932,12 +6936,15 @@ class IterativeFullRunTab:
             output_base = self.isu_output_folder.get().strip()
             os.makedirs(output_base, exist_ok=True)
 
+            # Kullanıcının Master Input Excel'i HİÇ DOKUNULMADAN kalır -
+            # tüm iterasyonlar, bu özel "working excel" ÇALIŞMA KOPYASI
+            # üzerinde okuma/yazma yapar.
             working_excel = os.path.join(output_base, "_IterativeFullRun_Working_Input.xlsx")
             shutil.copy2(self.master_input_excel_path.get().strip(), working_excel)
             self.log(f"  Working copy of the Master Input Excel: {working_excel}")
             self.log(f"  Target flight hours: {target_life}, Iterations: {n_iterations}")
 
-            prop_summary_df = None
+            prop_summary_df = None  # önceki iterasyonun boyutlandırma özeti (ilk iterasyonda yok)
             t_col = None
 
             for iteration in range(1, n_iterations + 1):
@@ -6947,11 +6954,19 @@ class IterativeFullRunTab:
                 self.log("#" * 70)
                 self.root.after(0, lambda p=(iteration - 1) / n_iterations * 100: self.progress_var.set(p))
 
+                # Bu, DÖNGÜNÜN GERİ BESLEME (feedback) ADIMI: ilk iterasyon
+                # HARİÇ, bir önceki iterasyonun boyutlandırma özetindeki
+                # (prop_summary_df) kalınlık değerleri, bu iterasyonun
+                # çözümünden ÖNCE working_excel'in Bar Property Dim1'ine yazılır.
                 if iteration > 1 and prop_summary_df is not None and t_col is not None:
                     prop_map = dict(zip(prop_summary_df['Bar Property ID'], prop_summary_df[t_col]))
                     self._update_bar_property_dim1(working_excel, prop_map)
 
                 # ---- STAGE A: UNDERSTANDING STRUCTURE TYPE ----
+                # FullRunTab'daki aynı mantık: t3 nesnesinin alanlarını
+                # doldur ve _run_solve()'u çağır - TEK FARK, Property/Element
+                # Excel'in HER İKİSİNİN de aynı working_excel'i göstermesi
+                # (Master Input Excel tek dosyada hepsini içerdiği için).
                 self.log(f"\n--- Iteration {iteration}: Understanding Structure Type ---")
                 t3 = self.tab3_tool
                 t3.bdf_paths = list(self.bdf_paths)
@@ -7003,12 +7018,21 @@ class IterativeFullRunTab:
                     return
                 self.log(f"  {op2_count_check} .op2 file(s) found")
 
+                # Bu iterasyonda ÇÖZÜLEN her BDF'teki (maneuver + thermal,
+                # hepsi) PBARL dim1 değerlerini oku ve DTCG_Input_Excel_
+                # Data'nın t1(mm)/tfem sütunlarına geri yaz - Joint Run'a
+                # giden Excel, "istenen" değeri değil GERÇEKTEN ÇÖZÜLEN
+                # kalınlığı yansıtsın.
                 stru_bdfs = self._find_all_stru_bdfs(base_model_folder)
                 dim1_by_pid = {}
                 for p in stru_bdfs:
                     dim1_by_pid.update(self._extract_pbarl_dim1(p))
                 self._update_dtcg_t1_tfem(working_excel, dim1_by_pid)
 
+                # Bu iterasyonun working_excel durumunu, o iterasyonun kendi
+                # _base_model klasörüne anlık görüntü (snapshot) olarak
+                # kaydet - sonradan "bu iterasyonda hangi kalınlıklar
+                # kullanıldı" diye geri bakılabilsin.
                 iter_snapshot = os.path.join(base_model_folder, f"Main_Input_Iteration_{iteration}.xlsx")
                 shutil.copy2(working_excel, iter_snapshot)
                 self.log(f"  Working excel snapshot saved: {iter_snapshot}")

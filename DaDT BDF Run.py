@@ -58,6 +58,25 @@ import numpy as np
 # gerektiğinde openpyxl kullanılıyor.
 import openpyxl
 
+# ==================== GÖRSELLEŞTİRME (VISUALIZATION) BAĞIMLILIKLARI ====================
+# matplotlib: SADECE "Visualization Results" sekmesindeki 3B FEM mesh görünümü
+# ve 2B grafikler için kullanılıyor. Uygulamanın geri kalanı (diğer 7 sekme)
+# matplotlib'e hiç ihtiyaç duymuyor - bu yüzden import opsiyonel: kurulu
+# değilse uygulamanın tamamı yine de normal çalışır, sadece Visualization
+# Results sekmesi kullanıcıya "matplotlib kurulu değil" uyarısı gösterir.
+try:
+    import matplotlib
+    matplotlib.use('TkAgg')  # Tkinter penceresi içine gömülebilen çizim motoru
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+    from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
+    import matplotlib.cm as mpl_cm
+    import matplotlib.colors as mpl_colors
+    from matplotlib.patches import Patch
+    _MATPLOTLIB_AVAILABLE = True
+except Exception:
+    _MATPLOTLIB_AVAILABLE = False
+
 # _APP_COLORS: uygulamanın renk paletini tutan global (modül seviyesi) sözlük.
 # Başlangıçta boş, _configure_app_style() çağrıldığında içi dolduruluyor.
 # Tüm sekmeler (tab) bu sözlüğü widget renklerini ayarlarken okuyor
@@ -259,11 +278,12 @@ class IntegratedBDFRFTool:
         # ---- Sekme renk grupları ----
         # BDF Merge Preparation: mavi (tek başına kendi rengi).
         # Nastran Solver / Post Processing / Joint Run: aynı grup, yeşil.
-        # Full Run: sarı. Iterative Full Run: bordo.
+        # Full Run: sarı. Iterative Full Run: bordo. Visualization Results: mor.
         _TAB_COLOR_BLUE = '#2563eb'
         _TAB_COLOR_GREEN = '#16a34a'
         _TAB_COLOR_YELLOW = '#eab308'
         _TAB_COLOR_MAROON = '#800000'
+        _TAB_COLOR_PURPLE = '#9333ea'
 
         # ---- Sekme 1: BDF Merge Preparation (mavi) ----
         # Bu sekmenin içeriği ayrı bir sınıfa çıkarılmamış; setup_tab1()
@@ -318,6 +338,17 @@ class IntegratedBDFRFTool:
         self.notebook.add(self.tab7, text="\U0001F501  Iterative Full Run")
         self.notebook.tab(self.tab7, image=self._make_tab_icon(_TAB_COLOR_MAROON), compound='left')
         self.tab7_tool = IterativeFullRunTab(self.tab7, self.root, self.tab3_tool, self.tab4_tool, self.tab5_tool)
+
+        # ---- Sekme 7: Visualization Results (mor) ----
+        # Diğer sekmelerden bağımsız, kendi kendine yeten yeni bir sekme -
+        # kullanıcının verdiği bir BDF'i 3B olarak çizer ve Iterative Full
+        # Run'ın ürettiği DT_SIZING_BAR_SUMMARY.csv / DT_SIZING_PROP_SUMMARY.csv
+        # sonuçlarını (t, d, Material, Life) bar elemanlarının üzerine
+        # renk kodlayarak gösterir.
+        self.tab8 = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab8, text="\U0001F4CA  Visualization Results")
+        self.notebook.tab(self.tab8, image=self._make_tab_icon(_TAB_COLOR_PURPLE), compound='left')
+        self.tab8_tool = VisualizationResultsTab(self.tab8, self.root)
 
 
     # setup_tab1: "BDF Merge Preparation" sekmesinin tüm arayüzünü (Thermal
@@ -7207,6 +7238,547 @@ class IterativeFullRunTab:
         t3.maneuver_listbox.delete(0, tk.END)
         for p in t3.maneuver_bdfs:
             t3.maneuver_listbox.insert(tk.END, os.path.basename(p))
+
+
+# ============================================================================
+# VisualizationResultsTab  --  "Visualization Results" sekmesi (Tab 8)
+# ============================================================================
+# Kullanıcının verdiği bir BDF dosyasını (HyperMesh benzeri) 3B olarak çizer
+# ve Iterative Full Run'ın ürettiği DT_SIZING_BAR_SUMMARY.csv /
+# DT_SIZING_PROP_SUMMARY.csv dosyalarındaki sonuçları (t, d, Material, Life)
+# bar elemanlarının üzerine renk kodlayarak gösterir - "Bar Property ID" veya
+# "Bar Element ID" bazında gruplama seçilebilir. Diğer hiçbir sekmenin kodunu
+# değiştirmez, bağımsız ve kendi kendine yeten yeni bir sekmedir.
+class VisualizationResultsTab:
+    def __init__(self, parent_frame, root):
+        self.root = root
+        self.parent_frame = parent_frame
+
+        # ---- Girdi yolları ----
+        self.bdf_path = tk.StringVar()        # görselleştirilecek BDF dosyası
+        self.summary_folder = tk.StringVar()  # DT_SIZING_*_SUMMARY.csv'lerin aranacağı klasör
+
+        # ---- Çizim ayarları ----
+        self.group_by = tk.StringVar(value="Bar Property ID")  # "Bar Property ID" | "Bar Element ID"
+        self.color_by = tk.StringVar(value="Life")              # "Life" | "t (mm)" | "d" | "Material"
+
+        # ---- BDF'ten çıkarılan mesh verisi ----
+        self.bdf_model = None
+        self.node_coords = {}      # nid -> (x, y, z)
+        self.bar_elements = []     # [{'eid', 'pid', 'n1', 'n2'}, ...]  (CBAR/CBEAM)
+        self.shell_elements = []   # [{'eid', 'pid', 'nodes': [...]}, ...]  (CQUAD4/CTRIA3/...)
+
+        # ---- CSV'den okunan sonuç verisi ----
+        self.bar_summary_df = None   # index: Bar Element ID
+        self.prop_summary_df = None  # index: Bar Property ID
+
+        self.setup_ui()
+
+    # ==================== GUI ====================
+    def setup_ui(self):
+        main = ttk.Frame(self.parent_frame, padding=10)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(main, text="Visualization Results", style='Header.TLabel').pack(pady=(0, 4))
+        ttk.Label(main, text="Load a BDF + a sizing summary folder, then color the FEM mesh by "
+                              "t / d / Material / Life, grouped by Bar Property ID or Bar Element ID",
+                 style='Subtitle.TLabel').pack(pady=(0, 8))
+
+        # matplotlib kurulu değilse, sekmenin geri kalanını hiç kurmadan
+        # sadece bir uyarı göster - uygulamanın diğer 7 sekmesi yine de
+        # tamamen normal çalışmaya devam eder.
+        if not _MATPLOTLIB_AVAILABLE:
+            ttk.Label(main, text="matplotlib bulunamadı. Bu sekmeyi kullanmak için önce şunu çalıştırın:\n"
+                                  "    pip install matplotlib",
+                     foreground=_APP_COLORS.get('danger', 'red'),
+                     font=('Segoe UI', 10, 'bold'), justify=tk.LEFT).pack(pady=30)
+            return
+
+        # ---- Section 1: Model & Sizing Data ----
+        f1 = ttk.LabelFrame(main, text="\U0001F4C1  1. Model & Sizing Data", padding=10)
+        f1.pack(fill=tk.X, pady=5)
+
+        bdf_frame = ttk.Frame(f1)
+        bdf_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(bdf_frame, text="BDF File:", width=16).pack(side=tk.LEFT)
+        ttk.Entry(bdf_frame, textvariable=self.bdf_path, width=55).pack(side=tk.LEFT, padx=5)
+        ttk.Button(bdf_frame, text="Browse", command=self._browse_bdf).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bdf_frame, text="Load BDF", command=self.load_bdf).pack(side=tk.LEFT, padx=2)
+        self.bdf_status = ttk.Label(f1, text="No BDF loaded", foreground="gray")
+        self.bdf_status.pack(anchor=tk.W, pady=(0, 6))
+
+        sum_frame = ttk.Frame(f1)
+        sum_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(sum_frame, text="Summary Folder:", width=16).pack(side=tk.LEFT)
+        ttk.Entry(sum_frame, textvariable=self.summary_folder, width=55).pack(side=tk.LEFT, padx=5)
+        ttk.Button(sum_frame, text="Browse", command=self._browse_summary_folder).pack(side=tk.LEFT, padx=2)
+        ttk.Button(sum_frame, text="Load Summary", command=self.load_summary).pack(side=tk.LEFT, padx=2)
+        ttk.Label(f1, text="(recursively searches for DT_SIZING_BAR_SUMMARY.csv / DT_SIZING_PROP_SUMMARY.csv "
+                            "- written by Iterative Full Run's sizing step into the Joint Run output folder; "
+                            "falls back to DT_FULL_SUMMARY.csv if those aren't found)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+        self.summary_status = ttk.Label(f1, text="No summary loaded", foreground="gray")
+        self.summary_status.pack(anchor=tk.W)
+
+        # ---- Section 2: Plot Settings ----
+        f2 = ttk.LabelFrame(main, text="\U0001F3A8  2. Plot Settings", padding=10)
+        f2.pack(fill=tk.X, pady=5)
+
+        gb_frame = ttk.Frame(f2)
+        gb_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(gb_frame, text="Group By:", width=16).pack(side=tk.LEFT)
+        ttk.Radiobutton(gb_frame, text="Bar Property ID", variable=self.group_by,
+                        value="Bar Property ID", command=self._on_setting_changed).pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(gb_frame, text="Bar Element ID", variable=self.group_by,
+                        value="Bar Element ID", command=self._on_setting_changed).pack(side=tk.LEFT, padx=5)
+
+        cb_frame = ttk.Frame(f2)
+        cb_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(cb_frame, text="Color By:", width=16).pack(side=tk.LEFT)
+        color_combo = ttk.Combobox(cb_frame, textvariable=self.color_by, state='readonly', width=14,
+                                    values=['Life', 't (mm)', 'd', 'Material'])
+        color_combo.pack(side=tk.LEFT, padx=5)
+        color_combo.bind('<<ComboboxSelected>>', lambda e: self._on_setting_changed())
+        ttk.Button(cb_frame, text="\u25B6  Plot", command=self.plot, style='Accent.TButton').pack(side=tk.LEFT, padx=15)
+
+        self.stats_label = ttk.Label(f2, text="", foreground=_APP_COLORS.get('primary_dark', '#1d4ed8'),
+                                     font=('Segoe UI', 9, 'bold'))
+        self.stats_label.pack(anchor=tk.W, pady=(4, 0))
+
+        # ---- Section 3: FEM Visualization ----
+        f3 = ttk.LabelFrame(main, text="\U0001F5FA  3. FEM Visualization", padding=5)
+        f3.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        self.fig = Figure(figsize=(11, 5.5), dpi=90)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=f3)
+        toolbar_frame = ttk.Frame(f3)
+        toolbar_frame.pack(fill=tk.X)
+        # NavigationToolbar2Tk: matplotlib'in standart araç çubuğu - döndür/kaydır/
+        # yakınlaştır ve çizimi PNG olarak kaydetme butonlarını hazır olarak verir.
+        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
+        self.toolbar.update()
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._draw_placeholder()
+
+        # ---- Durum/log kutusu ----
+        self.log_text = scrolledtext.ScrolledText(main, height=4, font=('Consolas', 9),
+                                                    bg=_APP_COLORS['log_bg'], fg=_APP_COLORS['log_fg'],
+                                                    insertbackground=_APP_COLORS['log_fg'], relief='flat',
+                                                    borderwidth=0)
+        self.log_text.pack(fill=tk.X, pady=(5, 0))
+
+    def _log(self, msg):
+        self.log_text.insert(tk.END, msg + "\n")
+        self.log_text.see(tk.END)
+
+    def _browse_bdf(self):
+        path = filedialog.askopenfilename(filetypes=[("BDF", "*.bdf *.dat *.nas"), ("All", "*.*")])
+        if path:
+            self.bdf_path.set(path)
+
+    def _browse_summary_folder(self):
+        folder = filedialog.askdirectory()
+        if folder:
+            self.summary_folder.set(folder)
+
+    # Group By / Color By değiştiğinde, zaten bir çizim varsa otomatik
+    # olarak yeniden çiz - kullanıcının her seferinde "Plot" butonuna
+    # tıklamasına gerek kalmasın.
+    def _on_setting_changed(self):
+        if self.bdf_model is not None:
+            self.plot()
+
+    # ==================== BDF YÜKLEME ====================
+    def load_bdf(self):
+        path = self.bdf_path.get().strip()
+        if not path or not os.path.exists(path):
+            messagebox.showerror("Error", "Select a valid BDF file")
+            return
+
+        self._log(f"Loading BDF: {os.path.basename(path)} ...")
+        try:
+            # xref=True: node.get_position() ve elem.node_ids/elem.pid'in
+            # düzgün çözümlenmesi (özellikle farklı koordinat sistemlerine
+            # bağlı GRID'ler) için gerekli - _calculate_offset_csv'nin de
+            # aynı sebeple xref=True kullandığı gibi.
+            model = BDF(debug=False)
+            try:
+                model.read_bdf(path, validate=False, xref=True, read_includes=True, encoding='latin-1')
+            except Exception:
+                # INCLUDE edilen dosyalar diskte bulunamazsa (örn. sadece
+                # ana BDF kullanıcıda varsa), INCLUDE'ları genişletmeden
+                # tekrar dene - en azından ana dosyanın geometrisi görülebilsin.
+                model = BDF(debug=False)
+                model.read_bdf(path, validate=False, xref=True, read_includes=False, encoding='latin-1')
+                self._log("  NOTE: some INCLUDE files could not be resolved - loaded the main file only.")
+
+            self.bdf_model = model
+            self._extract_mesh()
+
+            self.bdf_status.config(
+                text=f"Loaded: {len(self.node_coords)} nodes, {len(self.bar_elements)} bar element(s), "
+                     f"{len(self.shell_elements)} shell element(s)",
+                foreground="green")
+            self._log(f"BDF loaded OK: {len(self.node_coords)} nodes, {len(self.bar_elements)} bar "
+                      f"element(s) (CBAR/CBEAM), {len(self.shell_elements)} shell element(s) "
+                      f"(CQUAD4/CTRIA3/...)")
+            self.plot()
+        except Exception as e:
+            self.bdf_status.config(text="Error", foreground="red")
+            self._log(f"ERROR loading BDF: {e}")
+            messagebox.showerror("Error", f"Could not load BDF:\n{e}")
+
+    # _extract_mesh: xref'lenmiş pyNastran modelinden, çizim için gereken
+    # düğüm koordinatlarını ve CBAR/CBEAM (bar) ile CQUAD4/CTRIA3/... (shell)
+    # elemanlarının düğüm bağlantılarını çıkarır.
+    def _extract_mesh(self):
+        model = self.bdf_model
+        self.node_coords = {}
+        for nid, node in model.nodes.items():
+            try:
+                self.node_coords[nid] = tuple(node.get_position())
+            except Exception:
+                pass  # koordinat sistemi çözülemeyen tekil düğümü atla
+
+        self.bar_elements = []
+        self.shell_elements = []
+        for eid, elem in model.elements.items():
+            if elem.type in ('CBAR', 'CBEAM'):
+                try:
+                    nids = elem.node_ids
+                except Exception:
+                    continue
+                if len(nids) >= 2 and nids[0] in self.node_coords and nids[1] in self.node_coords:
+                    pid = elem.pid if not hasattr(elem, 'Pid') else elem.Pid()
+                    self.bar_elements.append({'eid': eid, 'pid': pid, 'n1': nids[0], 'n2': nids[1]})
+            elif elem.type in ('CQUAD4', 'CTRIA3', 'CQUAD8', 'CTRIA6'):
+                try:
+                    nids = [n for n in elem.node_ids if n in self.node_coords]
+                except Exception:
+                    continue
+                if len(nids) >= 3:
+                    pid = elem.pid if not hasattr(elem, 'Pid') else elem.Pid()
+                    self.shell_elements.append({'eid': eid, 'pid': pid, 'nodes': nids})
+
+    # ==================== SUMMARY CSV YÜKLEME ====================
+    @staticmethod
+    def _normalize_header(h):
+        return str(h).strip().lower().replace('\n', '').replace(' ', '').replace('(', '').replace(')', '')
+
+    # _standardize_summary_df: bir Nasgro özet CSV'sinin sütun adlarını
+    # (gerçek dosyalarda "t", "t(mm)", "Plate Material" gibi farklı şekillerde
+    # yazılabiliyor) tanıyıp, aşağı akan çizim kodunun her zaman aynı sabit
+    # isimlerle çalışabilmesi için standart adlara (Bar Element ID, Bar
+    # Property ID, t (mm), d, Material, Life) yeniden adlandırır.
+    def _standardize_summary_df(self, df):
+        rename = {}
+        found = {'beid': None, 'bpid': None, 't': None, 'd': None, 'mat': None, 'life': None}
+        for c in df.columns:
+            norm = self._normalize_header(c)
+            if found['beid'] is None and norm == 'barelementid':
+                found['beid'] = c
+            elif found['bpid'] is None and norm == 'barpropertyid':
+                found['bpid'] = c
+            elif found['t'] is None and (norm == 't' or norm.startswith('tmm') or norm.startswith('t(')):
+                found['t'] = c
+            elif found['d'] is None and (norm == 'd' or norm.startswith('dmm') or norm.startswith('d(')):
+                found['d'] = c
+            elif found['mat'] is None and 'material' in norm:
+                found['mat'] = c
+            elif found['life'] is None and norm == 'life':
+                found['life'] = c
+        if found['beid']:
+            rename[found['beid']] = 'Bar Element ID'
+        if found['bpid']:
+            rename[found['bpid']] = 'Bar Property ID'
+        if found['t']:
+            rename[found['t']] = 't (mm)'
+        if found['d']:
+            rename[found['d']] = 'd'
+        if found['mat']:
+            rename[found['mat']] = 'Material'
+        if found['life']:
+            rename[found['life']] = 'Life'
+        return df.rename(columns=rename)
+
+    # _scan_summary_files: Summary Folder altında (rekürsif) DT_SIZING_BAR_
+    # SUMMARY.csv / DT_SIZING_PROP_SUMMARY.csv / DT_FULL_SUMMARY.csv dosyalarını ara.
+    @staticmethod
+    def _scan_summary_files(folder):
+        bar_path = prop_path = full_path = None
+        for dirpath, _, filenames in os.walk(folder):
+            for fn in filenames:
+                fnl = fn.lower()
+                if fnl == 'dt_sizing_bar_summary.csv' and bar_path is None:
+                    bar_path = os.path.join(dirpath, fn)
+                elif fnl == 'dt_sizing_prop_summary.csv' and prop_path is None:
+                    prop_path = os.path.join(dirpath, fn)
+                elif fnl == 'dt_full_summary.csv' and full_path is None:
+                    full_path = os.path.join(dirpath, fn)
+        return bar_path, prop_path, full_path
+
+    def load_summary(self):
+        folder = self.summary_folder.get().strip()
+        if not folder or not os.path.isdir(folder):
+            messagebox.showerror("Error", "Select a valid Summary Folder")
+            return
+
+        self._log(f"Scanning for summary CSVs under: {folder}")
+        bar_path, prop_path, full_path = self._scan_summary_files(folder)
+        self.bar_summary_df = None
+        self.prop_summary_df = None
+        msgs = []
+
+        try:
+            if bar_path:
+                df = self._standardize_summary_df(pd.read_csv(bar_path))
+                if 'Bar Element ID' in df.columns:
+                    df = df.drop_duplicates(subset=['Bar Element ID']).set_index('Bar Element ID')
+                    self.bar_summary_df = df
+                    msgs.append(f"Bar Element ID: {len(df)} row(s) (DT_SIZING_BAR_SUMMARY.csv)")
+            if prop_path:
+                df = self._standardize_summary_df(pd.read_csv(prop_path))
+                if 'Bar Property ID' in df.columns:
+                    df = df.drop_duplicates(subset=['Bar Property ID']).set_index('Bar Property ID')
+                    self.prop_summary_df = df
+                    msgs.append(f"Bar Property ID: {len(df)} row(s) (DT_SIZING_PROP_SUMMARY.csv)")
+
+            # Sizing özetleri hiç bulunamadıysa, DT_FULL_SUMMARY.csv'den basit
+            # bir geri dönüş (fallback) üret - her ID için İLK görülen satırı
+            # kullanır (Iterative Full Run'ın kendi "governing/en kalın"
+            # seçim mantığını burada TEKRARLAMAZ, sadece hızlı bir önizleme sağlar).
+            if self.bar_summary_df is None and self.prop_summary_df is None and full_path:
+                full_df = self._standardize_summary_df(pd.read_csv(full_path))
+                if 'Bar Element ID' in full_df.columns:
+                    self.bar_summary_df = full_df.drop_duplicates(subset=['Bar Element ID']).set_index('Bar Element ID')
+                    msgs.append(f"Bar Element ID: {len(self.bar_summary_df)} row(s) "
+                                f"(DT_FULL_SUMMARY.csv fallback, first row per ID)")
+                if 'Bar Property ID' in full_df.columns:
+                    self.prop_summary_df = full_df.drop_duplicates(subset=['Bar Property ID']).set_index('Bar Property ID')
+                    msgs.append(f"Bar Property ID: {len(self.prop_summary_df)} row(s) "
+                                f"(DT_FULL_SUMMARY.csv fallback, first row per ID)")
+
+            if not msgs:
+                self.summary_status.config(text="No DT_SIZING_BAR_SUMMARY.csv / DT_SIZING_PROP_SUMMARY.csv / "
+                                                 "DT_FULL_SUMMARY.csv found", foreground="red")
+                self._log("  No usable summary CSV found under that folder.")
+                return
+
+            self.summary_status.config(text="; ".join(msgs), foreground="green")
+            for m in msgs:
+                self._log(f"  {m}")
+            if self.bdf_model is not None:
+                self.plot()
+        except Exception as e:
+            self.summary_status.config(text="Error", foreground="red")
+            self._log(f"ERROR loading summary: {e}")
+            messagebox.showerror("Error", f"Could not load summary CSV(s):\n{e}")
+
+    # ==================== ÇİZİM (PLOT) ====================
+    def _draw_placeholder(self):
+        self.fig.clear()
+        ax = self.fig.add_subplot(1, 1, 1)
+        ax.text(0.5, 0.5, "Load a BDF file (and optionally a sizing summary)\nto see the FEM visualization here",
+                ha='center', va='center', fontsize=11, color='gray')
+        ax.set_xticks([]); ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        self.canvas.draw()
+
+    @staticmethod
+    def _get_cmap(name, n=None):
+        # matplotlib sürümleri arasında colormap API'si değişti
+        # (eski: cm.get_cmap(name, n), yeni: matplotlib.colormaps[name]) -
+        # ikisini de deneyerek her iki sürümde de çalışmasını sağla.
+        try:
+            base = matplotlib.colormaps[name]
+        except Exception:
+            base = mpl_cm.get_cmap(name)
+        if n is not None and n > 0:
+            try:
+                return base.resampled(n)
+            except AttributeError:
+                try:
+                    return mpl_cm.get_cmap(name, n)
+                except Exception:
+                    return base
+        return base
+
+    @staticmethod
+    def _set_axes_equal(ax):
+        """3B eksenlerin X/Y/Z oranlarını eşitler (matplotlib'in 3D
+        projeksiyonu varsayılan olarak set_aspect('equal') desteklemez) -
+        aksi halde BDF geometrisi gerçek oranlarından saptırılmış görünür."""
+        x_lim = ax.get_xlim3d(); y_lim = ax.get_ylim3d(); z_lim = ax.get_zlim3d()
+        spans = [abs(x_lim[1] - x_lim[0]), abs(y_lim[1] - y_lim[0]), abs(z_lim[1] - z_lim[0])]
+        centers = [sum(x_lim) / 2, sum(y_lim) / 2, sum(z_lim) / 2]
+        radius = max(spans) / 2 if max(spans) > 0 else 1
+        ax.set_xlim3d([centers[0] - radius, centers[0] + radius])
+        ax.set_ylim3d([centers[1] - radius, centers[1] + radius])
+        ax.set_zlim3d([centers[2] - radius, centers[2] + radius])
+
+    # plot: ana çizim fonksiyonu - solda 3B renklendirilmiş FEM mesh'i,
+    # sağda aynı veriyi (ID'ye göre sıralanmış) 2B grafik olarak gösterir.
+    def plot(self):
+        if not _MATPLOTLIB_AVAILABLE:
+            return
+        if self.bdf_model is None:
+            messagebox.showerror("Error", "Load a BDF file first")
+            return
+
+        try:
+            group_by = self.group_by.get()
+            metric = self.color_by.get()
+            df = self.bar_summary_df if group_by == 'Bar Element ID' else self.prop_summary_df
+            is_material = (metric == 'Material')
+
+            self.fig.clear()
+            ax3d = self.fig.add_subplot(1, 2, 1, projection='3d')
+            ax2d = self.fig.add_subplot(1, 2, 2)
+
+            # ---- Her bar elemanının (eid/pid'ine göre) bu metrikteki değerini topla ----
+            records = []  # (bar_element_dict, key, value)
+            for be in self.bar_elements:
+                key = be['eid'] if group_by == 'Bar Element ID' else be['pid']
+                val = None
+                if df is not None and metric in df.columns and key in df.index:
+                    v = df.loc[key, metric]
+                    if isinstance(v, pd.Series):  # aynı ID'den birden fazla satır kalmışsa
+                        v = v.iloc[0]
+                    val = v
+                records.append((be, key, val))
+
+            # ---- Bağlam (context) için shell mesh'i soluk gri çiz ----
+            if self.shell_elements:
+                verts = [[self.node_coords[n] for n in se['nodes']] for se in self.shell_elements]
+                shell_poly = Poly3DCollection(verts, facecolor=(0.6, 0.6, 0.6, 0.12),
+                                              edgecolor=(0.5, 0.5, 0.5, 0.25), linewidths=0.3)
+                ax3d.add_collection3d(shell_poly)
+
+            cmap = None
+            norm = None
+            numeric_vals = []
+            mat_color = {}
+            materials = []
+
+            if is_material:
+                materials = sorted({str(v) for _, _, v in records
+                                    if v is not None and not (isinstance(v, float) and pd.isna(v))})
+                palette = self._get_cmap('tab20', max(len(materials), 1))
+                mat_color = {m: palette(i % 20) for i, m in enumerate(materials)}
+            else:
+                for _, _, v in records:
+                    try:
+                        if v is not None and not (isinstance(v, float) and pd.isna(v)):
+                            numeric_vals.append(float(v))
+                    except (TypeError, ValueError):
+                        pass
+                cmap_name = 'RdYlGn' if metric == 'Life' else 'viridis'
+                cmap = self._get_cmap(cmap_name)
+                if numeric_vals:
+                    vmin, vmax = min(numeric_vals), max(numeric_vals)
+                    if vmin == vmax:
+                        vmin, vmax = vmin - 1, vmax + 1
+                else:
+                    vmin, vmax = 0.0, 1.0
+                norm = mpl_colors.Normalize(vmin=vmin, vmax=vmax)
+
+            # ---- Bar elemanlarını (CBAR/CBEAM) renklendirerek çiz ----
+            segments = []
+            seg_colors = []
+            for be, key, val in records:
+                segments.append([self.node_coords[be['n1']], self.node_coords[be['n2']]])
+                if is_material:
+                    seg_colors.append(mat_color.get(str(val), (0.75, 0.75, 0.75, 1.0))
+                                      if val is not None and not (isinstance(val, float) and pd.isna(val))
+                                      else (0.75, 0.75, 0.75, 1.0))
+                else:
+                    try:
+                        if val is None or (isinstance(val, float) and pd.isna(val)):
+                            raise ValueError
+                        seg_colors.append(cmap(norm(float(val))))
+                    except (TypeError, ValueError):
+                        seg_colors.append((0.75, 0.75, 0.75, 1.0))  # veri yok -> nötr gri
+            if segments:
+                line_coll = Line3DCollection(segments, colors=seg_colors, linewidths=2.5)
+                ax3d.add_collection3d(line_coll)
+
+            # ---- Eksen sınırları: tüm düğümlerin kapladığı kutuya göre ----
+            if self.node_coords:
+                xs, ys, zs = zip(*self.node_coords.values())
+                ax3d.set_xlim3d(min(xs), max(xs))
+                ax3d.set_ylim3d(min(ys), max(ys))
+                ax3d.set_zlim3d(min(zs), max(zs))
+                self._set_axes_equal(ax3d)
+            ax3d.set_xlabel('X'); ax3d.set_ylabel('Y'); ax3d.set_zlabel('Z')
+            ax3d.set_title(f"{group_by} \u2192 {metric}", fontsize=10)
+
+            if is_material and materials:
+                handles = [Patch(color=mat_color[m], label=m) for m in materials]
+                ax3d.legend(handles=handles, loc='upper left', fontsize=7, bbox_to_anchor=(0.0, 1.0))
+            elif not is_material and numeric_vals:
+                mappable = mpl_cm.ScalarMappable(norm=norm, cmap=cmap)
+                mappable.set_array([])
+                self.fig.colorbar(mappable, ax=ax3d, shrink=0.6, pad=0.08, label=metric)
+
+            # ---- Sağdaki 2B panel: sayısal değerler için ID'ye göre sıralı
+            # dağılım, Material için eleman sayısı çubuk grafiği ----
+            if is_material:
+                counts = {}
+                for _, _, val in records:
+                    if val is None or (isinstance(val, float) and pd.isna(val)):
+                        continue
+                    key_m = str(val)
+                    counts[key_m] = counts.get(key_m, 0) + 1
+                if counts:
+                    names = list(counts.keys())
+                    vals = [counts[n] for n in names]
+                    bar_colors = [mat_color[n] for n in names]
+                    ax2d.bar(range(len(names)), vals, color=bar_colors)
+                    ax2d.set_xticks(range(len(names)))
+                    ax2d.set_xticklabels(names, rotation=45, ha='right', fontsize=7)
+                    ax2d.set_ylabel('Element count')
+                    ax2d.set_title('Material distribution', fontsize=10)
+                else:
+                    ax2d.text(0.5, 0.5, 'No material data', ha='center', va='center')
+                self.stats_label.config(text=f"{len(records)} bar element(s), {len(materials)} distinct material(s)")
+            else:
+                xs_ids, ys_vals = [], []
+                for be, key, val in records:
+                    try:
+                        if val is None or (isinstance(val, float) and pd.isna(val)):
+                            continue
+                        ys_vals.append(float(val))
+                        xs_ids.append(key)
+                    except (TypeError, ValueError):
+                        pass
+                if ys_vals:
+                    order = sorted(range(len(xs_ids)), key=lambda i: ys_vals[i])
+                    xs_sorted = [xs_ids[i] for i in order]
+                    ys_sorted = [ys_vals[i] for i in order]
+                    pt_colors = [cmap(norm(v)) for v in ys_sorted]
+                    ax2d.scatter(range(len(xs_sorted)), ys_sorted, c=pt_colors, s=16)
+                    step = max(1, len(xs_sorted) // 15)
+                    tick_idx = list(range(0, len(xs_sorted), step))
+                    ax2d.set_xticks(tick_idx)
+                    ax2d.set_xticklabels([str(xs_sorted[i]) for i in tick_idx], rotation=60, fontsize=6)
+                    ax2d.set_xlabel(group_by)
+                    ax2d.set_ylabel(metric)
+                    ax2d.set_title(f"{metric} by {group_by} (sorted)", fontsize=10)
+                    ax2d.grid(alpha=0.3)
+                    self.stats_label.config(
+                        text=f"{len(ys_vals)}/{len(records)} bar element(s) have {metric} data - "
+                             f"min={min(ys_vals):.3g}  max={max(ys_vals):.3g}  avg={sum(ys_vals)/len(ys_vals):.3g}")
+                else:
+                    ax2d.text(0.5, 0.5, f'No {metric} data loaded for this grouping\n'
+                                        f'(Load Summary first)', ha='center', va='center')
+                    self.stats_label.config(text=f"{len(records)} bar element(s) - no {metric} data loaded")
+
+            self.fig.tight_layout()
+            self.canvas.draw()
+        except Exception as e:
+            self._log(f"ERROR plotting: {e}")
+            messagebox.showerror("Error", f"Could not plot:\n{e}")
 
 
 # ============================================================================

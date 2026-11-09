@@ -7262,6 +7262,21 @@ class VisualizationResultsTab:
         self.group_by = tk.StringVar(value="Bar Property ID")  # "Bar Property ID" | "Bar Element ID"
         self.color_by = tk.StringVar(value="Life")              # "Life" | "t (mm)" | "d" | "Material"
 
+        # ---- Renk skalası (contour) ayarları ----
+        # scale_auto açıkken Min/Max veriden otomatik hesaplanır (eski
+        # davranış); kullanıcı kapatıp kendi Min/Max/Levels değerlerini
+        # girerse, renk skalası o aralığa ve o kadar banda (kademeye) göre çizilir.
+        self.scale_auto = tk.BooleanVar(value=True)
+        self.scale_min = tk.StringVar(value="")
+        self.scale_max = tk.StringVar(value="")
+        self.scale_levels = tk.StringVar(value="10")  # kaç ayrı renk bandına (kademeye) bölüneceği
+
+        # ---- Görünüm ayarı ----
+        # True iken 2B yan grafik gizlenir ve 3B FEM görünümü tüm çizim
+        # alanını kaplar - kullanıcı modeli daha büyük görüp rahatça
+        # döndürüp/yakınlaştırıp inceleyebilsin diye.
+        self.maximize_3d = tk.BooleanVar(value=False)
+
         # ---- BDF'ten çıkarılan mesh verisi ----
         self.bdf_model = None
         self.node_coords = {}      # nid -> (x, y, z)
@@ -7340,6 +7355,36 @@ class VisualizationResultsTab:
         color_combo.pack(side=tk.LEFT, padx=5)
         color_combo.bind('<<ComboboxSelected>>', lambda e: self._on_setting_changed())
         ttk.Button(cb_frame, text="\u25B6  Plot", command=self.plot, style='Accent.TButton').pack(side=tk.LEFT, padx=15)
+        # ---- Renk skalası (contour) ayar satırı ----
+        # "Auto" işaretliyken Min/Max veriden hesaplanır (eski davranış);
+        # kapatılırsa kullanıcı kendi Min/Max/Levels (kademe sayısı)
+        # değerlerini girip "Apply" ile (veya Enter'a basarak) uygulayabilir.
+        scale_frame = ttk.Frame(f2)
+        scale_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(scale_frame, text="Color Scale:", width=16).pack(side=tk.LEFT)
+        ttk.Checkbutton(scale_frame, text="Auto", variable=self.scale_auto,
+                        command=self._on_scale_auto_toggled).pack(side=tk.LEFT)
+        ttk.Label(scale_frame, text="Min:").pack(side=tk.LEFT, padx=(10, 2))
+        self.scale_min_entry = ttk.Entry(scale_frame, textvariable=self.scale_min, width=9, state='disabled')
+        self.scale_min_entry.pack(side=tk.LEFT)
+        ttk.Label(scale_frame, text="Max:").pack(side=tk.LEFT, padx=(8, 2))
+        self.scale_max_entry = ttk.Entry(scale_frame, textvariable=self.scale_max, width=9, state='disabled')
+        self.scale_max_entry.pack(side=tk.LEFT)
+        ttk.Label(scale_frame, text="Levels:").pack(side=tk.LEFT, padx=(8, 2))
+        self.scale_levels_entry = ttk.Entry(scale_frame, textvariable=self.scale_levels, width=5)
+        self.scale_levels_entry.pack(side=tk.LEFT)
+        for entry in (self.scale_min_entry, self.scale_max_entry, self.scale_levels_entry):
+            entry.bind('<Return>', lambda e: self._on_setting_changed())
+        ttk.Button(scale_frame, text="Apply", command=self._on_setting_changed).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(scale_frame, text="(uncheck Auto to set your own min/max and how many color bands "
+                                     "the legend is split into - for Life/t (mm)/d only)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=8)
+
+        # ---- Görünüm satırı ----
+        view_frame = ttk.Frame(f2)
+        view_frame.pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(view_frame, text="Maximize 3D View (hide the side chart for a bigger FEM view)",
+                        variable=self.maximize_3d, command=self._on_setting_changed).pack(side=tk.LEFT)
 
         self.stats_label = ttk.Label(f2, text="", foreground=_APP_COLORS.get('primary_dark', '#1d4ed8'),
                                      font=('Segoe UI', 9, 'bold'))
@@ -7349,7 +7394,7 @@ class VisualizationResultsTab:
         f3 = ttk.LabelFrame(main, text="\U0001F5FA  3. FEM Visualization", padding=5)
         f3.pack(fill=tk.BOTH, expand=True, pady=5)
 
-        self.fig = Figure(figsize=(11, 5.5), dpi=90)
+        self.fig = Figure(figsize=(12, 6.5), dpi=95)
         self.canvas = FigureCanvasTkAgg(self.fig, master=f3)
         toolbar_frame = ttk.Frame(f3)
         toolbar_frame.pack(fill=tk.X)
@@ -7358,6 +7403,12 @@ class VisualizationResultsTab:
         self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
         self.toolbar.update()
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        # Fare tekerleği ile 3B görünümde yakınlaştırma/uzaklaştırma -
+        # NavigationToolbar2Tk'nin "zoom to rectangle" aracı 3B eksenlerde
+        # pek işe yaramadığından, modeli yakından incelemenin en pratik
+        # yolu bu - bkz. _on_scroll_zoom. Bir kere bağlanması yeterli,
+        # çünkü self.canvas her plot()'ta yeniden oluşturulmuyor.
+        self.canvas.mpl_connect('scroll_event', self._on_scroll_zoom)
         self._draw_placeholder()
 
         # ---- Durum/log kutusu ----
@@ -7387,6 +7438,37 @@ class VisualizationResultsTab:
     def _on_setting_changed(self):
         if self.bdf_model is not None:
             self.plot()
+
+    # _on_scale_auto_toggled: "Auto" kutusu işaretlenip/kaldırıldığında
+    # Min/Max giriş kutularını etkinleştir/devre dışı bırak (Levels her
+    # zaman düzenlenebilir kalır - bant sayısı Auto modda da geçerli),
+    # sonra bir çizim varsa yeniden çiz.
+    def _on_scale_auto_toggled(self):
+        state = 'disabled' if self.scale_auto.get() else 'normal'
+        self.scale_min_entry.config(state=state)
+        self.scale_max_entry.config(state=state)
+        self._on_setting_changed()
+
+    # _on_scroll_zoom: fare tekerleği ile SADECE 3B eksenler üzerindeyken
+    # yakınlaştır/uzaklaştır - mevcut görünümün merkezini sabit tutarak
+    # X/Y/Z sınırlarını aynı oranda küçültüp/büyütür.
+    def _on_scroll_zoom(self, event):
+        ax = event.inaxes
+        if ax is None or not hasattr(ax, 'get_proj'):
+            return  # 2B panel üzerindeyse veya eksen dışındaysa bir şey yapma
+        scale = 0.9 if event.button == 'up' else 1.1
+        try:
+            x_lim = ax.get_xlim3d(); y_lim = ax.get_ylim3d(); z_lim = ax.get_zlim3d()
+        except Exception:
+            return
+        xc, yc, zc = sum(x_lim) / 2, sum(y_lim) / 2, sum(z_lim) / 2
+        xr = (x_lim[1] - x_lim[0]) / 2 * scale
+        yr = (y_lim[1] - y_lim[0]) / 2 * scale
+        zr = (z_lim[1] - z_lim[0]) / 2 * scale
+        ax.set_xlim3d(xc - xr, xc + xr)
+        ax.set_ylim3d(yc - yr, yc + yr)
+        ax.set_zlim3d(zc - zr, zc + zr)
+        self.canvas.draw_idle()
 
     # ==================== BDF YÜKLEME ====================
     def load_bdf(self):
@@ -7633,8 +7715,18 @@ class VisualizationResultsTab:
             is_material = (metric == 'Material')
 
             self.fig.clear()
-            ax3d = self.fig.add_subplot(1, 2, 1, projection='3d')
-            ax2d = self.fig.add_subplot(1, 2, 2)
+            # "Maximize 3D View" işaretliyse yan 2B grafiği hiç oluşturma -
+            # 3B FEM görünümü tüm çizim alanını kaplasın (büyütülmüş, daha
+            # rahat döndürülüp/incelenebilen görünüm). İşaretli değilse,
+            # 3B tarafa 2B tarafından daha fazla pay ver (3:2 oranı) - yine
+            # de varsayılan olarak eski 50/50'den daha büyük bir FEM görünümü.
+            if self.maximize_3d.get():
+                ax3d = self.fig.add_subplot(1, 1, 1, projection='3d')
+                ax2d = None
+            else:
+                gs = self.fig.add_gridspec(1, 2, width_ratios=[3, 2])
+                ax3d = self.fig.add_subplot(gs[0], projection='3d')
+                ax2d = self.fig.add_subplot(gs[1])
 
             # ---- Her bar elemanının (eid/pid'ine göre) bu metrikteki değerini topla ----
             records = []  # (bar_element_dict, key, value)
@@ -7674,14 +7766,50 @@ class VisualizationResultsTab:
                     except (TypeError, ValueError):
                         pass
                 cmap_name = 'RdYlGn' if metric == 'Life' else 'viridis'
-                cmap = self._get_cmap(cmap_name)
+
+                # ---- Renk skalası aralığı: Auto ise veriden, değilse
+                # kullanıcının Min/Max kutularından al. Kademe (Levels)
+                # sayısı HER ZAMAN kullanıcıdan okunur (Auto modda da
+                # geçerlidir) - HyperMesh'teki gibi bantlı (discrete)
+                # bir contour skalası elde etmek için. ----
                 if numeric_vals:
-                    vmin, vmax = min(numeric_vals), max(numeric_vals)
-                    if vmin == vmax:
-                        vmin, vmax = vmin - 1, vmax + 1
+                    auto_vmin, auto_vmax = min(numeric_vals), max(numeric_vals)
                 else:
-                    vmin, vmax = 0.0, 1.0
-                norm = mpl_colors.Normalize(vmin=vmin, vmax=vmax)
+                    auto_vmin, auto_vmax = 0.0, 1.0
+
+                if self.scale_auto.get():
+                    vmin, vmax = auto_vmin, auto_vmax
+                    # Kullanıcı Auto'yu kapatırsa düzenlemeye başlayacağı
+                    # makul bir başlangıç değeri görsün diye kutuları güncelle.
+                    self.scale_min.set(f"{vmin:.4g}")
+                    self.scale_max.set(f"{vmax:.4g}")
+                else:
+                    try:
+                        vmin = float(self.scale_min.get())
+                        vmax = float(self.scale_max.get())
+                        if vmin >= vmax:
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        self._log("  WARNING: invalid Min/Max - falling back to Auto range for this plot.")
+                        vmin, vmax = auto_vmin, auto_vmax
+
+                if vmin == vmax:
+                    vmin, vmax = vmin - 1, vmax + 1
+
+                try:
+                    n_levels = int(float(self.scale_levels.get()))
+                    if n_levels < 1:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    n_levels = 10
+                    self.scale_levels.set("10")
+
+                # BoundaryNorm + ayrık (discrete) renk haritası: değer
+                # aralığını n_levels eşit banda bölüp her banda sabit bir
+                # renk atar - HyperMesh'teki "contour legend" görünümü.
+                boundaries = [vmin + (vmax - vmin) * i / n_levels for i in range(n_levels + 1)]
+                cmap = self._get_cmap(cmap_name, n_levels)
+                norm = mpl_colors.BoundaryNorm(boundaries, cmap.N, clip=True)
 
             # ---- Bar elemanlarını (CBAR/CBEAM) renklendirerek çiz ----
             segments = []
@@ -7710,20 +7838,72 @@ class VisualizationResultsTab:
                 ax3d.set_ylim3d(min(ys), max(ys))
                 ax3d.set_zlim3d(min(zs), max(zs))
                 self._set_axes_equal(ax3d)
+            # ---- 3B görünümü büyüt (zoom) ----
+            # matplotlib'in Axes3D'si, kendisine ayrılan dikdörtgen alanı
+            # (özellikle TEK başına tüm figürü kapladığında, yani Maximize
+            # 3D View açıkken) kübik görünüm korumak için otomatik olarak
+            # KÜÇÜLTÜP ortalar - bu da "büyütülmüş" görünümün aslında daha
+            # KÜÇÜK görünmesine yol açar. set_box_aspect'in zoom parametresi
+            # (matplotlib 3.6+), ayrılan alanı değiştirmeden İÇERİĞİ o alan
+            # içinde büyütür - model gerçekten daha büyük ve incelemeye
+            # daha elverişli görünsün diye. Maximize açıkken daha agresif,
+            # kapalıyken (2B panelle paylaşılan dar alanda) daha ölçülü
+            # bir zoom uygulanıyor. Eski matplotlib sürümlerinde zoom
+            # parametresi yoksa (TypeError), sessizce aspect-only'e düş.
+            try:
+                ax3d.set_box_aspect((1, 1, 1), zoom=1.5 if ax2d is None else 1.2)
+            except TypeError:
+                try:
+                    ax3d.set_box_aspect((1, 1, 1))
+                except Exception:
+                    pass
             ax3d.set_xlabel('X'); ax3d.set_ylabel('Y'); ax3d.set_zlabel('Z')
             ax3d.set_title(f"{group_by} \u2192 {metric}", fontsize=10)
 
             if is_material and materials:
                 handles = [Patch(color=mat_color[m], label=m) for m in materials]
-                ax3d.legend(handles=handles, loc='upper left', fontsize=7, bbox_to_anchor=(0.0, 1.0))
+                # Lejant, ax3d'nin KENDİ köşesine değil, FİGÜRÜN sol üst
+                # köşesine sabitleniyor - zoom ile büyütülen 3B içerik
+                # genelde kutusunun ortasına/sağına doğru render edildiği
+                # için (bkz. set_box_aspect zoom notu), eksen-bazlı bir
+                # lejant onun üstüne biner; figür-bazlı lejant bundan bağımsız.
+                self.fig.legend(handles=handles, loc='upper left', fontsize=7, bbox_to_anchor=(0.01, 0.98))
             elif not is_material and numeric_vals:
                 mappable = mpl_cm.ScalarMappable(norm=norm, cmap=cmap)
                 mappable.set_array([])
-                self.fig.colorbar(mappable, ax=ax3d, shrink=0.6, pad=0.08, label=metric)
+                # boundaries/ticks=boundaries + spacing='uniform': renk
+                # çubuğunu HyperMesh'teki gibi n_levels adet eşit genişlikte
+                # bant olarak çizer, her bandın sınır değerini etiket yapar.
+                self.fig.colorbar(mappable, ax=ax3d, boundaries=boundaries, ticks=boundaries,
+                                  spacing='uniform', shrink=0.7, pad=0.08, label=metric,
+                                  format='%.3g')
 
-            # ---- Sağdaki 2B panel: sayısal değerler için ID'ye göre sıralı
-            # dağılım, Material için eleman sayısı çubuk grafiği ----
+            # ---- İstatistik satırı: ax2d olsun olmasın (Maximize 3D View
+            # açıkken bile) HER ZAMAN güncellenir. ----
             if is_material:
+                self.stats_label.config(text=f"{len(records)} bar element(s), {len(materials)} distinct material(s)")
+            else:
+                ys_vals_all = []
+                for _, _, val in records:
+                    try:
+                        if val is None or (isinstance(val, float) and pd.isna(val)):
+                            continue
+                        ys_vals_all.append(float(val))
+                    except (TypeError, ValueError):
+                        pass
+                if ys_vals_all:
+                    self.stats_label.config(
+                        text=f"{len(ys_vals_all)}/{len(records)} bar element(s) have {metric} data - "
+                             f"min={min(ys_vals_all):.3g}  max={max(ys_vals_all):.3g}  "
+                             f"avg={sum(ys_vals_all)/len(ys_vals_all):.3g}  "
+                             f"(scale: {vmin:.3g} to {vmax:.3g}, {n_levels} band(s))")
+                else:
+                    self.stats_label.config(text=f"{len(records)} bar element(s) - no {metric} data loaded")
+
+            # ---- Sağdaki 2B panel: "Maximize 3D View" kapalıyken çizilir -
+            # sayısal değerler için ID'ye göre sıralı dağılım, Material için
+            # eleman sayısı çubuk grafiği. ----
+            if ax2d is not None and is_material:
                 counts = {}
                 for _, _, val in records:
                     if val is None or (isinstance(val, float) and pd.isna(val)):
@@ -7741,8 +7921,7 @@ class VisualizationResultsTab:
                     ax2d.set_title('Material distribution', fontsize=10)
                 else:
                     ax2d.text(0.5, 0.5, 'No material data', ha='center', va='center')
-                self.stats_label.config(text=f"{len(records)} bar element(s), {len(materials)} distinct material(s)")
-            else:
+            elif ax2d is not None:
                 xs_ids, ys_vals = [], []
                 for be, key, val in records:
                     try:
@@ -7766,15 +7945,18 @@ class VisualizationResultsTab:
                     ax2d.set_ylabel(metric)
                     ax2d.set_title(f"{metric} by {group_by} (sorted)", fontsize=10)
                     ax2d.grid(alpha=0.3)
-                    self.stats_label.config(
-                        text=f"{len(ys_vals)}/{len(records)} bar element(s) have {metric} data - "
-                             f"min={min(ys_vals):.3g}  max={max(ys_vals):.3g}  avg={sum(ys_vals)/len(ys_vals):.3g}")
                 else:
                     ax2d.text(0.5, 0.5, f'No {metric} data loaded for this grouping\n'
                                         f'(Load Summary first)', ha='center', va='center')
-                    self.stats_label.config(text=f"{len(records)} bar element(s) - no {metric} data loaded")
 
-            self.fig.tight_layout()
+            # tight_layout() 2B paneli varken kenar boşluklarını iyi
+            # ayarlıyor, ama TEK BAŞINA 3B eksen (Maximize açıkken) için
+            # onu tekrar ortalayıp küçültüyor - bu yüzden o durumda sabit,
+            # geniş kenar boşluklarıyla subplots_adjust kullanılıyor.
+            if ax2d is not None:
+                self.fig.tight_layout()
+            else:
+                self.fig.subplots_adjust(left=0.02, right=0.96, top=0.90, bottom=0.08)
             self.canvas.draw()
         except Exception as e:
             self._log(f"ERROR plotting: {e}")

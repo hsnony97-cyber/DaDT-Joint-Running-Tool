@@ -3102,28 +3102,46 @@ class BarPropertySolverTab:
                         # referans çizgisi dim2 yönünde zaten ortada - ek
                         # terime gerek yok. C-kesit ise TEK eksende simetrik
                         # (web bir tarafta, açık ağız diğer tarafta); bu
-                        # yüzden bar'ın GERÇEK local-y ekseni (CBAR'ın G0/
-                        # X1,X2,X3 orientation vektöründen, pyNastran'ın
-                        # get_axes()'i ile - normale göre DEĞİL, Nastran'ın
-                        # resmi orientation kuralına göre) yönünde, dim2'nin
-                        # yarısı kadar ek bir kaydırma uygulanır. yhat zaten
-                        # işaretli (signed) bir vektör olduğundan - CBAR'ı
-                        # kuran mühendisin o anda local-y'yi hangi tarafa
-                        # yönlendirdiğini yansıtır - ayrı bir +/- seçimine
-                        # gerek kalmıyor.
+                        # yüzden dim2'nin yarısı kadar ek bir kaydırma
+                        # uygulanır - ama bu YÖN, CBAR'ın kendi BDF'teki
+                        # orientation vektöründen (G0/X1,X2,X3) DEĞİL,
+                        # tamamen geometriden kuruluyor:
+                        #   X = bar ekseni (GA -> GB)
+                        #   Z = zaten yukarıda hesaplanan panel normali (best_normal)
+                        #   Y = Z çarpı X (sağ-el kuralı, X-Y-Z sağ-el sistemi olacak şekilde)
+                        # Bu üçü de zaten GLOBAL XYZ'de - ayrı bir local->global
+                        # çevrimi gerekmiyor (I teriminde de aynı şekilde
+                        # best_normal doğrudan global'de kullanılıyordu).
+                        # CBAR'ın kendi orientation vektörünü (v) kullanmamamızın
+                        # sebebi: v, panelin hangi yüzeyde olduğundan bağımsız,
+                        # sadece BDF'e o an nasıl girildiğine bağlı - paneldeki
+                        # gerçek fiziksel yüzeye göre tutarlı olacağının garantisi
+                        # yok (HyperMesh'in tek-ok "orientation" gösterimiyle de
+                        # karışabiliyor). Burada kurulan Y ise doğrudan bar'ın iki
+                        # ucu ile panelin gerçek normaline bağlı - panel ve bar
+                        # arasındaki fiziksel ilişkiden türetiliyor.
                         sec_type = self.bar_section_types.get(eid, 'I')
                         if sec_type == 'C':
+                            y_vec = None
                             try:
-                                is_failed, (_wa, _wb, _ihat, yhat, _zhat) = elem.get_axes(bdf)
-                            except Exception:
-                                is_failed, yhat = True, None
-                            if not is_failed and yhat is not None:
-                                dim2 = self.bar_properties.get(pid, {}).get('dim2', bar_t)
-                                dim2 = max(0.1, dim2)
-                                vec = vec + yhat * (dim2 / 2.0)
-                            else:
-                                self.log(f"    WARNING: Bar {eid} (Section Type=C) - could not "
-                                          f"compute local-y orientation, skipping eccentricity term.")
+                                pA = np.array(bdf.nodes[bar_nodes[0]].get_position())
+                                pB = np.array(bdf.nodes[bar_nodes[1]].get_position())
+                                x_vec = pB - pA
+                                y_vec = np.cross(best_normal, x_vec)
+                                y_len = np.linalg.norm(y_vec)
+                            except Exception as e:
+                                self.log(f"    WARNING: Bar {eid} (Section Type=C) - eccentricity "
+                                          f"geometry error: {e}, skipping extra term.")
+                            if y_vec is not None:
+                                if y_len > 1e-10:
+                                    yhat = y_vec / y_len
+                                    dim2 = self.bar_properties.get(pid, {}).get('dim2', bar_t)
+                                    dim2 = max(0.1, dim2)
+                                    vec = vec + yhat * (dim2 / 2.0)
+                                else:
+                                    self.log(f"    WARNING: Bar {eid} (Section Type=C) - bar axis "
+                                              f"parallel to panel normal, cannot construct eccentricity "
+                                              f"direction, skipping extra term.")
 
                         rows.append({'Type': 'Bar', 'Element': eid, 'ZOffset': '',
                                      'WA_X': vec[0], 'WA_Y': vec[1], 'WA_Z': vec[2]})

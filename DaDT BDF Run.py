@@ -2682,6 +2682,45 @@ class BarPropertySolverTab:
         self.log("LOADING ELEMENT IDs FOR OFFSET")
         self.log("=" * 70)
 
+        # _harvest_section_types: bir dataframe'in sütun BAŞLIKLARINA bakıp
+        # (pozisyona değil - "Section Type" sütunu 2., 3., ... herhangi bir
+        # yerde olabilir) içinde hem "section" hem "type" geçen bir başlık
+        # varsa, o sütunu ilk sütundaki (Bar Element ID) ID'lerle eşleştirip
+        # self.bar_section_types'a ekler. Hem "Section_Type" diye AYRI bir
+        # sayfa için, hem de "Bar_Offset" sayfasının YANINA (ikinci sütun
+        # olarak) eklenmiş Section Type için aynı mantık çalışsın diye tek
+        # bir yardımcı fonksiyon olarak çıkarıldı.
+        def _harvest_section_types(df, positional_fallback=False):
+            sec_col = None
+            for col in df.columns:
+                cl = str(col).lower().replace('_', '').replace(' ', '')
+                if 'section' in cl and 'type' in cl:
+                    sec_col = col
+                    break
+            if sec_col is None:
+                # Başlık eşleşmedi. "Bar_Offset" gibi ortak/paylaşılan bir
+                # sayfada 2. sütunun NE olduğu belirsiz olabileceğinden
+                # (Section Type olmayabilir) orada pozisyonel tahmine
+                # GİDİLMEZ. Ama kullanıcının kendine ait, bu amaç için
+                # açtığı AYRI bir "Section Type" sayfasında (positional_fallback=True)
+                # 2. sütun zaten bunun için var sayılır.
+                if positional_fallback and len(df.columns) >= 2:
+                    sec_col = df.columns[1]
+                else:
+                    return 0
+            id_col = df.columns[0]
+            count = 0
+            for _, row in df.iterrows():
+                try:
+                    eid = int(row[id_col])
+                    sec_type = str(row[sec_col]).strip().upper()
+                except (TypeError, ValueError):
+                    continue
+                if sec_type and sec_type != 'NAN':
+                    self.bar_section_types[eid] = sec_type
+                    count += 1
+            return count
+
         try:
             xl = pd.ExcelFile(path)
             self.landing_elem_ids = []
@@ -2697,20 +2736,20 @@ class BarPropertySolverTab:
                 elif 'bar' in sl and 'offset' in sl:
                     self.bar_offset_elem_ids = df.iloc[:, 0].dropna().astype(int).tolist()
                     self.log(f"  Bar offset: {len(self.bar_offset_elem_ids)}")
-                # "Section Type" sayfası (opsiyonel): "Bar Element ID" / "Section
-                # Type" sütunları - C kesitler için ekstra local-y eksantriklik
-                # terimi hesaplanırken kullanılır (bkz. _calculate_offset_csv).
-                # Sayfa yoksa bar_section_types boş kalır - tüm bar'lar simetrik
-                # (I gibi) kabul edilip eski davranış (ekstra terimsiz) sürer.
+                    # Section Type, Bar_Offset sayfasının kendi içine (2.
+                    # sütun olarak) eklenmiş olabilir - aynı sayfadayken de ara.
+                    n = _harvest_section_types(df)
+                    if n:
+                        self.log(f"  Section types (Bar_Offset sheet'i içinde bulundu): {n}")
+                # "Section Type" AYRI bir sayfa olarak da verilebilir (opsiyonel):
+                # "Bar Element ID" + "Section Type" başlıklı herhangi bir sayfa.
+                # C kesitler için ekstra local-y eksantriklik terimi hesaplanırken
+                # kullanılır (bkz. _calculate_offset_csv). Ne ayrı sayfa ne de
+                # Bar_Offset içinde sütun varsa bar_section_types boş kalır -
+                # tüm bar'lar simetrik (I gibi) kabul edilip eski davranış sürer.
                 elif 'section' in sl and 'type' in sl:
-                    for _, row in df.iterrows():
-                        try:
-                            eid = int(row.iloc[0])
-                            sec_type = str(row.iloc[1]).strip().upper()
-                            self.bar_section_types[eid] = sec_type
-                        except (TypeError, ValueError):
-                            continue
-                    self.log(f"  Section types: {len(self.bar_section_types)}")
+                    n = _harvest_section_types(df, positional_fallback=True)
+                    self.log(f"  Section types: {n}")
 
             self.elem_status.config(
                 text=f"Landing: {len(self.landing_elem_ids)}, Bar offset: {len(self.bar_offset_elem_ids)}, "

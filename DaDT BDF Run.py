@@ -2156,6 +2156,7 @@ class BarPropertySolverTab:
         self.maneuver_base_path = None    # Excel-properties-applied maneuver (offset source) BDF, set by _build_base_model
         self.landing_elem_ids = []        # offset uygulanacak "landing" (göçme) eleman ID'leri
         self.bar_offset_elem_ids = []     # offset uygulanacak bar eleman ID'leri
+        self.bar_section_types = {}       # eid -> "C"/"I"/... ("Section Type" sayfasından); eksikse simetrik (I gibi) kabul edilir
 
         # ---- Çalışma (run) durumu ----
         self.is_running = False       # bir Nastran çözümü şu an sürüyor mu?
@@ -2685,6 +2686,7 @@ class BarPropertySolverTab:
             xl = pd.ExcelFile(path)
             self.landing_elem_ids = []
             self.bar_offset_elem_ids = []
+            self.bar_section_types = {}
 
             for s in xl.sheet_names:
                 sl = s.lower().replace('_', '').replace(' ', '')
@@ -2695,9 +2697,24 @@ class BarPropertySolverTab:
                 elif 'bar' in sl and 'offset' in sl:
                     self.bar_offset_elem_ids = df.iloc[:, 0].dropna().astype(int).tolist()
                     self.log(f"  Bar offset: {len(self.bar_offset_elem_ids)}")
+                # "Section Type" sayfası (opsiyonel): "Bar Element ID" / "Section
+                # Type" sütunları - C kesitler için ekstra local-y eksantriklik
+                # terimi hesaplanırken kullanılır (bkz. _calculate_offset_csv).
+                # Sayfa yoksa bar_section_types boş kalır - tüm bar'lar simetrik
+                # (I gibi) kabul edilip eski davranış (ekstra terimsiz) sürer.
+                elif 'section' in sl and 'type' in sl:
+                    for _, row in df.iterrows():
+                        try:
+                            eid = int(row.iloc[0])
+                            sec_type = str(row.iloc[1]).strip().upper()
+                            self.bar_section_types[eid] = sec_type
+                        except (TypeError, ValueError):
+                            continue
+                    self.log(f"  Section types: {len(self.bar_section_types)}")
 
             self.elem_status.config(
-                text=f"Landing: {len(self.landing_elem_ids)}, Bar offset: {len(self.bar_offset_elem_ids)}",
+                text=f"Landing: {len(self.landing_elem_ids)}, Bar offset: {len(self.bar_offset_elem_ids)}, "
+                     f"Section types: {len(self.bar_section_types)}",
                 foreground="green"
             )
 
@@ -3040,6 +3057,35 @@ class BarPropertySolverTab:
                     if best_normal is not None and max_t > 0:
                         offset_mag = max_t + bar_t / 2.0
                         vec = -best_normal * offset_mag
+
+                        # ---- C-kesit (kanal) eksantriklik terimi ----
+                        # I (ve ROD/BOX gibi çift-simetrik) kesitlerde bar'ın
+                        # referans çizgisi dim2 yönünde zaten ortada - ek
+                        # terime gerek yok. C-kesit ise TEK eksende simetrik
+                        # (web bir tarafta, açık ağız diğer tarafta); bu
+                        # yüzden bar'ın GERÇEK local-y ekseni (CBAR'ın G0/
+                        # X1,X2,X3 orientation vektöründen, pyNastran'ın
+                        # get_axes()'i ile - normale göre DEĞİL, Nastran'ın
+                        # resmi orientation kuralına göre) yönünde, dim2'nin
+                        # yarısı kadar ek bir kaydırma uygulanır. yhat zaten
+                        # işaretli (signed) bir vektör olduğundan - CBAR'ı
+                        # kuran mühendisin o anda local-y'yi hangi tarafa
+                        # yönlendirdiğini yansıtır - ayrı bir +/- seçimine
+                        # gerek kalmıyor.
+                        sec_type = self.bar_section_types.get(eid, 'I')
+                        if sec_type == 'C':
+                            try:
+                                is_failed, (_wa, _wb, _ihat, yhat, _zhat) = elem.get_axes(bdf)
+                            except Exception:
+                                is_failed, yhat = True, None
+                            if not is_failed and yhat is not None:
+                                dim2 = self.bar_properties.get(pid, {}).get('dim2', bar_t)
+                                dim2 = max(0.1, dim2)
+                                vec = vec + yhat * (dim2 / 2.0)
+                            else:
+                                self.log(f"    WARNING: Bar {eid} (Section Type=C) - could not "
+                                          f"compute local-y orientation, skipping eccentricity term.")
+
                         rows.append({'Type': 'Bar', 'Element': eid, 'ZOffset': '',
                                      'WA_X': vec[0], 'WA_Y': vec[1], 'WA_Z': vec[2]})
 
@@ -5645,7 +5691,8 @@ class FullRunTab:
         self._add_file_row(f1, "Master Input Excel:", self.master_input_excel_path,
                             [("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
         ttk.Label(f1, text="(one excel with every sheet needed: Bar Property, Skin Property, "
-                            "Landing_Offset, Bar_Offset, Load_Extraction, DTCG_Input_Excel_Data)",
+                            "Landing_Offset, Bar_Offset, Load_Extraction, DTCG_Input_Excel_Data, "
+                            "Section_Type [optional - Bar Element ID/C or I, for channel eccentricity offset])",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
         self._add_file_row(f1, "Nastran Exe:", self.nastran_path,
                             [("Executable", "*.exe"), ("All", "*.*")])
@@ -6364,7 +6411,8 @@ class IterativeFullRunTab:
                             [("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
         ttk.Label(f1, text="(one excel with every sheet needed: Bar Property, Skin Property, "
                             "Landing_Offset, Bar_Offset, Load_Extraction, DTCG_Input_Excel_Data, "
-                            "Load_Modify - never modified in place, only a private working copy is)",
+                            "Load_Modify, Section_Type [optional - Bar Element ID/C or I, for channel "
+                            "eccentricity offset] - never modified in place, only a private working copy is)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
 
         self._add_file_row(f1, "Nastran Exe:", self.nastran_path,

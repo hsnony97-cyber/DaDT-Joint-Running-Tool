@@ -3078,77 +3078,20 @@ class BarPropertySolverTab:
                 bar_nodes = elem.node_ids[:2]
                 if bar_nodes[0] in node_to_shells and bar_nodes[1] in node_to_shells:
                     common = set(node_to_shells[bar_nodes[0]]) & set(node_to_shells[bar_nodes[1]])
-
-                    sec_type = self.bar_section_types.get(eid, 'I')
-
-                    # C-kesit (kanal) ise, eksantriklik yönünü (yhat - CBAR'ın
-                    # kendi orientation vektöründen, GA/GB sırasından bağımsız
-                    # - bkz. get_axes() notu altta) HANGİ SKIN SEÇİLECEĞİNDEN
-                    # ÖNCE hesaplıyoruz, çünkü C için skin seçim kriteri artık
-                    # kalınlık değil, bu yön olacak (aşağıdaki seçim bloğuna bkz.).
-                    yhat = None
-                    if sec_type == 'C':
-                        try:
-                            is_failed, (_wa, _wb, _ihat, yhat, _zhat) = elem.get_axes(bdf)
-                            if is_failed:
-                                yhat = None
-                        except Exception:
-                            yhat = None
-                        if yhat is None:
-                            self.log(f"    WARNING: Bar {eid} (Section Type=C) - could not compute "
-                                      f"local-y orientation, falling back to max-thickness skin "
-                                      f"selection (like I-section) for this bar.")
-
                     max_t = 0
                     best_normal = None
-
-                    if sec_type == 'C' and yhat is not None:
-                        # ---- C-kesit skin seçimi: KALINLIĞA BAKILMAZ. Ortak
-                        # shell'ler arasından, eksantrikliğin (yhat) işaret
-                        # ettiği TARAFTA duran paneli seçiyoruz - bar'ın orta
-                        # noktasından her aday shell'in merkezine olan vektörü
-                        # yhat üzerine izdüşürüp en büyük (en pozitif)
-                        # izdüşüme sahip olanı alıyoruz. Birden fazla panelin
-                        # farklı açılarda kesiştiği bir köşede (örn. T/L
-                        # birleşimi), "en kalın" seçimi yhat'in gerçekte
-                        # baktığı panelden FARKLI bir paneli seçebilir - bu
-                        # yüzden C için yön-bazlı seçim, I için kalınlık-bazlı
-                        # seçimden AYRI tutuluyor (I/base mantığı değişmedi).
-                        bar_mid = (np.array(bdf.nodes[bar_nodes[0]].get_position()) +
-                                   np.array(bdf.nodes[bar_nodes[1]].get_position())) / 2.0
-                        best_proj = -np.inf
-                        for shell_eid in common:
-                            if shell_eid not in landing_normals or landing_normals[shell_eid] is None:
-                                continue
+                    # Ortak shell'ler arasından EN KALIN olanı seç (en kalın
+                    # landing kalınlığı, bar'ın gerçekte hangi yüzeyde
+                    # oturduğunu en iyi temsil eden varsayım).
+                    for shell_eid in common:
+                        if shell_eid in landing_normals:
                             shell_elem = bdf.elements[shell_eid]
                             shell_pid = shell_elem.pid if hasattr(shell_elem, 'pid') else None
-                            if not shell_pid:
-                                continue
-                            try:
-                                shell_nodes = [bdf.nodes[n] for n in shell_elem.node_ids if n in bdf.nodes]
-                                shell_centroid = np.mean(
-                                    [np.array(n.get_position()) for n in shell_nodes], axis=0)
-                            except Exception:
-                                continue
-                            proj = np.dot(shell_centroid - bar_mid, yhat)
-                            if proj > best_proj:
-                                best_proj = proj
-                                best_normal = landing_normals[shell_eid]
-                                max_t = self.current_skin_thicknesses.get(shell_pid, 0)
-                    else:
-                        # ---- I (ve C'de yhat hesaplanamadıysa fallback):
-                        # ortak shell'ler arasından EN KALIN olanı seç (en
-                        # kalın landing kalınlığı, bar'ın gerçekte hangi
-                        # yüzeyde oturduğunu en iyi temsil eden varsayım).
-                        for shell_eid in common:
-                            if shell_eid in landing_normals:
-                                shell_elem = bdf.elements[shell_eid]
-                                shell_pid = shell_elem.pid if hasattr(shell_elem, 'pid') else None
-                                if shell_pid:
-                                    shell_t = self.current_skin_thicknesses.get(shell_pid, 0)
-                                    if shell_t > max_t:
-                                        max_t = shell_t
-                                        best_normal = landing_normals.get(shell_eid)
+                            if shell_pid:
+                                shell_t = self.current_skin_thicknesses.get(shell_pid, 0)
+                                if shell_t > max_t:
+                                    max_t = shell_t
+                                    best_normal = landing_normals.get(shell_eid)
 
                     if best_normal is not None and max_t > 0:
                         offset_mag = max_t + bar_t / 2.0
@@ -3157,15 +3100,37 @@ class BarPropertySolverTab:
                         # ---- C-kesit (kanal) eksantriklik terimi ----
                         # I (ve ROD/BOX gibi çift-simetrik) kesitlerde bar'ın
                         # referans çizgisi dim2 yönünde zaten ortada - ek
-                        # terime gerek yok. C-kesit TEK eksende simetrik (web
-                        # bir tarafta, açık ağız diğer tarafta); yukarıda
-                        # seçilen panele göre hesaplanan best_normal'in
-                        # üzerine, dim2'nin yarısı kadar yhat yönünde ek bir
-                        # kaydırma uygulanır.
-                        if sec_type == 'C' and yhat is not None:
-                            dim2 = self.bar_properties.get(pid, {}).get('dim2', bar_t)
-                            dim2 = max(0.1, dim2)
-                            vec = vec + yhat * (dim2 / 2.0)
+                        # terime gerek yok. C-kesit ise TEK eksende simetrik
+                        # (web bir tarafta, açık ağız diğer tarafta); bu
+                        # yüzden dim2'nin yarısı kadar ek bir kaydırma
+                        # uygulanır, YÖNÜ CBAR'ın kendi orientation
+                        # vektöründen (v - G0/X1,X2,X3) türetilen local-y
+                        # (yhat) ile belirlenir - "bar ekseni (GA->GB) çarpı
+                        # panel normali" YERİNE, çünkü o yöntem GA/GB
+                        # sırasına göre İŞARET DEĞİŞTİRİR: iki paralel bar,
+                        # fiziksel olarak aynı tarafa "baksa" bile, biri
+                        # GA=1/GB=2 diğeri GA=2/GB=1 şeklinde mesh'lenmişse
+                        # ters işaretli eksantriklik üretir (doğrulandı,
+                        # gerçek kullanıcı modelinde görüldü). Nastran'ın v
+                        # vektörü (X1,X2,X3 formatında, GA'nın pozisyonundan
+                        # BAĞIMSIZ sabit bir vektör) ise ihat ile BİRLİKTE
+                        # işaret değiştirdiğinden (ihat ters dönünce ondan
+                        # türeyen zhat de ters döner, iki eksi çarpımı
+                        # yhat'i DEĞİŞTİRMEZ) - matematiksel olarak GA/GB
+                        # sırasından bağımsız, tutarlı bir yhat garantiler.
+                        sec_type = self.bar_section_types.get(eid, 'I')
+                        if sec_type == 'C':
+                            try:
+                                is_failed, (_wa, _wb, _ihat, yhat, _zhat) = elem.get_axes(bdf)
+                            except Exception:
+                                is_failed, yhat = True, None
+                            if not is_failed and yhat is not None:
+                                dim2 = self.bar_properties.get(pid, {}).get('dim2', bar_t)
+                                dim2 = max(0.1, dim2)
+                                vec = vec + yhat * (dim2 / 2.0)
+                            else:
+                                self.log(f"    WARNING: Bar {eid} (Section Type=C) - could not "
+                                          f"compute local-y orientation, skipping eccentricity term.")
 
                         rows.append({'Type': 'Bar', 'Element': eid, 'ZOffset': '',
                                      'WA_X': vec[0], 'WA_Y': vec[1], 'WA_Z': vec[2]})

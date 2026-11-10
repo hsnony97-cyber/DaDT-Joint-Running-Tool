@@ -2969,6 +2969,60 @@ class BarPropertySolverTab:
         self.log(f"BASE MODEL SOLVE COMPLETE (total {time.time() - t_build_start:.1f}s).\n")
 
     # ==================== OFFSET CALCULATION / APPLICATION ====================
+    # _compute_bar_yhat: bir CBAR/CBEAM'in local-y eksenini (yhat) pyNastran'ın
+    # get_axes()'ini HİÇ KULLANMADAN, doğrudan GA/GB düğüm konumlarından ve
+    # orientation vektöründen (G0 ya da X1,X2,X3) hesaplar. Bunun gerekli
+    # olma sebebi: pyNastran'ın get_axes()/check_offt()'u SAYISAL OFFT
+    # kodlarını (1,2,21,22,41,42 - bazı Nastran modellerinde harf kodu
+    # "GGG" yerine kullanılan eski/alternatif bir format) desteklemiyor ve
+    # SyntaxError fırlatıyor - gerçek kullanıcı modelinde bu yüzden TÜM C
+    # kesitli bar'lar için eksantriklik hesaplanamadan (sessizce I gibi
+    # davranarak) düşüyordu. OFFT alanı sadece WA/WB uç-ofset dönüşümlerini
+    # ve GRID'in CD (displacement koordinat sistemi) != 0 durumundaki
+    # dönüşümü etkiliyor - bar'ın sadece YÖNÜNÜ (yhat) bulmak için hiç
+    # gerekli değil, bu yüzden burada hiç OFFT'e bakılmıyor. CD==0
+    # (modellerin büyük çoğunluğu - özel bir yerel koordinat sistemi
+    # tanımlanmamış GRID'ler) olduğu sürece sonuç, pyNastran'ın resmi
+    # get_axes()'i ile birebir aynı çıkar (bkz. Nastran'ın CBAR/CBEAM
+    # orientation kuralı: ihat = GA->GB; zhat = ihat×v; yhat = zhat×ihat).
+    # Dönüş: (yhat, None) başarılıysa, (None, "sebep metni") başarısızsa.
+    @staticmethod
+    def _compute_bar_yhat(bdf, elem, bar_nodes):
+        try:
+            pA = np.array(bdf.nodes[bar_nodes[0]].get_position())
+            pB = np.array(bdf.nodes[bar_nodes[1]].get_position())
+        except Exception as e:
+            return None, f"GA/GB konumu okunamadı ({e})"
+
+        ihat = pB - pA
+        i_len = np.linalg.norm(ihat)
+        if i_len < 1e-10:
+            return None, "bar uzunluğu sıfır (GA ve GB aynı noktada)"
+        ihat = ihat / i_len
+
+        if elem.g0:
+            if elem.g0 not in bdf.nodes:
+                return None, f"G0={elem.g0} referans düğümü modelde bulunamadı"
+            v = np.array(bdf.nodes[elem.g0].get_position()) - pA
+        else:
+            try:
+                v = np.array(elem.x, dtype=float)
+            except Exception as e:
+                return None, f"X1,X2,X3 okunamadı ({e})"
+
+        v_len = np.linalg.norm(v)
+        if v_len < 1e-10:
+            return None, "orientation vektörü (v) sıfır uzunlukta"
+        v = v / v_len
+
+        zhat = np.cross(ihat, v)
+        z_len = np.linalg.norm(zhat)
+        if z_len < 1e-10:
+            return None, "orientation vektörü (v), bar eksenine (neredeyse) paralel"
+        zhat = zhat / z_len
+        yhat = np.cross(zhat, ihat)
+        return yhat, None
+
     def _calculate_offset_csv(self, thickness_overrides, folder, label=""):
         """Write the maneuver (offset source) BDF at THIS iteration's
         thickness_overrides (layered on its Excel-properties base, same as any
@@ -3087,16 +3141,37 @@ class BarPropertySolverTab:
                     # skin seçim kriteri kalınlık DEĞİL, bu yön olacak.
                     yhat = None
                     if sec_type == 'C':
+                        fail_reason = None
                         try:
                             is_failed, (_wa, _wb, _ihat, yhat, _zhat) = elem.get_axes(bdf)
                             if is_failed:
                                 yhat = None
-                        except Exception:
+                                fail_reason = f"get_axes() failed (offt={elem.offt!r})"
+                        except Exception as e:
                             yhat = None
+                            fail_reason = f"get_axes() raised {type(e).__name__}: {e}"
+
                         if yhat is None:
-                            self.log(f"    WARNING: Bar {eid} (Section Type=C) - could not compute "
-                                      f"local-y orientation, falling back to max-thickness skin "
-                                      f"selection (like I-section) for this bar.")
+                            # pyNastran'ın get_axes()'i, SAYISAL OFFT kodlarını
+                            # (1,2,21,22,41,42 - bazı Nastran modellerinde
+                            # "GGG" harf kodu yerine kullanılan eski/alternatif
+                            # format) desteklemiyor ve SyntaxError fırlatıyor -
+                            # gerçek kullanıcı modelinde tespit edildi. OFFT
+                            # alanı sadece WA/WB uç-ofset dönüşümlerini ve
+                            # GRID'in CD (displacement koordinat sistemi) != 0
+                            # durumundaki dönüşümü etkiliyor - bar'ın sadece
+                            # YÖNÜNÜ (yhat) bulmak için GEREKLİ DEĞİL. Bu yüzden
+                            # OFFT'e hiç bakmayan, doğrudan GA/GB + orientation
+                            # vektöründen (v) hesaplayan bir yedek yönteme
+                            # düşüyoruz - CD==0 (modellerin büyük çoğunluğu)
+                            # olduğu sürece pyNastran'ın resmi get_axes()'i ile
+                            # birebir aynı sonucu verir.
+                            yhat, direct_fail = self._compute_bar_yhat(bdf, elem, bar_nodes)
+                            if yhat is None:
+                                self.log(f"    WARNING: Bar {eid} (Section Type=C) - could not "
+                                          f"compute local-y orientation ({fail_reason}; direct "
+                                          f"fallback also failed: {direct_fail}), falling back to "
+                                          f"max-thickness skin selection (like I-section).")
 
                     max_t = 0
                     best_normal = None

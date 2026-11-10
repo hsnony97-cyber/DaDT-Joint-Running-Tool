@@ -6866,14 +6866,140 @@ class IterativeFullRunTab:
             i += 1
         return dim1_by_pid
 
+    # _extract_bar_pid_by_eid: solve'ün yazdığı BDF'teki CBAR/CBEAM
+    # kartlarından {Bar Element ID: Bar Property ID} haritası - DTCG satırları
+    # Bar Element ID ile tutulduğunda, her elemanın GERÇEKTE hangi PBARL'a
+    # bağlı çözüldüğünü bulmak için. _extract_pbarl_dim1 ile aynı sabit-
+    # genişlik alan okuması (EID [8:16], PID [16:24]; PID boşsa Nastran
+    # kuralı gereği PID = EID).
+    @staticmethod
+    def _extract_bar_pid_by_eid(bdf_path):
+        pid_by_eid = {}
+        try:
+            with open(bdf_path, 'r', encoding='latin-1') as f:
+                lines = f.readlines()
+        except Exception:
+            return pid_by_eid
+        for line in lines:
+            card = line[:8].strip().upper()
+            if card not in ('CBAR', 'CBEAM'):
+                continue
+            try:
+                eid = int(line[8:16].strip())
+            except ValueError:
+                continue
+            pid_txt = line[16:24].strip()
+            try:
+                pid_by_eid[eid] = int(pid_txt) if pid_txt else eid
+            except ValueError:
+                continue
+        return pid_by_eid
+
+    # _recalc_with_excel: working excel'i görünmez bir Excel örneğinde açıp
+    # TÜM formülleri yeniden hesaplatıp kaydeder (Windows + Excel + pywin32
+    # varsa). openpyxl ile kaydedilen bir dosyada formüllerin hesaplanmış
+    # değerleri (cache) silinir; pandas sadece bu cache'i okuduğundan, Joint
+    # Run/Post Processing/load_properties formül hücrelerini BOŞ görürdü.
+    # Excel ile yeniden hesaplatmak, t1(mm)/Dim1 gibi bizim güncellediğimiz
+    # değerlere bağlı formüllerin de doğru (güncel) sonucu vermesini sağlar.
+    @staticmethod
+    def _recalc_with_excel(path):
+        try:
+            import win32com.client
+        except Exception:
+            return False
+        com_initialized = False
+        try:
+            import pythoncom
+            pythoncom.CoInitialize()  # _run_pipeline bir worker thread'de çalışıyor
+            com_initialized = True
+        except Exception:
+            pass
+        excel = None
+        try:
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            wb = excel.Workbooks.Open(os.path.abspath(path), 0)  # 0 = UpdateLinks kapalı
+            excel.CalculateFull()
+            wb.Save()
+            wb.Close(False)
+            return True
+        except Exception:
+            return False
+        finally:
+            if excel is not None:
+                try:
+                    excel.Quit()
+                except Exception:
+                    pass
+            if com_initialized:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+    # _save_working_excel: working excel'e yapılan HER openpyxl kaydı bu
+    # yardımcıdan geçer - formül hücrelerinin değerleri kaybolmasın diye.
+    # 1) Kaydetmeden ÖNCE diskteki dosyanın hesaplanmış formül değerlerini
+    #    (data_only=True) okur - bu değerler orijinal Master Input Excel'den
+    #    (Excel'in son kaydı) ya da bir önceki Excel yeniden hesaplamasından gelir.
+    # 2) Kaydeder, sonra Excel ile yeniden hesaplatmayı dener (formüller canlı kalır).
+    # 3) Excel yoksa: formül hücrelerini 1. adımdaki değerleriyle sabitler
+    #    ("freeze") - böylece pandas onları boş değil, son hesaplanan
+    #    değerleriyle okur. Bu durumda formüller güncellenen t1/Dim1'e göre
+    #    YENİDEN hesaplanmaz; bunu log'da bir kere belirtiyoruz.
+    def _save_working_excel(self, wb, path):
+        cached_wb = None
+        try:
+            cached_wb = openpyxl.load_workbook(path, data_only=True)
+        except Exception:
+            pass
+
+        if self._excel_recalc_ok is not False:
+            wb.save(path)
+            if self._recalc_with_excel(path):
+                if self._excel_recalc_ok is None:
+                    self.log("  Working excel formulas recalculated with Excel after each update.")
+                self._excel_recalc_ok = True
+                return
+            self._excel_recalc_ok = False
+
+        n_frozen = 0
+        frozen_cols = {}
+        for ws in wb.worksheets:
+            cached_ws = cached_wb[ws.title] if cached_wb is not None and ws.title in cached_wb.sheetnames else None
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.data_type != 'f' and not (isinstance(cell.value, str) and cell.value.startswith('=')):
+                        continue
+                    cell.value = cached_ws[cell.coordinate].value if cached_ws is not None else None
+                    n_frozen += 1
+                    hdr = ws.cell(row=1, column=cell.column).value
+                    frozen_cols.setdefault(ws.title, set()).add(
+                        str(hdr).replace('\n', ' ').strip() if hdr is not None else cell.column_letter)
+        wb.save(path)
+
+        if n_frozen and not self._formula_freeze_logged:
+            self._formula_freeze_logged = True
+            self.log(f"  NOTE: Excel recalculation is not available here (needs Windows + Excel + "
+                      f"pywin32), so {n_frozen} formula cell(s) in the working excel were replaced "
+                      f"with their last Excel-calculated values - they will NOT update if they "
+                      f"depend on t1(mm)/tfem or Bar Property Dim1.")
+            for title, cols in frozen_cols.items():
+                self.log(f"    '{title}' formula columns frozen: {', '.join(sorted(cols))}")
+
     # _update_dtcg_t1_tfem: DTCG_Input_Excel_Data sayfasının 't1(mm)' ve
-    # 'tfem' sütunlarını (Bar Property ID'ye göre eşleştirerek), solve'ün
-    # gerçekten yazdığı PBARL dim1 değerleriyle doldur - böylece Joint
-    # Run'a giden Excel, "istenen" değil "gerçekten çözülen" kalınlığı yansıtır.
-    def _update_dtcg_t1_tfem(self, excel_path, dim1_by_pid):
-        """Fill DTCG_Input_Excel_Data's 't1(mm)'/'tfem' columns (by 'Bar
-        Property ID') from dim1_by_pid. t2(mm) and every other column are
-        never touched."""
+    # 'tfem' sütunlarını, solve'ün gerçekten yazdığı (prop_updated +
+    # offseted) BDF'teki PBARL dim1 değerleriyle doldur - böylece Joint Run'a
+    # giden Excel, "istenen" değil "gerçekten çözülen" kalınlığı yansıtır.
+    # Satır eşleştirme: 'Bar Element ID' sütunu varsa eleman -> (BDF'teki
+    # CBAR/CBEAM'den) PID -> dim1; yoksa 'Bar Property ID' -> dim1.
+    def _update_dtcg_t1_tfem(self, excel_path, dim1_by_pid, pid_by_eid):
+        """Fill DTCG_Input_Excel_Data's 't1(mm)'/'tfem' columns from the
+        solved BDF's PBARL dim1. Rows are matched by 'Bar Element ID' (via
+        the BDF's CBAR/CBEAM -> PID) when that column exists, otherwise by
+        'Bar Property ID'. t2(mm) and every other column are never touched."""
         keep_vba = excel_path.lower().endswith(('.xlsm', '.xltm', '.xlam'))
         wb = openpyxl.load_workbook(excel_path, keep_vba=keep_vba)
         ws = None
@@ -6887,26 +7013,44 @@ class IterativeFullRunTab:
             return 0
 
         header = {}
+        raw_headers = []
         for cell in next(ws.iter_rows(min_row=1, max_row=1)):
             if cell.value:
-                norm = str(cell.value).strip().lower().replace('\n', '').replace(' ', '')
+                raw_headers.append(str(cell.value).replace('\n', ' ').strip())
+                norm = str(cell.value).strip().lower().replace('\n', '').replace(' ', '').replace('_', '')
                 header[norm] = cell.column
+        eid_col = header.get('barelementid')
         pid_col = header.get('barpropertyid')
-        t1_col = header.get('t1(mm)')
+        t1_col = header.get('t1(mm)') or header.get('t1')
         tfem_col = header.get('tfem')
-        if not pid_col or (not t1_col and not tfem_col):
-            self.log("  WARNING: 'Bar Property ID' / 't1(mm)' / 'tfem' columns not found in "
-                      "DTCG_Input_Excel_Data - t1(mm)/tfem not updated.")
+        if (not eid_col and not pid_col) or (not t1_col and not tfem_col):
+            self.log("  WARNING: DTCG_Input_Excel_Data needs a 'Bar Element ID' or 'Bar Property ID' "
+                      "column and a 't1(mm)' or 'tfem' column - t1(mm)/tfem not updated. "
+                      f"Headers found: {raw_headers}")
+            return 0
+        if not dim1_by_pid:
+            self.log("  WARNING: no PBARL dim1 values could be read from the solved BDF(s) - "
+                      "t1(mm)/tfem not updated.")
             return 0
 
         n_updated = 0
+        unmatched = []
         for row in range(2, ws.max_row + 1):
-            pid_cell = ws.cell(row=row, column=pid_col)
-            if pid_cell.value is None:
-                continue
-            try:
-                pid = int(pid_cell.value)
-            except (ValueError, TypeError):
+            pid = None
+            key = None
+            if eid_col:
+                key = ws.cell(row=row, column=eid_col).value
+                try:
+                    pid = pid_by_eid.get(int(key))
+                except (ValueError, TypeError):
+                    pid = None
+            if pid is None and pid_col:
+                key = ws.cell(row=row, column=pid_col).value if key is None else key
+                try:
+                    pid = int(ws.cell(row=row, column=pid_col).value)
+                except (ValueError, TypeError):
+                    pid = None
+            if key is None:
                 continue
             if pid in dim1_by_pid:
                 val = dim1_by_pid[pid]
@@ -6915,10 +7059,16 @@ class IterativeFullRunTab:
                 if tfem_col:
                     ws.cell(row=row, column=tfem_col).value = val
                 n_updated += 1
+            else:
+                unmatched.append(key)
 
-        wb.save(excel_path)
+        self._save_working_excel(wb, excel_path)
+        key_name = "Bar Element ID" if eid_col else "Bar Property ID"
         self.log(f"  Updated t1(mm)/tfem for {n_updated} DTCG_Input_Excel_Data row(s) "
-                  f"from the solved BDF")
+                  f"(matched by {key_name}) from the solved BDF")
+        if unmatched:
+            self.log(f"  WARNING: {len(unmatched)} DTCG row(s) had no matching bar/PBARL in the "
+                      f"solved BDF and kept their old t1(mm)/tfem, e.g. {unmatched[:5]}")
         return n_updated
 
     # _update_bar_property_dim1: bir sonraki iterasyon için "Bar Property"
@@ -6956,7 +7106,7 @@ class IterativeFullRunTab:
                 ws.cell(row=row, column=2).value = prop_map[pid]
                 n_updated += 1
 
-        wb.save(excel_path)
+        self._save_working_excel(wb, excel_path)
         self.log(f"  Updated Dim1 for {n_updated} Bar Property row(s) from the previous "
                   f"iteration's sizing summary")
         return n_updated
@@ -7231,6 +7381,8 @@ class IterativeFullRunTab:
             # üzerinde okuma/yazma yapar.
             working_excel = os.path.join(output_base, "_IterativeFullRun_Working_Input.xlsx")
             shutil.copy2(self.master_input_excel_path.get().strip(), working_excel)
+            self._excel_recalc_ok = None        # None = henüz denenmedi (bkz. _save_working_excel)
+            self._formula_freeze_logged = False
             self.log(f"  Working copy of the Master Input Excel: {working_excel}")
             self.log(f"  Target flight hours: {target_life}, Iterations: {n_iterations}")
 
@@ -7315,9 +7467,13 @@ class IterativeFullRunTab:
                 # kalınlığı yansıtsın.
                 stru_bdfs = self._find_all_stru_bdfs(base_model_folder)
                 dim1_by_pid = {}
+                pid_by_eid = {}
                 for p in stru_bdfs:
                     dim1_by_pid.update(self._extract_pbarl_dim1(p))
-                self._update_dtcg_t1_tfem(working_excel, dim1_by_pid)
+                    pid_by_eid.update(self._extract_bar_pid_by_eid(p))
+                self.log(f"  Read {len(dim1_by_pid)} PBARL dim1 value(s) and {len(pid_by_eid)} "
+                          f"CBAR/CBEAM -> PID mapping(s) from {len(stru_bdfs)} solved BDF(s)")
+                self._update_dtcg_t1_tfem(working_excel, dim1_by_pid, pid_by_eid)
 
                 # Bu iterasyonun working_excel durumunu, o iterasyonun kendi
                 # _base_model klasörüne anlık görüntü (snapshot) olarak

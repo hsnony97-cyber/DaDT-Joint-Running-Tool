@@ -7022,7 +7022,7 @@ class IterativeFullRunTab:
         eid_col = header.get('barelementid')
         pid_col = header.get('barpropertyid')
         t1_col = header.get('t1(mm)') or header.get('t1')
-        tfem_col = header.get('tfem')
+        tfem_col = header.get('tfem(mm)') or header.get('tfem')
         if (not eid_col and not pid_col) or (not t1_col and not tfem_col):
             self.log("  WARNING: DTCG_Input_Excel_Data needs a 'Bar Element ID' or 'Bar Property ID' "
                       "column and a 't1(mm)' or 'tfem' column - t1(mm)/tfem not updated. "
@@ -7248,6 +7248,28 @@ class IterativeFullRunTab:
                         n += 1
                     except OSError:
                         pass
+        return n
+
+    # _delete_util_folders: Joint Run'ın her Set klasörüne kopyaladığı Util
+    # Folder kopyalarını (<joint_run_dir>/<Set>/<util_name>) sil. Sadece Set
+    # klasörlerinin HEMEN içindeki, adı util_name olan klasörler silinir;
+    # kullanıcının kaynak Util Folder'ı asla silinmez.
+    @staticmethod
+    def _delete_util_folders(joint_run_dir, util_source):
+        if not util_source or not os.path.isdir(joint_run_dir):
+            return 0
+        util_name = os.path.basename(os.path.normpath(util_source))
+        source_real = os.path.realpath(util_source)
+        n = 0
+        for set_name in os.listdir(joint_run_dir):
+            target = os.path.join(joint_run_dir, set_name, util_name)
+            if not os.path.isdir(target) or os.path.realpath(target) == source_real:
+                continue
+            try:
+                shutil.rmtree(target)
+                n += 1
+            except OSError:
+                pass
         return n
 
     def _wait_for_exe_to_finish(self, exe_name, poll_seconds=30, max_wait_seconds=12 * 3600):
@@ -7579,6 +7601,12 @@ class IterativeFullRunTab:
                     n_del_jr = self._delete_h5_files(joint_run_dir)
                     self.log(f"  Deleted {n_del_le} H5 file(s) from Load Extraction Results and "
                               f"{n_del_jr} from Joint Run (not the last iteration)")
+
+                # Her iterasyonun sonunda (son dahil, sizing özeti zaten
+                # üretildikten SONRA) Set klasörlerine kopyalanan Util Folder
+                # kopyalarını sil - sadece yardımcı dosyaların kopyası, sonuç değil.
+                n_del_util = self._delete_util_folders(joint_run_dir, self.jr_util_folder.get().strip())
+                self.log(f"  Deleted {n_del_util} copied Util Folder(s) from the Joint Run Set folders")
 
                 self.log(f"\nIteration {iteration}/{n_iterations} complete "
                           f"({time.time() - iter_t_start:.1f}s)")

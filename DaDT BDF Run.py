@@ -3242,14 +3242,38 @@ class BarPropertySolverTab:
                         # I (ve ROD/BOX gibi çift-simetrik) kesitlerde bar'ın
                         # referans çizgisi dim2 yönünde zaten ortada - ek
                         # terime gerek yok. C-kesit TEK eksende simetrik (web
-                        # bir tarafta, açık ağız diğer tarafta); yukarıda
-                        # (yön-bazlı ya da fallback) seçilen panele göre
-                        # hesaplanan best_normal'in üzerine, dim2'nin yarısı
-                        # kadar yhat yönünde ek bir kaydırma uygulanır.
+                        # bir tarafta, açık ağız diğer tarafta) - dim2/2 kadar
+                        # YANA kaydırılır. Kaydırma yönü panelden kurulur:
+                        # y_panel = normal x bar_ekseni (panel düzleminde, bar'a
+                        # dik), böylece derinlik terimine (normal yönü) karışmaz.
+                        # Hangi TARAFA gidileceği ise CBAR'ın yhat'inden alınır
+                        # (sign(yhat . y_panel)) - GA/GB ters çevrilince
+                        # bar_ekseni ve y_panel birlikte döner, yhat dönmez,
+                        # sonuç değişmez. yhat panel normaline neredeyse
+                        # paralelse taraf belirlenemez: ek terim uygulanmaz,
+                        # log'a uyarı yazılır.
                         if sec_type == 'C' and yhat is not None:
-                            dim2 = self.bar_properties.get(pid, {}).get('dim2', bar_t)
-                            dim2 = max(0.1, dim2)
-                            vec = vec + yhat * (dim2 / 2.0)
+                            y_panel = None
+                            try:
+                                pA = np.array(bdf.nodes[bar_nodes[0]].get_position())
+                                pB = np.array(bdf.nodes[bar_nodes[1]].get_position())
+                                y_vec = np.cross(best_normal, pB - pA)
+                                y_len = np.linalg.norm(y_vec)
+                                if y_len > 1e-10:
+                                    y_panel = y_vec / y_len
+                            except Exception:
+                                y_panel = None
+                            side = float(np.dot(yhat, y_panel)) if y_panel is not None else 0.0
+                            if abs(side) < 0.2:
+                                self.log(f"    WARNING: Bar {eid} (Section Type=C) - the bar's local y "
+                                          f"is (nearly) perpendicular to its landing panel "
+                                          f"(yhat . y_panel = {side:.2f}), so the C opening side can't "
+                                          f"be determined - eccentricity term skipped, check this "
+                                          f"bar's orientation.")
+                            else:
+                                dim2 = self.bar_properties.get(pid, {}).get('dim2', bar_t)
+                                dim2 = max(0.1, dim2)
+                                vec = vec + np.sign(side) * y_panel * (dim2 / 2.0)
 
                         rows.append({'Type': 'Bar', 'Element': eid, 'ZOffset': '',
                                      'WA_X': vec[0], 'WA_Y': vec[1], 'WA_Z': vec[2]})

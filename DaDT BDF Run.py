@@ -7660,6 +7660,7 @@ class VisualizationResultsTab:
         self.bdf_path = tk.StringVar()
         self.bar_csv_path = tk.StringVar()    # Bar Element ID bazlı sonuçlar (örn. DT_SIZING_BAR_SUMMARY.csv)
         self.prop_csv_path = tk.StringVar()   # Bar Property ID bazlı sonuçlar (örn. DT_SIZING_PROP_SUMMARY.csv)
+        self.software_gl = tk.BooleanVar(value=False)  # GPU'suz Uzak Masaüstü için CPU (Mesa) ile çizim
         self.setup_ui()
 
     # ==================== GUI ====================
@@ -7709,6 +7710,12 @@ class VisualizationResultsTab:
                                   foreground=_APP_COLORS.get('danger', 'red'))
         else:
             self.req_label.config(text="PyVista + Qt found", foreground="green")
+        fr = ttk.Frame(f2)
+        fr.pack(fill=tk.X, pady=(6, 0))
+        ttk.Checkbutton(fr, text="Software rendering (CPU)", variable=self.software_gl).pack(side=tk.LEFT)
+        ttk.Label(fr, text="(for Remote Desktop / machines without OpenGL 3.2 - slower; uses Qt's Mesa "
+                           "opengl32sw.dll or a Mesa opengl32.dll in a 'mesa' folder next to this script)",
+                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=8)
 
         f3 = ttk.LabelFrame(main, text="\U0001F4CB  3. Log", padding=10)
         f3.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -7773,6 +7780,8 @@ class VisualizationResultsTab:
         if not getattr(sys, 'frozen', False):
             cmd.append(os.path.abspath(__file__))
         cmd += [_FEM_VIEWER_FLAG, '--bdf', bdf]
+        if self.software_gl.get():
+            cmd.append('--software-gl')
         for flag, var in (('--bar-csv', self.bar_csv_path), ('--prop-csv', self.prop_csv_path)):
             p = var.get().strip()
             if p:
@@ -7829,18 +7838,41 @@ class VisualizationResultsTab:
         if code == 0:
             self._log("FEM Viewer closed.")
             return
-        if "OPENGL_NOT_SUPPORTED" in log:
-            msg = ("The 3D view needs OpenGL 3.2 or newer, but this Windows session only offers "
-                   "the basic OpenGL 1.1 driver.\n\n"
-                   "This is typical of a Remote Desktop session where the server's graphics card "
-                   "is not enabled for remote sessions. Options:\n"
-                   "  - Ask IT to enable the Group Policy 'Use hardware graphics adapters for all "
-                   "Remote Desktop Services sessions' on this machine (needs a GPU), or\n"
-                   "  - Run the tool on a machine you use directly (not over Remote Desktop), or\n"
-                   "  - Use a software OpenGL driver (Mesa 'opengl32.dll' placed next to "
-                   f"{os.path.basename(sys.executable)}) - slower, but works without a GPU.")
-            self._log("FEM Viewer: OpenGL 3.2+ not available in this session - see the message window.")
-            messagebox.showerror("FEM Viewer - OpenGL not available", msg + f"\n\nLog: {log_path}")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        mesa_help = ("To get a Mesa software OpenGL driver: download a 'mesa3d-...-release-msvc' archive "
+                     "from https://github.com/pal1000/mesa-dist-win/releases, and copy the files in its "
+                     f"x64 folder (opengl32.dll and the DLLs next to it) into:\n    {os.path.join(script_dir, 'mesa')}\n"
+                     "then try again with 'Software rendering (CPU)' ticked.")
+        if "SOFTWARE_GL_NOT_FOUND" in log:
+            self._log("FEM Viewer: no Mesa software OpenGL driver found - see the message window.")
+            messagebox.showerror("FEM Viewer - software OpenGL not found",
+                                 "Software rendering needs a Mesa OpenGL driver, but none was found "
+                                 "(Qt's opengl32sw.dll is not part of this Python's Qt).\n\n" + mesa_help)
+            return
+        # Viewer OpenGL testi sırasında çöktüyse de ("Checking OpenGL" var
+        # ama "OpenGL OK" yok) sebep OpenGL'dir.
+        gl_failed = "OPENGL_NOT_SUPPORTED" in log or ("Checking OpenGL" in log and "OpenGL OK" not in log)
+        if gl_failed:
+            self._log("FEM Viewer: OpenGL 3.2+ is not available in this session.")
+            used_software_gl = isinstance(getattr(proc, 'args', None), list) and '--software-gl' in proc.args
+            if used_software_gl:
+                messagebox.showerror("FEM Viewer - OpenGL not available",
+                                     "Even with software rendering, no usable OpenGL 3.2 context could be "
+                                     "created. See the [viewer] lines in the log.\n\n" + mesa_help)
+                return
+            retry = messagebox.askyesno(
+                "FEM Viewer - OpenGL not available",
+                "The 3D view needs OpenGL 3.2 or newer, but this Windows session only offers the basic "
+                "OpenGL 1.1 driver (typical of a Remote Desktop session without GPU access) - this is "
+                "what left the viewer window white.\n\n"
+                "Retry now with software rendering (draws on the CPU with Mesa - works without a GPU, "
+                "but rotating a large model is slower)?\n\n"
+                "Permanent fix with full speed: ask IT to enable the Group Policy 'Use hardware graphics "
+                "adapters for all Remote Desktop Services sessions' on this machine (needs a GPU), or run "
+                "the tool on a machine you use directly.")
+            if retry:
+                self.software_gl.set(True)
+                self.open_fem_viewer()
             return
         tail = "\n".join(l for l in lines[-25:] if l != "FEM_VIEWER_READY") or "(no output)"
         self._log(f"FEM Viewer exited with an error (code {code}) - see the lines above.")
@@ -8067,6 +8099,111 @@ def _fem_load_grid(bdf_path, log=print, use_cache=True):
     return grid
 
 
+def _fem_check_opengl():
+    """Render a tiny hidden VTK window once and report (ok, info). VTK's own
+    SupportsOpenGL() is not reliable here (it returned True on a Remote
+    Desktop session whose context creation had just failed), so this checks
+    the errors VTK reports while rendering plus the OpenGL version obtained."""
+    try:
+        import vtkmodules.vtkRenderingOpenGL2  # noqa: F401  (OpenGL render window'u kaydeder)
+        from vtkmodules.vtkCommonCore import vtkOutputWindow, vtkStringOutputWindow
+        from vtkmodules.vtkRenderingCore import vtkRenderWindow, vtkRenderer
+    except Exception as e:
+        return True, f"check skipped ({e})"
+    print("Checking OpenGL ...", flush=True)
+    previous = vtkOutputWindow.GetInstance()
+    captured = vtkStringOutputWindow()
+    vtkOutputWindow.SetInstance(captured)
+    try:
+        rw = vtkRenderWindow()
+        rw.SetOffScreenRendering(1)
+        rw.SetSize(64, 64)
+        rw.AddRenderer(vtkRenderer())
+        rw.Render()
+        caps = rw.ReportCapabilities() or ""
+        rw.Finalize()
+    except Exception as e:
+        caps = ""
+        captured.DisplayText(f"exception: {e}")
+    finally:
+        vtkOutputWindow.SetInstance(previous)
+    errors = captured.GetOutput()
+    info = {}
+    for line in caps.splitlines():
+        for key in ('vendor', 'renderer', 'version'):
+            if line.lower().startswith(f'opengl {key} string:'):
+                info[key] = line.split(':', 1)[1].strip()
+    m = re.match(r'\s*(\d+)\.(\d+)', info.get('version', ''))
+    version_ok = bool(m) and (int(m.group(1)), int(m.group(2))) >= (3, 2)
+    failed_markers = ('failed to initialize opengl', 'wglchoosepixelformatarb', 'valid pixel format',
+                      'unable to find a valid opengl', 'exception:')
+    ok = version_ok and not any(k in errors.lower() for k in failed_markers)
+    text = (f"{info.get('version', 'unknown version')} / {info.get('renderer', '?')} "
+            f"({info.get('vendor', '?')})")
+    if errors.strip() and not ok:
+        text += " - VTK errors: " + " | ".join(l.strip() for l in errors.splitlines()
+                                               if l.strip() and not l.startswith('ERROR: In'))[:400]
+    return ok, text
+
+
+def _fem_enable_software_opengl(log=None):
+    """Windows only: load a Mesa (llvmpipe) OpenGL driver BEFORE VTK/Qt are
+    imported, so VTK renders on the CPU when the session has no OpenGL 3.2+
+    (e.g. Remote Desktop without GPU). Windows matches an already loaded DLL
+    by its NAME, so once a Mesa 'opengl32.dll' is loaded, VTK uses it instead
+    of the system one. Looks for (in order): DADT_MESA_OPENGL env var,
+    <script folder>/mesa/opengl32.dll, <script folder>/opengl32.dll, and the
+    Mesa build Qt ships as 'opengl32sw.dll' (copied to a temp folder as
+    opengl32.dll)."""
+    log = log or (lambda m: print(m, flush=True))
+    if os.name != 'nt':
+        log("Software OpenGL switch is only needed/supported on Windows - using the normal driver")
+        return True
+    import ctypes
+    import importlib.util
+    script_dir = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__))
+    candidates = [os.environ.get('DADT_MESA_OPENGL', ''),
+                  os.path.join(script_dir, 'mesa', 'opengl32.dll'),
+                  os.path.join(script_dir, 'opengl32.dll')]
+    qt_dirs = []
+    for pkg in ('PyQt5', 'PySide2', 'PyQt6', 'PySide6'):
+        try:
+            spec = importlib.util.find_spec(pkg)
+        except Exception:
+            spec = None
+        if spec and spec.submodule_search_locations:
+            base = list(spec.submodule_search_locations)[0]
+            qt_dirs += [os.path.join(base, 'Qt5', 'bin'), os.path.join(base, 'Qt', 'bin'),
+                        os.path.join(base, 'Qt6', 'bin'), base]
+    qt_dirs += [os.path.join(sys.prefix, 'Library', 'bin'), sys.prefix]
+    candidates += [os.path.join(d, 'opengl32sw.dll') for d in qt_dirs]
+
+    for src in candidates:
+        if not src or not os.path.isfile(src):
+            continue
+        dll = src
+        if os.path.basename(src).lower() != 'opengl32.dll':
+            dst_dir = os.path.join(tempfile.gettempdir(), 'dadt_fem_mesa')
+            os.makedirs(dst_dir, exist_ok=True)
+            dll = os.path.join(dst_dir, 'opengl32.dll')
+            if not os.path.isfile(dll) or os.path.getsize(dll) != os.path.getsize(src):
+                shutil.copy2(src, dll)
+        try:
+            os.environ.setdefault('GALLIUM_DRIVER', 'llvmpipe')
+            try:
+                os.add_dll_directory(os.path.dirname(dll))
+            except Exception:
+                pass
+            ctypes.WinDLL(dll, winmode=0x00000008)   # LOAD_WITH_ALTERED_SEARCH_PATH: Mesa'nın yan DLL'leri kendi klasöründen
+            log(f"Software OpenGL (Mesa) loaded from {src}")
+            return True
+        except OSError as e:
+            log(f"Could not load {src}: {e}")
+    log("No Mesa software OpenGL driver found (looked for Qt's opengl32sw.dll and "
+        f"{os.path.join(script_dir, 'mesa', 'opengl32.dll')})")
+    return False
+
+
 def _fem_parse_id_list(text):
     """'1001, 1005-1010 2000' -> {1001, 1005, ..., 1010, 2000}."""
     ids = set()
@@ -8093,6 +8230,7 @@ def _run_fem_viewer(argv):
     parser.add_argument('--prop-csv', dest='prop_csv', default='')
     parser.add_argument('--group', default='Bar Property ID')
     parser.add_argument('--metric', default='')
+    parser.add_argument('--software-gl', dest='software_gl', action='store_true')
     args, _ = parser.parse_known_args(argv)
 
     # Viewer'ın çıktısı sekmenin açtığı log dosyasına gider; Python hataları
@@ -8105,6 +8243,11 @@ def _run_fem_viewer(argv):
     except Exception:
         pass
     print(f"FEM Viewer: Python {sys.version.split()[0]} at {sys.executable}", flush=True)
+    # Yazılım OpenGL (Mesa) - Qt/VTK import edilmeden ÖNCE yüklenmeli ki
+    # VTK sistemin opengl32.dll'i yerine bunu kullansın.
+    if args.software_gl and not _fem_enable_software_opengl():
+        print("SOFTWARE_GL_NOT_FOUND", flush=True)
+        sys.exit(5)
     try:
         import pyvista as pv
         from pyvistaqt import QtInteractor
@@ -8129,19 +8272,15 @@ def _run_fem_viewer(argv):
 
     # VTK en az OpenGL 3.2 ister. Uzak Masaüstü (RDP) oturumlarında, sunucu
     # GPU'yu RDP'ye açmadıysa Windows sadece OpenGL 1.1 verir - bu durumda
-    # VTK penceresi boş/beyaz kalıp donar. Pencereyi kurmadan önce test et.
-    try:
-        from vtkmodules.vtkRenderingCore import vtkRenderWindow
-        opengl_ok = bool(vtkRenderWindow().SupportsOpenGL())
-    except Exception as e:
-        print(f"OpenGL check failed: {e}", flush=True)
-        opengl_ok = True   # test yapılamadıysa engelleme, normal dene
-    print(f"OpenGL 3.2+ available: {opengl_ok}", flush=True)
+    # VTK penceresi beyaz kalıp donar. Pencereyi kurmadan önce test et.
+    opengl_ok, gl_info = _fem_check_opengl()
+    print(f"OpenGL: {gl_info}", flush=True)
     if not opengl_ok:
         print("OPENGL_NOT_SUPPORTED: this session has no OpenGL 3.2+ driver, which VTK/PyVista needs "
               "(typical for a Remote Desktop session where the server's GPU is not enabled for RDP).",
               flush=True)
         sys.exit(4)
+    print("OpenGL OK", flush=True)
 
     V = VisualizationResultsTab   # CSV yardımcıları (_scan_summary_files, _fmt_fixed, ...) buradan
     fmt = V._fmt_fixed

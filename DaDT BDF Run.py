@@ -18,6 +18,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 # os: dosya/klasör yolu işlemleri (os.path.join, os.makedirs, os.listdir, os.walk vb.).
 import os
+# sys: FEM Viewer'ı ayrı bir süreç olarak başlatmak için (sys.executable / sys.argv).
+import sys
 # re: düzenli ifadeler (regex) - bazı metin ayrıştırma işlemlerinde kullanılıyor.
 import re
 # threading: arka planda (GUI'yi dondurmadan) uzun süren işleri çalıştırmak için
@@ -7757,6 +7759,16 @@ class VisualizationResultsTab:
         self.summary_status = ttk.Label(f1, text="No summary loaded", foreground="gray")
         self.summary_status.pack(anchor=tk.W)
 
+        viewer_frame = ttk.Frame(f1)
+        viewer_frame.pack(fill=tk.X, pady=(8, 2))
+        ttk.Label(viewer_frame, text="3D FEM Viewer:", width=16).pack(side=tk.LEFT)
+        ttk.Button(viewer_frame, text="Open FEM Viewer", command=self.open_fem_viewer,
+                   style='Accent.TButton').pack(side=tk.LEFT, padx=5)
+        ttk.Label(viewer_frame, text="(opens the BDF + summary CSVs above in a separate PyVista window: "
+                                     "hide/show by property or element ID, editable contour, picking - "
+                                     "needs: pip install pyvista pyvistaqt PyQt5)",
+                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=8)
+
         # ---- Section 2: Plot Settings ----
         f2 = ttk.LabelFrame(main, text="\U0001F3A8  2. Plot Settings", padding=10)
         f2.pack(fill=tk.X, pady=5)
@@ -7871,6 +7883,38 @@ class VisualizationResultsTab:
         path = filedialog.askopenfilename(filetypes=[("BDF", "*.bdf *.dat *.nas"), ("All", "*.*")])
         if path:
             self.bdf_path.set(path)
+
+    # open_fem_viewer: bu dosyayı "--fem-viewer" ile AYRI bir süreç olarak
+    # başlatır (bkz. _run_fem_viewer) - BDF/summary yolu ve mevcut Group By /
+    # Color By seçimi argüman olarak geçer.
+    def open_fem_viewer(self):
+        import importlib.util
+        bdf = self.bdf_path.get().strip()
+        if not bdf or not os.path.isfile(bdf):
+            messagebox.showerror("Error", "Select a valid BDF file first")
+            return
+        missing = [m for m in ('pyvista', 'pyvistaqt', 'qtpy') if importlib.util.find_spec(m) is None]
+        if not any(importlib.util.find_spec(b) for b in ('PyQt5', 'PySide2', 'PyQt6', 'PySide6')):
+            missing.append('PyQt5')
+        if missing:
+            messagebox.showerror("Missing packages",
+                                 f"The FEM Viewer needs: {', '.join(missing)}\n\n"
+                                 "Install with:\n    pip install pyvista pyvistaqt PyQt5")
+            return
+        cmd = [sys.executable]
+        if not getattr(sys, 'frozen', False):
+            cmd.append(os.path.abspath(__file__))
+        cmd += [_FEM_VIEWER_FLAG, '--bdf', bdf, '--group', self.group_by.get()]
+        folder = self.summary_folder.get().strip()
+        if folder and os.path.isdir(folder):
+            cmd += ['--summary', folder]
+        if self.color_by.get():
+            cmd += ['--metric', self.color_by.get()]
+        try:
+            subprocess.Popen(cmd)
+            self._log(f"FEM Viewer launched for {os.path.basename(bdf)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not start the FEM Viewer:\n{e}")
 
     def _browse_summary_folder(self):
         folder = filedialog.askdirectory()
@@ -8557,6 +8601,884 @@ class VisualizationResultsTab:
 
 
 # ============================================================================
+# FEM Viewer  --  PyVista (VTK) tabanlı, AYRI bir süreçte/pencerede açılan 3B
+# görüntüleyici. Visualization Results sekmesindeki "Open FEM Viewer" butonu
+# bu dosyayı "--fem-viewer" argümanıyla yeniden başlatır; böylece büyük bir
+# BDF yüklenirken ana uygulama donmaz ve Qt ile Tkinter aynı süreçte
+# karışmaz. pyvista / pyvistaqt / Qt SADECE bu modda import edilir - kurulu
+# olmasalar bile uygulamanın geri kalanı etkilenmez.
+# ============================================================================
+_FEM_VIEWER_FLAG = "--fem-viewer"
+_FEM_CACHE_VERSION = "1"
+
+# Nastran kartı -> (VTK hücre tipi, kullanılan köşe düğümü sayısı, kategori)
+# kategori: 0 = bar/çubuk (CSV sonuçları bunlara boyanır), 1 = shell, 2 = solid.
+# Yüksek mertebeli elemanlarda (CQUAD8, CTETRA10, ...) sadece köşe düğümleri kullanılır.
+_FEM_CELL_MAP = {
+    'CBAR': (3, 2, 0), 'CBEAM': (3, 2, 0), 'CROD': (3, 2, 0), 'CONROD': (3, 2, 0), 'CTUBE': (3, 2, 0),
+    'CQUAD4': (9, 4, 1), 'CQUAD8': (9, 4, 1), 'CQUADR': (9, 4, 1), 'CSHEAR': (9, 4, 1),
+    'CTRIA3': (5, 3, 1), 'CTRIA6': (5, 3, 1), 'CTRIAR': (5, 3, 1),
+    'CTETRA': (10, 4, 2), 'CPENTA': (13, 6, 2), 'CHEXA': (12, 8, 2), 'CPYRAM': (14, 5, 2),
+}
+
+
+def _fem_cache_path(bdf_path):
+    """Cache file for the mesh built from bdf_path, keyed by path + mtime +
+    size, so an edited BDF is re-read automatically (INCLUDE files are not
+    part of the key - use 'Reload BDF' after editing one)."""
+    import hashlib
+    st = os.stat(bdf_path)
+    key = f"{os.path.abspath(bdf_path)}|{st.st_mtime_ns}|{st.st_size}|{_FEM_CACHE_VERSION}"
+    digest = hashlib.md5(key.encode('utf-8')).hexdigest()[:16]
+    cache_dir = os.path.join(tempfile.gettempdir(), 'dadt_fem_cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(bdf_path))[0]
+    return os.path.join(cache_dir, f"{stem}_{digest}.vtu")
+
+
+def _fem_build_grid(bdf_path, log=print):
+    """Read bdf_path with pyNastran and return a pyvista UnstructuredGrid
+    with cell arrays EID / PID / TypeCode / Category and the element type
+    names in field_data['TypeNames']. Only node coordinates are
+    cross-referenced (enough to place nodes defined in local coordinate
+    systems) - a full xref is slow on big models and isn't needed here."""
+    import pyvista as pv
+
+    t0 = time.time()
+    model = BDF(debug=None)
+    try:
+        model.read_bdf(bdf_path, validate=False, xref=False, read_includes=True, encoding='latin-1')
+    except Exception as e:
+        log(f"Reading with INCLUDE files failed ({e}) - retrying without includes")
+        model = BDF(debug=None)
+        model.read_bdf(bdf_path, validate=False, xref=False, read_includes=False, encoding='latin-1')
+    log(f"BDF read in {time.time() - t0:.1f}s: {len(model.nodes)} nodes, {len(model.elements)} elements")
+
+    try:
+        model.cross_reference(xref_nodes=True, xref_elements=False, xref_nodes_with_elements=False,
+                              xref_properties=False, xref_masses=False, xref_materials=False,
+                              xref_loads=False, xref_constraints=False, xref_aero=False,
+                              xref_sets=False, xref_optimization=False)
+    except Exception as e:
+        log(f"WARNING: coordinate cross-reference failed ({e}) - nodes defined in local "
+            f"coordinate systems may be misplaced")
+
+    nids = sorted(model.nodes)
+    xyz = np.empty((len(nids), 3), dtype=float)
+    nid_index = {}
+    for i, nid in enumerate(nids):
+        node = model.nodes[nid]
+        nid_index[nid] = i
+        try:
+            xyz[i] = node.xyz if node.Cp() == 0 else node.get_position()
+        except Exception:
+            xyz[i] = node.xyz
+
+    type_names, type_code = [], {}
+    cells, celltypes, eids, pids, tcodes, cats = [], [], [], [], [], []
+    n_skipped = 0
+    for eid, elem in model.elements.items():
+        spec = _FEM_CELL_MAP.get(elem.type)
+        if spec is None:
+            continue
+        vtk_type, n_corner, cat = spec
+        try:
+            corner = [nid_index.get(n) for n in elem.node_ids[:n_corner]]
+        except Exception:
+            corner = []
+        if len(corner) < n_corner or any(c is None for c in corner):
+            n_skipped += 1
+            continue
+        if elem.type not in type_code:
+            type_code[elem.type] = len(type_names)
+            type_names.append(elem.type)
+        cells.append(n_corner)
+        cells.extend(corner)
+        celltypes.append(vtk_type)
+        eids.append(eid)
+        pid = getattr(elem, 'pid', None)
+        pids.append(int(pid) if isinstance(pid, (int, np.integer)) else -1)
+        tcodes.append(type_code[elem.type])
+        cats.append(cat)
+
+    if not celltypes:
+        raise ValueError("No supported elements (CBAR/CBEAM/CROD/CQUAD4/CTRIA3/solids...) found in the BDF")
+
+    grid = pv.UnstructuredGrid(np.array(cells, dtype=np.int64), np.array(celltypes, dtype=np.uint8), xyz)
+    grid.cell_data['EID'] = np.array(eids, dtype=np.int64)
+    grid.cell_data['PID'] = np.array(pids, dtype=np.int64)
+    grid.cell_data['TypeCode'] = np.array(tcodes, dtype=np.int32)
+    grid.cell_data['Category'] = np.array(cats, dtype=np.int8)
+    grid.field_data['TypeNames'] = np.array(type_names)
+    msg = f"Mesh built in {time.time() - t0:.1f}s total: {grid.n_cells} elements"
+    if n_skipped:
+        msg += f" ({n_skipped} skipped - nodes not found, e.g. in an unread INCLUDE)"
+    log(msg)
+    return grid
+
+
+def _fem_load_grid(bdf_path, log=print, use_cache=True):
+    """_fem_build_grid with a .vtu cache - reopening the same (unchanged) BDF
+    takes seconds instead of a full pyNastran read."""
+    import pyvista as pv
+    cache = _fem_cache_path(bdf_path)
+    if use_cache and os.path.isfile(cache):
+        try:
+            t0 = time.time()
+            grid = pv.read(cache)
+            if all(k in grid.cell_data for k in ('EID', 'PID', 'TypeCode', 'Category')):
+                log(f"Loaded mesh from cache in {time.time() - t0:.1f}s: {grid.n_cells} elements")
+                return grid
+        except Exception as e:
+            log(f"Cache unreadable ({e}) - rebuilding from the BDF")
+    grid = _fem_build_grid(bdf_path, log)
+    try:
+        grid.save(cache)
+    except Exception as e:
+        log(f"WARNING: could not write mesh cache ({e})")
+    return grid
+
+
+def _fem_parse_id_list(text):
+    """'1001, 1005-1010 2000' -> {1001, 1005, ..., 1010, 2000}."""
+    ids = set()
+    for tok in re.split(r'[,\s;]+', text.strip()):
+        if not tok:
+            continue
+        if '-' in tok[1:]:
+            a, b = tok.split('-', 1) if not tok.startswith('-') else (tok, None)
+            lo, hi = int(a), int(b)
+            if hi < lo:
+                lo, hi = hi, lo
+            ids.update(range(lo, hi + 1))
+        else:
+            ids.add(int(tok))
+    return ids
+
+
+def _run_fem_viewer(argv):
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(_FEM_VIEWER_FLAG, action='store_true')
+    parser.add_argument('--bdf', default='')
+    parser.add_argument('--summary', default='')
+    parser.add_argument('--group', default='Bar Property ID')
+    parser.add_argument('--metric', default='')
+    args, _ = parser.parse_known_args(argv)
+
+    try:
+        import pyvista as pv
+        from pyvistaqt import QtInteractor
+        from qtpy import QtWidgets, QtCore, QtGui
+        from vtkmodules.vtkRenderingCore import vtkCellPicker
+    except Exception as e:
+        r = tk.Tk()
+        r.withdraw()
+        messagebox.showerror("FEM Viewer", "The FEM Viewer needs PyVista and Qt:\n\n"
+                                           "    pip install pyvista pyvistaqt PyQt5\n\n"
+                                           f"Import error: {e}")
+        r.destroy()
+        return
+
+    V = VisualizationResultsTab   # CSV yardımcıları (_scan_summary_files, _fmt_fixed, ...) buradan
+    fmt = V._fmt_fixed
+    tristate_flag = getattr(QtCore.Qt, 'ItemIsAutoTristate', QtCore.Qt.ItemIsTristate)
+    group_options = ['Bar Property ID', 'Bar Element ID']
+    cmap_options = ['Auto', 'jet', 'rainbow', 'turbo', 'RdYlGn', 'RdYlGn_r', 'viridis', 'coolwarm']
+
+    class _LoadWorker(QtCore.QThread):
+        """BDF okumasını arayüz dışında yapar - büyük modelde pencere donmasın."""
+        message = QtCore.Signal(str)
+        done = QtCore.Signal(object)
+        failed = QtCore.Signal(str)
+
+        def __init__(self, bdf_path, use_cache):
+            super().__init__()
+            self.bdf_path = bdf_path
+            self.use_cache = use_cache
+
+        def run(self):
+            try:
+                self.done.emit(_fem_load_grid(self.bdf_path, log=self.message.emit, use_cache=self.use_cache))
+            except Exception as e:
+                self.failed.emit(str(e))
+
+    class FemViewer(QtWidgets.QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.bdf_path = args.bdf
+            self.grid = None
+            self.type_names = []
+            self.bar_df = None       # index: Bar Element ID
+            self.prop_df = None      # index: Bar Property ID
+            self.tree_mask = None    # property/tip ağacına göre görünürlük
+            self.id_hidden = None    # ID ile gizlenen elemanlar
+            self.has_result = None   # CSV'de değeri olan bar'lar
+            self.color_mode = None   # None | 'numeric' | 'categorical'
+            self.actors = {}
+            self.last_pick_eid = None
+            self._tree_update_pending = False
+            self._worker = None
+
+            self.setWindowTitle("DaDT FEM Viewer")
+            self.resize(1700, 1000)
+
+            self.plotter = QtInteractor(self)
+            self.setCentralWidget(self.plotter.interactor)
+            self.plotter.set_background('white', top='#b9c7d8')
+            self.plotter.add_axes()
+            self.plotter.track_click_position(self._on_double_click, side='left', double=True)
+
+            self._build_toolbar()
+            self._build_dock()
+            self.status_label = QtWidgets.QLabel("")
+            self.statusBar().addPermanentWidget(self.status_label)
+
+        # ==================== ARAYÜZ ====================
+        def _build_toolbar(self):
+            tb = self.addToolBar("View")
+            tb.setMovable(False)
+            for text, fn in [("Fit", lambda: self.plotter.reset_camera()),
+                             ("Iso", lambda: self.plotter.view_isometric()),
+                             ("XY", lambda: self.plotter.view_xy()),
+                             ("XZ", lambda: self.plotter.view_xz()),
+                             ("YZ", lambda: self.plotter.view_yz()),
+                             ("Parallel / Perspective", self._toggle_projection),
+                             ("Screenshot", self._screenshot),
+                             ("Reload BDF", lambda: self.load_bdf(use_cache=False))]:
+                act = tb.addAction(text)
+                act.triggered.connect(fn)
+                if text in ("YZ", "Parallel / Perspective"):
+                    tb.addSeparator()
+
+        def _build_dock(self):
+            dock = QtWidgets.QDockWidget("Model / Results", self)
+            dock.setFeatures(QtWidgets.QDockWidget.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetFloatable)
+            scroll = QtWidgets.QScrollArea()
+            scroll.setWidgetResizable(True)
+            panel = QtWidgets.QWidget()
+            lay = QtWidgets.QVBoxLayout(panel)
+            scroll.setWidget(panel)
+            dock.setWidget(scroll)
+            dock.setMinimumWidth(400)
+            self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, dock)
+
+            # ---- Results ----
+            g = QtWidgets.QGroupBox("Results (summary CSV)")
+            gl = QtWidgets.QGridLayout(g)
+            self.summary_edit = QtWidgets.QLineEdit(args.summary)
+            btn_browse = QtWidgets.QPushButton("...")
+            btn_browse.setFixedWidth(30)
+            btn_browse.clicked.connect(self._browse_summary)
+            btn_load = QtWidgets.QPushButton("Load")
+            btn_load.clicked.connect(self.load_summary)
+            gl.addWidget(QtWidgets.QLabel("Summary folder:"), 0, 0)
+            gl.addWidget(self.summary_edit, 0, 1)
+            gl.addWidget(btn_browse, 0, 2)
+            gl.addWidget(btn_load, 0, 3)
+            self.summary_status = QtWidgets.QLabel("No summary loaded")
+            self.summary_status.setWordWrap(True)
+            gl.addWidget(self.summary_status, 1, 0, 1, 4)
+            self.group_combo = QtWidgets.QComboBox()
+            self.group_combo.addItems(group_options)
+            if args.group in group_options:
+                self.group_combo.setCurrentText(args.group)
+            self.group_combo.currentTextChanged.connect(self._on_group_changed)
+            gl.addWidget(QtWidgets.QLabel("Group by:"), 2, 0)
+            gl.addWidget(self.group_combo, 2, 1, 1, 3)
+            self.metric_combo = QtWidgets.QComboBox()
+            self.metric_combo.currentTextChanged.connect(self._on_metric_changed)
+            gl.addWidget(QtWidgets.QLabel("Color by:"), 3, 0)
+            gl.addWidget(self.metric_combo, 3, 1, 1, 3)
+            self.only_results_chk = QtWidgets.QCheckBox("Show only bars that have results")
+            self.only_results_chk.toggled.connect(lambda _: self.refresh_scene())
+            gl.addWidget(self.only_results_chk, 4, 0, 1, 4)
+            self.stats_label = QtWidgets.QLabel("")
+            self.stats_label.setWordWrap(True)
+            gl.addWidget(self.stats_label, 5, 0, 1, 4)
+            lay.addWidget(g)
+
+            # ---- Contour ----
+            g = QtWidgets.QGroupBox("Contour")
+            gl = QtWidgets.QGridLayout(g)
+            self.auto_chk = QtWidgets.QCheckBox("Auto range")
+            self.auto_chk.setChecked(True)
+            self.auto_chk.toggled.connect(self._on_auto_toggled)
+            gl.addWidget(self.auto_chk, 0, 0, 1, 2)
+            self.cmap_combo = QtWidgets.QComboBox()
+            self.cmap_combo.addItems(cmap_options)
+            self.cmap_combo.currentTextChanged.connect(lambda _: self.apply_contour())
+            gl.addWidget(QtWidgets.QLabel("Colormap:"), 0, 2)
+            gl.addWidget(self.cmap_combo, 0, 3)
+            self.min_edit = QtWidgets.QLineEdit()
+            self.max_edit = QtWidgets.QLineEdit()
+            self.levels_spin = QtWidgets.QSpinBox()
+            self.levels_spin.setRange(1, 64)
+            self.levels_spin.setValue(10)
+            self.levels_spin.valueChanged.connect(self._on_levels_changed)
+            gl.addWidget(QtWidgets.QLabel("Min:"), 1, 0)
+            gl.addWidget(self.min_edit, 1, 1)
+            gl.addWidget(QtWidgets.QLabel("Max:"), 1, 2)
+            gl.addWidget(self.max_edit, 1, 3)
+            gl.addWidget(QtWidgets.QLabel("Levels:"), 2, 0)
+            gl.addWidget(self.levels_spin, 2, 1)
+            self.gen_btn = QtWidgets.QPushButton("Generate Levels")
+            self.gen_btn.clicked.connect(self._generate_levels)
+            gl.addWidget(self.gen_btn, 2, 2, 1, 2)
+            self.levels_table = QtWidgets.QTableWidget(0, 1)
+            self.levels_table.setHorizontalHeaderLabels(["Level value (edit freely)"])
+            self.levels_table.horizontalHeader().setStretchLastSection(True)
+            self.levels_table.setMinimumHeight(160)
+            gl.addWidget(self.levels_table, 3, 0, 1, 4)
+            self.apply_btn = QtWidgets.QPushButton("Apply Contour")
+            self.apply_btn.clicked.connect(self.apply_contour)
+            gl.addWidget(self.apply_btn, 4, 0, 1, 4)
+            hint = QtWidgets.QLabel("Untick Auto, set Min/Max/Levels, Generate Levels, then edit any level "
+                                    "value for a non-uniform scale and Apply. Values outside the range get "
+                                    "the first/last color; bars without results are gray.")
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: gray; font-style: italic;")
+            gl.addWidget(hint, 5, 0, 1, 4)
+            lay.addWidget(g)
+            self._on_auto_toggled(True)
+
+            # ---- Visibility ----
+            g = QtWidgets.QGroupBox("Visibility")
+            gl = QtWidgets.QGridLayout(g)
+            self.tree = QtWidgets.QTreeWidget()
+            self.tree.setHeaderLabels(["Element type / Property", "Elements"])
+            self.tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+            self.tree.setMinimumHeight(260)
+            self.tree.itemChanged.connect(self._on_tree_item_changed)
+            gl.addWidget(self.tree, 0, 0, 1, 4)
+            for col, (text, fn) in enumerate([("Show All", self._show_all), ("Hide All", self._hide_all),
+                                               ("Show Only Selected", self._show_only_selected),
+                                               ("Hide Selected", self._hide_selected)]):
+                b = QtWidgets.QPushButton(text)
+                b.clicked.connect(fn)
+                gl.addWidget(b, 1 + col // 2, (col % 2) * 2, 1, 2)
+            self.ids_edit = QtWidgets.QLineEdit()
+            self.ids_edit.setPlaceholderText("Element IDs, e.g. 1001, 1005-1010")
+            gl.addWidget(self.ids_edit, 3, 0, 1, 4)
+            for col, (text, fn) in enumerate([("Hide IDs", self._hide_ids), ("Show Only IDs", self._show_only_ids),
+                                               ("Hide Picked", self._hide_picked),
+                                               ("Unhide All IDs", self._unhide_ids)]):
+                b = QtWidgets.QPushButton(text)
+                b.clicked.connect(fn)
+                gl.addWidget(b, 4 + col // 2, (col % 2) * 2, 1, 2)
+            lay.addWidget(g)
+
+            # ---- Display ----
+            g = QtWidgets.QGroupBox("Display")
+            gl = QtWidgets.QGridLayout(g)
+            self.edges_chk = QtWidgets.QCheckBox("Shell / solid edges")
+            self.edges_chk.setChecked(True)
+            self.edges_chk.toggled.connect(lambda _: self._apply_display())
+            gl.addWidget(self.edges_chk, 0, 0, 1, 2)
+            self.opacity_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+            self.opacity_slider.setRange(5, 100)
+            self.opacity_slider.setValue(100)
+            self.opacity_slider.valueChanged.connect(lambda _: self._apply_display())
+            gl.addWidget(QtWidgets.QLabel("Shell opacity:"), 1, 0)
+            gl.addWidget(self.opacity_slider, 1, 1)
+            self.width_spin = QtWidgets.QSpinBox()
+            self.width_spin.setRange(1, 20)
+            self.width_spin.setValue(5)
+            self.width_spin.valueChanged.connect(lambda _: self._apply_display())
+            gl.addWidget(QtWidgets.QLabel("Bar line width:"), 2, 0)
+            gl.addWidget(self.width_spin, 2, 1)
+            lay.addWidget(g)
+
+            # ---- Picked element ----
+            g = QtWidgets.QGroupBox("Picked element (double-click in the 3D view)")
+            gl = QtWidgets.QVBoxLayout(g)
+            self.info_text = QtWidgets.QPlainTextEdit()
+            self.info_text.setReadOnly(True)
+            self.info_text.setMinimumHeight(150)
+            gl.addWidget(self.info_text)
+            lay.addWidget(g)
+            lay.addStretch(1)
+
+        # ==================== VERİ YÜKLEME ====================
+        def load_bdf(self, use_cache=True):
+            if not self.bdf_path or not os.path.isfile(self.bdf_path):
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open BDF", "", "BDF (*.bdf *.dat *.nas);;All (*)")
+                if not path:
+                    return
+                self.bdf_path = path
+            if self._worker is not None and self._worker.isRunning():
+                return
+            self.setWindowTitle(f"DaDT FEM Viewer - {os.path.basename(self.bdf_path)}")
+            self.statusBar().showMessage(f"Loading {self.bdf_path} ...")
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            self._worker = _LoadWorker(self.bdf_path, use_cache)
+            self._worker.message.connect(lambda m: self.statusBar().showMessage(m))
+            self._worker.done.connect(self._on_grid_loaded)
+            self._worker.failed.connect(self._on_load_failed)
+            self._worker.start()
+
+        def _on_load_failed(self, msg):
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.statusBar().showMessage("Load failed")
+            QtWidgets.QMessageBox.critical(self, "FEM Viewer", f"Could not load the BDF:\n{msg}")
+
+        def _on_grid_loaded(self, grid):
+            QtWidgets.QApplication.restoreOverrideCursor()
+            self.grid = grid
+            self.type_names = [str(t) for t in np.asarray(grid.field_data['TypeNames']).tolist()]
+            n = grid.n_cells
+            self.tree_mask = np.ones(n, dtype=bool)
+            self.id_hidden = np.zeros(n, dtype=bool)
+            self.has_result = np.zeros(n, dtype=bool)
+            self.is_bar = np.asarray(grid.cell_data['Category']) == 0
+            tcode = np.asarray(grid.cell_data['TypeCode']).astype(np.int64)
+            self.tree_key = (tcode << 40) | (np.asarray(grid.cell_data['PID']) + 1)
+            self._build_tree()
+            self.statusBar().showMessage(f"Loaded {n} elements from {os.path.basename(self.bdf_path)}", 8000)
+            if self.summary_edit.text().strip():
+                self.load_summary(quiet=True)
+            else:
+                self.apply_contour()
+            self.plotter.view_isometric()
+            self.plotter.reset_camera()
+
+        def _browse_summary(self):
+            folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Summary folder", self.summary_edit.text())
+            if folder:
+                self.summary_edit.setText(folder)
+                self.load_summary()
+
+        @staticmethod
+        def _read_summary(path, id_col):
+            df = V._standardize_summary_df(V, pd.read_csv(path))
+            if id_col not in df.columns:
+                return None
+            df[id_col] = pd.to_numeric(df[id_col], errors='coerce')
+            df = df.dropna(subset=[id_col])
+            df[id_col] = df[id_col].astype(np.int64)
+            return df.drop_duplicates(subset=[id_col]).set_index(id_col)
+
+        def load_summary(self, quiet=False):
+            folder = self.summary_edit.text().strip()
+            if not folder or not os.path.isdir(folder):
+                if not quiet:
+                    QtWidgets.QMessageBox.warning(self, "FEM Viewer", "Select a valid summary folder")
+                self.apply_contour()
+                return
+            bar_path, prop_path, full_path = V._scan_summary_files(folder)
+            self.bar_df = self.prop_df = None
+            msgs = []
+            try:
+                if bar_path:
+                    self.bar_df = self._read_summary(bar_path, 'Bar Element ID')
+                if prop_path:
+                    self.prop_df = self._read_summary(prop_path, 'Bar Property ID')
+                if self.bar_df is None and self.prop_df is None and full_path:
+                    self.bar_df = self._read_summary(full_path, 'Bar Element ID')
+                    self.prop_df = self._read_summary(full_path, 'Bar Property ID')
+                    msgs.append("DT_FULL_SUMMARY.csv fallback (first row per ID)")
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "FEM Viewer", f"Could not read summary CSVs:\n{e}")
+            if self.bar_df is not None:
+                msgs.insert(0, f"Bar Element ID: {len(self.bar_df)} rows")
+            if self.prop_df is not None:
+                msgs.insert(0, f"Bar Property ID: {len(self.prop_df)} rows")
+            self.summary_status.setText("; ".join(msgs) if msgs else "No DT_SIZING_*_SUMMARY.csv / DT_FULL_SUMMARY.csv found")
+            self._refresh_metric_options(preferred=args.metric)
+            self.apply_contour()
+
+        def _current_df(self):
+            return self.bar_df if self.group_combo.currentText() == 'Bar Element ID' else self.prop_df
+
+        def _refresh_metric_options(self, preferred=''):
+            cols = [str(c) for c in V._metric_columns(self._current_df())]
+            current = preferred or self.metric_combo.currentText()
+            self.metric_combo.blockSignals(True)
+            self.metric_combo.clear()
+            self.metric_combo.addItems(cols)
+            if current in cols:
+                self.metric_combo.setCurrentText(current)
+            elif cols:
+                self.metric_combo.setCurrentText(next((c for c in cols if 'life' in c.lower()), cols[0]))
+            self.metric_combo.blockSignals(False)
+
+        def _on_group_changed(self, _):
+            self._refresh_metric_options()
+            self.auto_chk.setChecked(True)
+            self.apply_contour()
+
+        def _on_metric_changed(self, _):
+            self.auto_chk.setChecked(True)
+            self.apply_contour()
+
+        # ==================== CONTOUR ====================
+        def _on_auto_toggled(self, auto):
+            for w in (self.min_edit, self.max_edit, self.gen_btn, self.levels_table):
+                w.setEnabled(not auto)
+            if self.grid is not None:
+                self.apply_contour()
+
+        def _on_levels_changed(self, _):
+            if self.auto_chk.isChecked():
+                self.apply_contour()
+
+        def _set_table_values(self, values):
+            self.levels_table.setRowCount(len(values))
+            for i, v in enumerate(values):
+                self.levels_table.setItem(i, 0, QtWidgets.QTableWidgetItem(fmt(v)))
+
+        def _table_values(self):
+            vals = []
+            for i in range(self.levels_table.rowCount()):
+                item = self.levels_table.item(i, 0)
+                vals.append(float(item.text()))
+            return vals
+
+        def _generate_levels(self):
+            try:
+                vmin, vmax = float(self.min_edit.text()), float(self.max_edit.text())
+                if vmin >= vmax:
+                    raise ValueError
+            except (TypeError, ValueError):
+                QtWidgets.QMessageBox.warning(self, "FEM Viewer", "Enter a valid Min < Max first")
+                return
+            self._set_table_values(np.linspace(vmin, vmax, self.levels_spin.value() + 1))
+
+        def _boundaries(self, data):
+            """Band boundaries: Auto -> even split of the data range; otherwise
+            the edited level table if valid (>=2 strictly increasing values),
+            else an even split of Min/Max."""
+            n = self.levels_spin.value()
+            if data.size:
+                dmin, dmax = float(np.nanmin(data)), float(np.nanmax(data))
+            else:
+                dmin, dmax = 0.0, 1.0
+            if not self.auto_chk.isChecked():
+                try:
+                    vals = self._table_values()
+                    if len(vals) >= 2 and all(vals[i] < vals[i + 1] for i in range(len(vals) - 1)):
+                        return np.array(vals)
+                except (TypeError, ValueError, AttributeError):
+                    pass
+                try:
+                    vmin, vmax = float(self.min_edit.text()), float(self.max_edit.text())
+                    if vmin < vmax:
+                        return np.linspace(vmin, vmax, n + 1)
+                except (TypeError, ValueError):
+                    pass
+                self.statusBar().showMessage("Invalid manual contour range - using the data range", 6000)
+            if dmin == dmax:
+                dmin, dmax = dmin - 0.5, dmax + 0.5
+            self.min_edit.setText(fmt(dmin))
+            self.max_edit.setText(fmt(dmax))
+            bounds = np.linspace(dmin, dmax, n + 1)
+            if self.auto_chk.isChecked():
+                self._set_table_values(bounds)
+            return bounds
+
+        def apply_contour(self):
+            if self.grid is None:
+                return
+            n_cells = self.grid.n_cells
+            values = np.full(n_cells, np.nan)
+            self.color_mode = None
+            self.has_result[:] = False
+            self.legend = {}
+            df = self._current_df()
+            metric = self.metric_combo.currentText()
+            if df is not None and metric in df.columns:
+                key_name = 'EID' if self.group_combo.currentText() == 'Bar Element ID' else 'PID'
+                keys = np.asarray(self.grid.cell_data[key_name])[self.is_bar]
+                mapped = pd.Series(keys).map(df[metric])
+                bar_idx = np.nonzero(self.is_bar)[0]
+                if V._is_numeric_column(df[metric]):
+                    vals = pd.to_numeric(mapped, errors='coerce').to_numpy(dtype=float)
+                    values[bar_idx] = vals
+                    data = vals[~np.isnan(vals)]
+                    bounds = self._boundaries(data)
+                    n = len(bounds) - 1
+                    band = np.clip(np.digitize(values, bounds[1:-1]), 0, n - 1).astype(float) + 0.5
+                    band[np.isnan(values)] = np.nan
+                    self.color_mode = 'numeric'
+                    self.legend = {'n': n, 'annotations': {float(i): fmt(b) for i, b in enumerate(bounds)}}
+                    if data.size:
+                        self.stats_label.setText(
+                            f"{data.size} bar(s) with '{metric}': min={fmt(data.min())}  "
+                            f"max={fmt(data.max())}  avg={fmt(data.mean())}")
+                    else:
+                        self.stats_label.setText(f"No bar in this BDF matches a '{key_name}' in the CSV")
+                else:
+                    names = [None if pd.isna(x) else str(x) for x in mapped]
+                    cats = sorted({x for x in names if x is not None})
+                    code = {c: i for i, c in enumerate(cats)}
+                    band = np.full(n_cells, np.nan)
+                    band[bar_idx] = [np.nan if x is None else code[x] for x in names]
+                    values = band.copy()
+                    self.color_mode = 'categorical'
+                    self.legend = {'n': max(len(cats), 1), 'annotations': {float(i): c for i, c in enumerate(cats)}}
+                    self.stats_label.setText(f"{int(np.sum(~np.isnan(band)))} bar(s) with '{metric}', "
+                                             f"{len(cats)} distinct value(s)")
+                self.grid.cell_data['__band'] = band
+                self.has_result[:] = ~np.isnan(values)
+                self.metric_name = metric
+            else:
+                self.stats_label.setText("" if df is None else f"'{metric}' not in the CSV")
+            self.refresh_scene()
+
+        def _cmap_name(self):
+            choice = self.cmap_combo.currentText()
+            if choice != 'Auto':
+                return choice
+            return 'RdYlGn' if 'life' in getattr(self, 'metric_name', '').lower() else 'jet'
+
+        # ==================== ÇİZİM ====================
+        def visible_mask(self):
+            vis = self.tree_mask & ~self.id_hidden
+            if self.only_results_chk.isChecked() and self.color_mode:
+                vis &= ~self.is_bar | self.has_result
+            return vis
+
+        def refresh_scene(self):
+            if self.grid is None:
+                return
+            vis = self.visible_mask()
+            for name in ('others', 'bars'):
+                self.plotter.remove_actor(name, render=False)
+                self.actors.pop(name, None)
+            try:
+                self.plotter.remove_scalar_bar()
+            except Exception:
+                pass
+
+            other_ids = np.nonzero(vis & ~self.is_bar)[0]
+            if other_ids.size:
+                self.actors['others'] = self.plotter.add_mesh(
+                    self.grid.extract_cells(other_ids), name='others', color='#c9ced6',
+                    show_edges=self.edges_chk.isChecked(), edge_color='#4d5560',
+                    opacity=self.opacity_slider.value() / 100.0, reset_camera=False, render=False)
+
+            bar_ids = np.nonzero(vis & self.is_bar)[0]
+            if bar_ids.size:
+                bars = self.grid.extract_cells(bar_ids)
+                common = dict(name='bars', line_width=self.width_spin.value(), reset_camera=False, render=False)
+                if self.color_mode:
+                    n = self.legend['n']
+                    if self.color_mode == 'numeric':
+                        cmap, clim = self._cmap_name(), [0, n]
+                    else:
+                        cmap, clim = ('tab20' if n <= 20 else 'hsv'), [-0.5, n - 0.5]
+                    self.actors['bars'] = self.plotter.add_mesh(
+                        bars, scalars='__band', cmap=cmap, n_colors=n, clim=clim,
+                        nan_color='#9aa0a6', annotations=self.legend['annotations'],
+                        scalar_bar_args=dict(title=self.metric_name, n_labels=0, vertical=True,
+                                             position_x=0.86, position_y=0.08, width=0.08, height=0.84,
+                                             title_font_size=16, label_font_size=13, color='black'),
+                        **common)
+                else:
+                    self.actors['bars'] = self.plotter.add_mesh(bars, color='#1f5fbf', **common)
+
+            if self.last_pick_eid is not None:
+                self._highlight(self.last_pick_eid)
+            self.plotter.render()
+            self.status_label.setText(f"Visible: {int(vis.sum())} / {self.grid.n_cells} elements   ")
+
+        def _apply_display(self):
+            act = self.actors.get('others')
+            if act is not None:
+                act.GetProperty().SetOpacity(self.opacity_slider.value() / 100.0)
+                act.GetProperty().SetEdgeVisibility(self.edges_chk.isChecked())
+            act = self.actors.get('bars')
+            if act is not None:
+                act.GetProperty().SetLineWidth(self.width_spin.value())
+            self.plotter.render()
+
+        def _toggle_projection(self):
+            if self.plotter.camera.parallel_projection:
+                self.plotter.disable_parallel_projection()
+            else:
+                self.plotter.enable_parallel_projection()
+
+        def _screenshot(self):
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save screenshot", "fem_view.png", "PNG (*.png)")
+            if path:
+                self.plotter.screenshot(path)
+                self.statusBar().showMessage(f"Saved {path}", 6000)
+
+        # ==================== GÖRÜNÜRLÜK AĞACI ====================
+        def _build_tree(self):
+            self.tree.blockSignals(True)
+            self.tree.clear()
+            keys, counts = np.unique(self.tree_key, return_counts=True)
+            by_type = {}
+            for k, c in zip(keys.tolist(), counts.tolist()):
+                by_type.setdefault(k >> 40, []).append((k, (k & ((1 << 40) - 1)) - 1, c))
+            for tcode in sorted(by_type, key=lambda t: self.type_names[t]):
+                rows = sorted(by_type[tcode], key=lambda r: r[1])
+                parent = QtWidgets.QTreeWidgetItem([self.type_names[tcode], str(sum(r[2] for r in rows))])
+                parent.setFlags(parent.flags() | QtCore.Qt.ItemIsUserCheckable | tristate_flag)
+                parent.setCheckState(0, QtCore.Qt.Checked)
+                for key, pid, c in rows:
+                    child = QtWidgets.QTreeWidgetItem([f"PID {pid}" if pid >= 0 else "(no PID)", str(c)])
+                    child.setFlags(child.flags() | QtCore.Qt.ItemIsUserCheckable)
+                    child.setCheckState(0, QtCore.Qt.Checked)
+                    child.setData(0, QtCore.Qt.UserRole, int(key))
+                    parent.addChild(child)
+                self.tree.addTopLevelItem(parent)
+            self.tree.resizeColumnToContents(0)
+            self.tree.blockSignals(False)
+
+        def _leaf_items(self):
+            for i in range(self.tree.topLevelItemCount()):
+                parent = self.tree.topLevelItem(i)
+                for j in range(parent.childCount()):
+                    yield parent.child(j)
+
+        def _on_tree_item_changed(self, *_):
+            # Bir tip'i (ebeveyn) işaretlemek tüm alt PID'leri tek tek
+            # değiştirir - her biri için yeniden çizmek yerine tek seferde topla.
+            if not self._tree_update_pending:
+                self._tree_update_pending = True
+                QtCore.QTimer.singleShot(0, self._apply_tree)
+
+        def _apply_tree(self):
+            self._tree_update_pending = False
+            if self.grid is None:
+                return
+            checked = [leaf.data(0, QtCore.Qt.UserRole) for leaf in self._leaf_items()
+                       if leaf.checkState(0) == QtCore.Qt.Checked]
+            self.tree_mask = np.isin(self.tree_key, np.array(checked, dtype=np.int64))
+            self.refresh_scene()
+
+        def _set_all_leaves(self, state, only=None):
+            self.tree.blockSignals(True)
+            for i in range(self.tree.topLevelItemCount()):
+                self.tree.topLevelItem(i).setCheckState(0, state)
+            if only is not None:
+                for leaf in only:
+                    leaf.setCheckState(0, QtCore.Qt.Checked if state == QtCore.Qt.Unchecked else QtCore.Qt.Unchecked)
+            self.tree.blockSignals(False)
+            self._apply_tree()
+
+        def _selected_leaves(self):
+            # QTreeWidgetItem hash'lenemiyor (PyQt5) - set yerine id() ile tekilleştir.
+            leaves = {}
+            for item in self.tree.selectedItems():
+                kids = [item.child(j) for j in range(item.childCount())] if item.childCount() else [item]
+                for leaf in kids:
+                    leaves[id(leaf)] = leaf
+            return list(leaves.values())
+
+        def _show_all(self):
+            self._set_all_leaves(QtCore.Qt.Checked)
+
+        def _hide_all(self):
+            self._set_all_leaves(QtCore.Qt.Unchecked)
+
+        def _show_only_selected(self):
+            leaves = self._selected_leaves()
+            if leaves:
+                self._set_all_leaves(QtCore.Qt.Unchecked, only=leaves)
+
+        def _hide_selected(self):
+            leaves = self._selected_leaves()
+            if not leaves:
+                return
+            self.tree.blockSignals(True)
+            for leaf in leaves:
+                leaf.setCheckState(0, QtCore.Qt.Unchecked)
+            self.tree.blockSignals(False)
+            self._apply_tree()
+
+        # ==================== ID İLE GİZLE / GÖSTER ====================
+        def _ids_from_edit(self):
+            try:
+                ids = _fem_parse_id_list(self.ids_edit.text())
+            except ValueError:
+                QtWidgets.QMessageBox.warning(self, "FEM Viewer", "Element IDs must be numbers or ranges like 1005-1010")
+                return None
+            return np.array(sorted(ids), dtype=np.int64) if ids else None
+
+        def _hide_ids(self):
+            ids = self._ids_from_edit()
+            if ids is not None and self.grid is not None:
+                self.id_hidden |= np.isin(self.grid.cell_data['EID'], ids)
+                self.refresh_scene()
+
+        def _show_only_ids(self):
+            ids = self._ids_from_edit()
+            if ids is not None and self.grid is not None:
+                self.id_hidden = ~np.isin(self.grid.cell_data['EID'], ids)
+                self.refresh_scene()
+
+        def _hide_picked(self):
+            if self.last_pick_eid is not None and self.grid is not None:
+                self.id_hidden |= np.asarray(self.grid.cell_data['EID']) == self.last_pick_eid
+                self.last_pick_eid = None
+                self.plotter.remove_actor('__pick', render=False)
+                self.refresh_scene()
+
+        def _unhide_ids(self):
+            if self.grid is not None:
+                self.id_hidden[:] = False
+                self.refresh_scene()
+
+        # ==================== SEÇİM (PICK) ====================
+        def _on_double_click(self, *_):
+            if self.grid is None:
+                return
+            x, y = self.plotter.iren.interactor.GetEventPosition()
+            picker = vtkCellPicker()
+            picker.SetTolerance(0.005)
+            picker.Pick(x, y, 0, self.plotter.renderer)
+            cell_id = picker.GetCellId()
+            dataset = picker.GetDataSet()
+            if cell_id < 0 or dataset is None:
+                return
+            ds = pv.wrap(dataset)
+            if 'EID' not in ds.cell_data:
+                return
+            eid = int(ds.cell_data['EID'][cell_id])
+            self.last_pick_eid = eid
+            self._highlight(eid)
+            self._show_info(eid)
+            self.plotter.render()
+
+        def _highlight(self, eid):
+            idx = np.nonzero(np.asarray(self.grid.cell_data['EID']) == eid)[0]
+            if not idx.size:
+                return
+            self.plotter.add_mesh(self.grid.extract_cells(idx), name='__pick', color='magenta',
+                                  style='wireframe', line_width=self.width_spin.value() + 4,
+                                  reset_camera=False, pickable=False, render=False)
+
+        def _show_info(self, eid):
+            i = int(np.nonzero(np.asarray(self.grid.cell_data['EID']) == eid)[0][0])
+            pid = int(self.grid.cell_data['PID'][i])
+            etype = self.type_names[int(self.grid.cell_data['TypeCode'][i])]
+            lines = [f"EID: {eid}", f"Type: {etype}", f"PID: {pid if pid >= 0 else '-'}"]
+            if self.is_bar[i]:
+                for label, df, key in (("Bar Element ID row", self.bar_df, eid), ("Bar Property ID row", self.prop_df, pid)):
+                    if df is not None and key in df.index:
+                        lines.append(f"\n{label}:")
+                        for col, val in df.loc[key].items():
+                            if isinstance(val, (int, float, np.number)) and not pd.isna(val):
+                                val = str(int(val)) if float(val).is_integer() else fmt(val)
+                            lines.append(f"  {col}: {val}")
+            self.info_text.setPlainText("\n".join(lines))
+            self.statusBar().showMessage(f"Picked EID {eid} ({etype}, PID {pid})", 8000)
+
+        def closeEvent(self, event):
+            self.plotter.close()
+            super().closeEvent(event)
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    win = FemViewer()
+    win.show()
+    QtCore.QTimer.singleShot(0, win.load_bdf)
+    app.exec_()
+
+
+# ============================================================================
 # main()  --  programın giriş noktası
 # ============================================================================
 # Tkinter ana penceresini (root) oluşturur, tüm sekmeleri barındıran
@@ -8564,6 +9486,10 @@ class VisualizationResultsTab:
 # olay döngüsünü (mainloop) başlatır - bu çağrı, pencere kapatılana kadar
 # bloklar (GUI olaylarını işler).
 def main():
+    # "Open FEM Viewer" bu dosyayı --fem-viewer ile ayrı bir süreç olarak başlatır.
+    if _FEM_VIEWER_FLAG in sys.argv[1:]:
+        _run_fem_viewer(sys.argv[1:])
+        return
     root = tk.Tk()
     app = IntegratedBDFRFTool(root)
     root.mainloop()

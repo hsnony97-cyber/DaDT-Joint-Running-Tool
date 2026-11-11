@@ -60,26 +60,6 @@ import numpy as np
 # gerektiğinde openpyxl kullanılıyor.
 import openpyxl
 
-# ==================== GÖRSELLEŞTİRME (VISUALIZATION) BAĞIMLILIKLARI ====================
-# matplotlib: SADECE "Visualization Results" sekmesindeki 3B FEM mesh görünümü
-# ve 2B grafikler için kullanılıyor. Uygulamanın geri kalanı (diğer 7 sekme)
-# matplotlib'e hiç ihtiyaç duymuyor - bu yüzden import opsiyonel: kurulu
-# değilse uygulamanın tamamı yine de normal çalışır, sadece Visualization
-# Results sekmesi kullanıcıya "matplotlib kurulu değil" uyarısı gösterir.
-try:
-    import matplotlib
-    matplotlib.use('TkAgg')  # Tkinter penceresi içine gömülebilen çizim motoru
-    from matplotlib.figure import Figure
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
-    from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection
-    import matplotlib.cm as mpl_cm
-    import matplotlib.colors as mpl_colors
-    import matplotlib.ticker as mpl_ticker
-    from matplotlib.patches import Patch
-    _MATPLOTLIB_AVAILABLE = True
-except Exception:
-    _MATPLOTLIB_AVAILABLE = False
-
 # _APP_COLORS: uygulamanın renk paletini tutan global (modül seviyesi) sözlük.
 # Başlangıçta boş, _configure_app_style() çağrıldığında içi dolduruluyor.
 # Tüm sekmeler (tab) bu sözlüğü widget renklerini ayarlarken okuyor
@@ -7667,50 +7647,19 @@ class IterativeFullRunTab:
 # ============================================================================
 # VisualizationResultsTab  --  "Visualization Results" sekmesi (Tab 8)
 # ============================================================================
-# Kullanıcının verdiği bir BDF dosyasını (HyperMesh benzeri) 3B olarak çizer
-# ve Iterative Full Run'ın ürettiği DT_SIZING_BAR_SUMMARY.csv /
-# DT_SIZING_PROP_SUMMARY.csv dosyalarındaki sonuçları (t, d, Material, Life)
-# bar elemanlarının üzerine renk kodlayarak gösterir - "Bar Property ID" veya
-# "Bar Element ID" bazında gruplama seçilebilir. Diğer hiçbir sekmenin kodunu
-# değiştirmez, bağımsız ve kendi kendine yeten yeni bir sekmedir.
+# Sadece bir "başlatıcı": kullanıcı BDF'i ve sonuç CSV'lerini (Bar Element ID
+# bazlı / Bar Property ID bazlı) seçer, "Open in FEM Viewer" ile PyVista
+# tabanlı FEM Viewer ayrı bir süreç olarak açılır (bkz. _run_fem_viewer).
+# Contour, Group By / Color By, hide/show gibi TÜM çizim ayarları viewer'ın
+# içindedir. Viewer'ın çıktısı bir log dosyasına yazılır; viewer bir hatayla
+# kapanırsa hata bu sekmede gösterilir (önceden sessizce kayboluyordu).
 class VisualizationResultsTab:
     def __init__(self, parent_frame, root):
         self.root = root
         self.parent_frame = parent_frame
-
-        # ---- Girdi yolları ----
-        self.bdf_path = tk.StringVar()        # görselleştirilecek BDF dosyası
-        self.summary_folder = tk.StringVar()  # DT_SIZING_*_SUMMARY.csv'lerin aranacağı klasör
-
-        # ---- Çizim ayarları ----
-        self.group_by = tk.StringVar(value="Bar Property ID")  # "Bar Property ID" | "Bar Element ID"
-        self.color_by = tk.StringVar(value="Life")              # yüklenen CSV'nin sütunlarından biri - sabit bir liste değil, bkz. _refresh_metric_options
-
-        # ---- Renk skalası (contour) ayarları ----
-        # scale_auto açıkken Min/Max veriden otomatik hesaplanır (eski
-        # davranış); kullanıcı kapatıp kendi Min/Max/Levels değerlerini
-        # girerse, renk skalası o aralığa ve o kadar banda (kademeye) göre çizilir.
-        self.scale_auto = tk.BooleanVar(value=True)
-        self.scale_min = tk.StringVar(value="")
-        self.scale_max = tk.StringVar(value="")
-        self.scale_levels = tk.StringVar(value="10")  # kaç ayrı renk bandına (kademeye) bölüneceği
-
-        # ---- Görünüm ayarı ----
-        # True iken 2B yan grafik gizlenir ve 3B FEM görünümü tüm çizim
-        # alanını kaplar - kullanıcı modeli daha büyük görüp rahatça
-        # döndürüp/yakınlaştırıp inceleyebilsin diye.
-        self.maximize_3d = tk.BooleanVar(value=False)
-
-        # ---- BDF'ten çıkarılan mesh verisi ----
-        self.bdf_model = None
-        self.node_coords = {}      # nid -> (x, y, z)
-        self.bar_elements = []     # [{'eid', 'pid', 'n1', 'n2'}, ...]  (CBAR/CBEAM)
-        self.shell_elements = []   # [{'eid', 'pid', 'nodes': [...]}, ...]  (CQUAD4/CTRIA3/...)
-
-        # ---- CSV'den okunan sonuç verisi ----
-        self.bar_summary_df = None   # index: Bar Element ID
-        self.prop_summary_df = None  # index: Bar Property ID
-
+        self.bdf_path = tk.StringVar()
+        self.bar_csv_path = tk.StringVar()    # Bar Element ID bazlı sonuçlar (örn. DT_SIZING_BAR_SUMMARY.csv)
+        self.prop_csv_path = tk.StringVar()   # Bar Property ID bazlı sonuçlar (örn. DT_SIZING_PROP_SUMMARY.csv)
         self.setup_ui()
 
     # ==================== GUI ====================
@@ -7719,371 +7668,179 @@ class VisualizationResultsTab:
         main.pack(fill=tk.BOTH, expand=True)
 
         ttk.Label(main, text="Visualization Results", style='Header.TLabel').pack(pady=(0, 4))
-        ttk.Label(main, text="Load a BDF + a sizing summary folder, then color the FEM mesh by any "
-                              "column from that CSV, grouped by Bar Property ID or Bar Element ID",
-                 style='Subtitle.TLabel').pack(pady=(0, 8))
+        ttk.Label(main, text="Select a BDF and the result CSVs, then open them in the 3D FEM Viewer - "
+                              "contour, Group By / Color By and hide/show are all inside the viewer",
+                  style='Subtitle.TLabel').pack(pady=(0, 8))
 
-        # matplotlib kurulu değilse, sekmenin geri kalanını hiç kurmadan
-        # sadece bir uyarı göster - uygulamanın diğer 7 sekmesi yine de
-        # tamamen normal çalışmaya devam eder.
-        if not _MATPLOTLIB_AVAILABLE:
-            ttk.Label(main, text="matplotlib bulunamadı. Bu sekmeyi kullanmak için önce şunu çalıştırın:\n"
-                                  "    pip install matplotlib",
-                     foreground=_APP_COLORS.get('danger', 'red'),
-                     font=('Segoe UI', 10, 'bold'), justify=tk.LEFT).pack(pady=30)
-            return
-
-        # ---- Section 1: Model & Sizing Data ----
-        f1 = ttk.LabelFrame(main, text="\U0001F4C1  1. Model & Sizing Data", padding=10)
+        f1 = ttk.LabelFrame(main, text="\U0001F4C1  1. Model & Results", padding=10)
         f1.pack(fill=tk.X, pady=5)
-
-        bdf_frame = ttk.Frame(f1)
-        bdf_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(bdf_frame, text="BDF File:", width=16).pack(side=tk.LEFT)
-        ttk.Entry(bdf_frame, textvariable=self.bdf_path, width=55).pack(side=tk.LEFT, padx=5)
-        ttk.Button(bdf_frame, text="Browse", command=self._browse_bdf).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bdf_frame, text="Load BDF", command=self.load_bdf).pack(side=tk.LEFT, padx=2)
-        self.bdf_status = ttk.Label(f1, text="No BDF loaded", foreground="gray")
-        self.bdf_status.pack(anchor=tk.W, pady=(0, 6))
-
-        sum_frame = ttk.Frame(f1)
-        sum_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(sum_frame, text="Summary Folder:", width=16).pack(side=tk.LEFT)
-        ttk.Entry(sum_frame, textvariable=self.summary_folder, width=55).pack(side=tk.LEFT, padx=5)
-        ttk.Button(sum_frame, text="Browse", command=self._browse_summary_folder).pack(side=tk.LEFT, padx=2)
-        ttk.Button(sum_frame, text="Load Summary", command=self.load_summary).pack(side=tk.LEFT, padx=2)
-        ttk.Label(f1, text="(recursively searches for DT_SIZING_BAR_SUMMARY.csv / DT_SIZING_PROP_SUMMARY.csv "
-                            "- written by Iterative Full Run's sizing step into the Joint Run output folder; "
-                            "falls back to DT_FULL_SUMMARY.csv if those aren't found)",
-                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
-        self.summary_status = ttk.Label(f1, text="No summary loaded", foreground="gray")
-        self.summary_status.pack(anchor=tk.W)
-
-        viewer_frame = ttk.Frame(f1)
-        viewer_frame.pack(fill=tk.X, pady=(8, 2))
-        ttk.Label(viewer_frame, text="3D FEM Viewer:", width=16).pack(side=tk.LEFT)
-        ttk.Button(viewer_frame, text="Open FEM Viewer", command=self.open_fem_viewer,
-                   style='Accent.TButton').pack(side=tk.LEFT, padx=5)
-        ttk.Label(viewer_frame, text="(opens the BDF + summary CSVs above in a separate PyVista window: "
-                                     "hide/show by property or element ID, editable contour, picking - "
-                                     "needs: pip install pyvista pyvistaqt PyQt5)",
+        rows = [("BDF File:", self.bdf_path, [("BDF", "*.bdf *.dat *.nas"), ("All", "*.*")], ""),
+                ("Bar Element CSV:", self.bar_csv_path, [("CSV", "*.csv"), ("All", "*.*")],
+                 "(optional - rows keyed by Bar Element ID, e.g. DT_SIZING_BAR_SUMMARY.csv)"),
+                ("Bar Property CSV:", self.prop_csv_path, [("CSV", "*.csv"), ("All", "*.*")],
+                 "(optional - rows keyed by Bar Property ID, e.g. DT_SIZING_PROP_SUMMARY.csv)")]
+        for label, var, types, hint in rows:
+            fr = ttk.Frame(f1)
+            fr.pack(fill=tk.X, pady=2)
+            ttk.Label(fr, text=label, width=18).pack(side=tk.LEFT)
+            ttk.Entry(fr, textvariable=var, width=70).pack(side=tk.LEFT, padx=5)
+            ttk.Button(fr, text="Browse", command=lambda v=var, t=types: self._browse_file(v, t)).pack(side=tk.LEFT, padx=2)
+            if hint:
+                ttk.Label(fr, text=hint, font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=6)
+        fr = ttk.Frame(f1)
+        fr.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(fr, text="Find CSVs in Folder...", command=self._find_csvs_in_folder).pack(side=tk.LEFT)
+        ttk.Label(fr, text="(searches a folder, e.g. an Iterative Full Run's Joint_Run folder, for "
+                           "DT_SIZING_BAR_SUMMARY / DT_SIZING_PROP_SUMMARY.csv - DT_FULL_SUMMARY.csv "
+                           "as a fallback - and fills both CSV fields)",
                   font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=8)
 
-        # ---- Section 2: Plot Settings ----
-        f2 = ttk.LabelFrame(main, text="\U0001F3A8  2. Plot Settings", padding=10)
+        f2 = ttk.LabelFrame(main, text="\U0001F5A5  2. FEM Viewer", padding=10)
         f2.pack(fill=tk.X, pady=5)
+        fr = ttk.Frame(f2)
+        fr.pack(fill=tk.X)
+        ttk.Button(fr, text="▶  Open in FEM Viewer", command=self.open_fem_viewer,
+                   style='Accent.TButton').pack(side=tk.LEFT)
+        self.req_label = ttk.Label(fr, text="")
+        self.req_label.pack(side=tk.LEFT, padx=12)
+        missing = self._missing_viewer_packages()
+        if missing:
+            self.req_label.config(text=f"Missing: {', '.join(missing)} -> pip install pyvista pyvistaqt PyQt5",
+                                  foreground=_APP_COLORS.get('danger', 'red'))
+        else:
+            self.req_label.config(text="PyVista + Qt found", foreground="green")
 
-        gb_frame = ttk.Frame(f2)
-        gb_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(gb_frame, text="Group By:", width=16).pack(side=tk.LEFT)
-        ttk.Radiobutton(gb_frame, text="Bar Property ID", variable=self.group_by,
-                        value="Bar Property ID", command=self._on_group_by_changed).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(gb_frame, text="Bar Element ID", variable=self.group_by,
-                        value="Bar Element ID", command=self._on_group_by_changed).pack(side=tk.LEFT, padx=5)
-
-        cb_frame = ttk.Frame(f2)
-        cb_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(cb_frame, text="Color By:", width=16).pack(side=tk.LEFT)
-        # Bu a\u00E7\u0131l\u0131r listenin i\u00E7eri\u011Fi SAB\u0130T de\u011Fil - "Bar Element ID"/"Bar
-        # Property ID" d\u0131\u015F\u0131ndaki T\u00DCM s\u00FCtunlar, y\u00FCklenen CSV neyse ona g\u00F6re
-        # _refresh_metric_options() taraf\u0131ndan doldurulur (bkz. load_summary
-        # ve _on_group_by_changed). B\u00F6ylece farkl\u0131 bir CSV format\u0131
-        # verildi\u011Finde (s\u00FCtun adlar\u0131 farkl\u0131 olsa bile) otomatik uyum sa\u011Flan\u0131r.
-        self.color_combo = ttk.Combobox(cb_frame, textvariable=self.color_by, state='readonly', width=22, values=[])
-        self.color_combo.pack(side=tk.LEFT, padx=5)
-        self.color_combo.bind('<<ComboboxSelected>>', lambda e: self._on_setting_changed())
-        ttk.Button(cb_frame, text="\u25B6  Plot", command=self.plot, style='Accent.TButton').pack(side=tk.LEFT, padx=15)
-        # ---- Renk skalası (contour) ayar satırı ----
-        # "Auto" işaretliyken Min/Max veriden hesaplanır (eski davranış);
-        # kapatılırsa kullanıcı kendi Min/Max/Levels (kademe sayısı)
-        # değerlerini girip "Apply" ile (veya Enter'a basarak) uygulayabilir.
-        scale_frame = ttk.Frame(f2)
-        scale_frame.pack(fill=tk.X, pady=2)
-        ttk.Label(scale_frame, text="Color Scale:", width=16).pack(side=tk.LEFT)
-        ttk.Checkbutton(scale_frame, text="Auto", variable=self.scale_auto,
-                        command=self._on_scale_auto_toggled).pack(side=tk.LEFT)
-        ttk.Label(scale_frame, text="Min:").pack(side=tk.LEFT, padx=(10, 2))
-        self.scale_min_entry = ttk.Entry(scale_frame, textvariable=self.scale_min, width=9, state='disabled')
-        self.scale_min_entry.pack(side=tk.LEFT)
-        ttk.Label(scale_frame, text="Max:").pack(side=tk.LEFT, padx=(8, 2))
-        self.scale_max_entry = ttk.Entry(scale_frame, textvariable=self.scale_max, width=9, state='disabled')
-        self.scale_max_entry.pack(side=tk.LEFT)
-        ttk.Label(scale_frame, text="Levels:").pack(side=tk.LEFT, padx=(8, 2))
-        self.scale_levels_entry = ttk.Entry(scale_frame, textvariable=self.scale_levels, width=5)
-        self.scale_levels_entry.pack(side=tk.LEFT)
-        for entry in (self.scale_min_entry, self.scale_max_entry, self.scale_levels_entry):
-            entry.bind('<Return>', lambda e: self._on_setting_changed())
-        self.scale_generate_btn = ttk.Button(scale_frame, text="Generate Levels",
-                                             command=self._generate_boundary_entries, state='disabled')
-        self.scale_generate_btn.pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Button(scale_frame, text="Apply", command=self._on_setting_changed).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(scale_frame, text="(uncheck Auto, set Min/Max/Levels, then click Generate Levels to "
-                                     "get editable band values below - edit any of them by hand for a "
-                                     "non-uniform scale, then Apply. Only applies when Color By is "
-                                     "numeric; text columns use a legend instead)",
-                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=8)
-
-        # ---- Ara değer (boundary) düzenleme satırı ----
-        # "Generate Levels" butonu, Min/Max/Levels'e göre eşit aralıklı
-        # N+1 ara değer üretip burada birer kutu olarak gösterir - kullanıcı
-        # her bir ara değeri TEK TEK elle değiştirebilir (artık eşit aralıklı
-        # kalması zorunlu değil). "Apply"a basıldığında, bu kutulardaki
-        # (varsa) değerler AYNEN kullanılır - sadece Min/Max/Levels'ten
-        # otomatik hesaplanmaz.
-        boundaries_outer = ttk.Frame(f2)
-        boundaries_outer.pack(fill=tk.X, pady=(0, 2))
-        ttk.Label(boundaries_outer, text="Level Values:", width=16).pack(side=tk.LEFT, anchor=tk.N)
-        self.boundaries_inner = ttk.Frame(boundaries_outer)
-        self.boundaries_inner.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.scale_boundary_vars = []  # her ara değer kutusu için bir StringVar
-
-        # ---- Görünüm satırı ----
-        view_frame = ttk.Frame(f2)
-        view_frame.pack(fill=tk.X, pady=2)
-        ttk.Checkbutton(view_frame, text="Maximize 3D View (hide the side chart for a bigger FEM view)",
-                        variable=self.maximize_3d, command=self._on_setting_changed).pack(side=tk.LEFT)
-
-        self.stats_label = ttk.Label(f2, text="", foreground=_APP_COLORS.get('primary_dark', '#1d4ed8'),
-                                     font=('Segoe UI', 9, 'bold'))
-        self.stats_label.pack(anchor=tk.W, pady=(4, 0))
-
-        # ---- Section 3: FEM Visualization ----
-        f3 = ttk.LabelFrame(main, text="\U0001F5FA  3. FEM Visualization", padding=5)
+        f3 = ttk.LabelFrame(main, text="\U0001F4CB  3. Log", padding=10)
         f3.pack(fill=tk.BOTH, expand=True, pady=5)
-
-        self.fig = Figure(figsize=(12, 6.5), dpi=95)
-        self.canvas = FigureCanvasTkAgg(self.fig, master=f3)
-        toolbar_frame = ttk.Frame(f3)
-        toolbar_frame.pack(fill=tk.X)
-        # NavigationToolbar2Tk: matplotlib'in standart araç çubuğu - döndür/kaydır/
-        # yakınlaştır ve çizimi PNG olarak kaydetme butonlarını hazır olarak verir.
-        self.toolbar = NavigationToolbar2Tk(self.canvas, toolbar_frame)
-        self.toolbar.update()
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        # Fare tekerleği ile 3B görünümde yakınlaştırma/uzaklaştırma -
-        # NavigationToolbar2Tk'nin "zoom to rectangle" aracı 3B eksenlerde
-        # pek işe yaramadığından, modeli yakından incelemenin en pratik
-        # yolu bu - bkz. _on_scroll_zoom. Bir kere bağlanması yeterli,
-        # çünkü self.canvas her plot()'ta yeniden oluşturulmuyor.
-        self.canvas.mpl_connect('scroll_event', self._on_scroll_zoom)
-        self._draw_placeholder()
-
-        # ---- Durum/log kutusu ----
-        self.log_text = scrolledtext.ScrolledText(main, height=4, font=('Consolas', 9),
-                                                    bg=_APP_COLORS['log_bg'], fg=_APP_COLORS['log_fg'],
-                                                    insertbackground=_APP_COLORS['log_fg'], relief='flat',
-                                                    borderwidth=0)
-        self.log_text.pack(fill=tk.X, pady=(5, 0))
+        self.log_text = scrolledtext.ScrolledText(f3, height=14, font=('Consolas', 9),
+                                                  bg=_APP_COLORS['log_bg'], fg=_APP_COLORS['log_fg'],
+                                                  insertbackground=_APP_COLORS['log_fg'], relief='flat',
+                                                  borderwidth=0)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
 
     def _log(self, msg):
         self.log_text.insert(tk.END, msg + "\n")
         self.log_text.see(tk.END)
 
-    def _browse_bdf(self):
-        path = filedialog.askopenfilename(filetypes=[("BDF", "*.bdf *.dat *.nas"), ("All", "*.*")])
+    def _browse_file(self, var, types):
+        path = filedialog.askopenfilename(filetypes=types)
         if path:
-            self.bdf_path.set(path)
+            var.set(path)
 
-    # open_fem_viewer: bu dosyayı "--fem-viewer" ile AYRI bir süreç olarak
-    # başlatır (bkz. _run_fem_viewer) - BDF/summary yolu ve mevcut Group By /
-    # Color By seçimi argüman olarak geçer.
-    def open_fem_viewer(self):
+    def _find_csvs_in_folder(self):
+        folder = filedialog.askdirectory()
+        if not folder:
+            return
+        bar_path, prop_path, full_path = self._scan_summary_files(folder)
+        if not bar_path and not prop_path and full_path:
+            bar_path = prop_path = full_path
+        if bar_path:
+            self.bar_csv_path.set(bar_path)
+        if prop_path:
+            self.prop_csv_path.set(prop_path)
+        if bar_path or prop_path:
+            self._log(f"Found in {folder}:\n  Bar Element CSV: {bar_path or '-'}\n  Bar Property CSV: {prop_path or '-'}")
+        else:
+            self._log(f"No DT_SIZING_BAR_SUMMARY / DT_SIZING_PROP_SUMMARY / DT_FULL_SUMMARY.csv under {folder}")
+            messagebox.showwarning("Not found", "No summary CSVs found in that folder")
+
+    @staticmethod
+    def _missing_viewer_packages():
         import importlib.util
+        missing = [m for m in ('pyvista', 'pyvistaqt', 'qtpy') if importlib.util.find_spec(m) is None]
+        if not any(importlib.util.find_spec(b) for b in ('PyQt5', 'PySide2', 'PyQt6', 'PySide6')):
+            missing.append('PyQt5')
+        return missing
+
+    # ==================== FEM VIEWER BAŞLATMA ====================
+    # Bu dosya "--fem-viewer" ile AYRI bir süreç olarak başlatılır. Viewer'ın
+    # stdout/stderr'i bir log dosyasına yazılır; süreç izlenir ve hatayla
+    # kapanırsa log'un sonu bu sekmede ve bir hata penceresinde gösterilir.
+    def open_fem_viewer(self):
         bdf = self.bdf_path.get().strip()
         if not bdf or not os.path.isfile(bdf):
             messagebox.showerror("Error", "Select a valid BDF file first")
             return
-        missing = [m for m in ('pyvista', 'pyvistaqt', 'qtpy') if importlib.util.find_spec(m) is None]
-        if not any(importlib.util.find_spec(b) for b in ('PyQt5', 'PySide2', 'PyQt6', 'PySide6')):
-            missing.append('PyQt5')
+        missing = self._missing_viewer_packages()
         if missing:
             messagebox.showerror("Missing packages",
                                  f"The FEM Viewer needs: {', '.join(missing)}\n\n"
-                                 "Install with:\n    pip install pyvista pyvistaqt PyQt5")
+                                 f"Install them for THIS Python:\n    {sys.executable} -m pip install "
+                                 f"pyvista pyvistaqt PyQt5")
             return
+
         cmd = [sys.executable]
         if not getattr(sys, 'frozen', False):
             cmd.append(os.path.abspath(__file__))
-        cmd += [_FEM_VIEWER_FLAG, '--bdf', bdf, '--group', self.group_by.get()]
-        folder = self.summary_folder.get().strip()
-        if folder and os.path.isdir(folder):
-            cmd += ['--summary', folder]
-        if self.color_by.get():
-            cmd += ['--metric', self.color_by.get()]
+        cmd += [_FEM_VIEWER_FLAG, '--bdf', bdf]
+        for flag, var in (('--bar-csv', self.bar_csv_path), ('--prop-csv', self.prop_csv_path)):
+            p = var.get().strip()
+            if p:
+                if not os.path.isfile(p):
+                    messagebox.showerror("Error", f"CSV not found:\n{p}")
+                    return
+                cmd += [flag, p]
+
+        log_path = os.path.join(tempfile.gettempdir(), f"dadt_fem_viewer_{int(time.time())}.log")
+        env = dict(os.environ, PYTHONUNBUFFERED='1')
         try:
-            subprocess.Popen(cmd)
-            self._log(f"FEM Viewer launched for {os.path.basename(bdf)}")
+            if os.name == 'nt':
+                # Kullanıcı butona bastığı için bu süreç ön planda - viewer
+                # penceresinin arkada açılmak yerine öne gelebilmesine izin ver.
+                try:
+                    import ctypes
+                    ctypes.windll.user32.AllowSetForegroundWindow(-1)
+                except Exception:
+                    pass
+            with open(log_path, 'w', encoding='utf-8') as log_f:
+                proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT, env=env,
+                                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
         except Exception as e:
             messagebox.showerror("Error", f"Could not start the FEM Viewer:\n{e}")
-
-    def _browse_summary_folder(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            self.summary_folder.set(folder)
-
-    # Group By / Color By değiştiğinde, zaten bir çizim varsa otomatik
-    # olarak yeniden çiz - kullanıcının her seferinde "Plot" butonuna
-    # tıklamasına gerek kalmasın.
-    def _on_setting_changed(self):
-        if self.bdf_model is not None:
-            self.plot()
-
-    # _on_scale_auto_toggled: "Auto" kutusu işaretlenip/kaldırıldığında
-    # Min/Max giriş kutularını ve "Generate Levels" butonunu etkinleştir/
-    # devre dışı bırak (Levels her zaman düzenlenebilir kalır - bant sayısı
-    # Auto modda da geçerli), sonra bir çizim varsa yeniden çiz.
-    def _on_scale_auto_toggled(self):
-        state = 'disabled' if self.scale_auto.get() else 'normal'
-        self.scale_min_entry.config(state=state)
-        self.scale_max_entry.config(state=state)
-        self.scale_generate_btn.config(state=state)
-        self._on_setting_changed()
-
-    # _rebuild_boundary_entries: "Level Values" satırını, verilen değer
-    # listesine göre (her biri için bir Entry kutusu) sıfırdan kurar.
-    # Çok sayıda kademe varsa satır sarılsın diye grid kullanılıyor.
-    def _rebuild_boundary_entries(self, values):
-        for child in self.boundaries_inner.winfo_children():
-            child.destroy()
-        self.scale_boundary_vars = []
-        cols_per_row = 10
-        for i, v in enumerate(values):
-            var = tk.StringVar(value=self._fmt_fixed(v))
-            self.scale_boundary_vars.append(var)
-            entry = ttk.Entry(self.boundaries_inner, textvariable=var, width=9)
-            entry.grid(row=i // cols_per_row, column=i % cols_per_row, padx=2, pady=2, sticky='w')
-            entry.bind('<Return>', lambda e: self._on_setting_changed())
-
-    # _generate_boundary_entries: "Generate Levels" butonu - Min/Max/Levels
-    # kutularından eşit aralıklı (N+1 adet) ara değer üretip "Level Values"
-    # satırını bu değerlerle doldurur. Kullanıcı bundan SONRA tek tek
-    # düzenleyip "Apply"a basabilir - Generate, DÜZENLEMEYE başlanacak bir
-    # taslak üretir, otomatik olarak çizimi değiştirmez.
-    def _generate_boundary_entries(self):
-        try:
-            vmin = float(self.scale_min.get())
-            vmax = float(self.scale_max.get())
-            n_levels = int(float(self.scale_levels.get()))
-            if vmin >= vmax or n_levels < 1:
-                raise ValueError
-        except (TypeError, ValueError):
-            messagebox.showerror("Error", "Enter a valid Min < Max and a positive Levels count first")
             return
-        values = [vmin + (vmax - vmin) * i / n_levels for i in range(n_levels + 1)]
-        self._rebuild_boundary_entries(values)
+        self._log(f"Starting FEM Viewer for {os.path.basename(bdf)} (PID {proc.pid}) - log: {log_path}")
+        self._watch_viewer(proc, log_path, announced=False)
 
-    # _on_scroll_zoom: fare tekerleği ile SADECE 3B eksenler üzerindeyken
-    # yakınlaştır/uzaklaştır - mevcut görünümün merkezini sabit tutarak
-    # X/Y/Z sınırlarını aynı oranda küçültüp/büyütür.
-    def _on_scroll_zoom(self, event):
-        ax = event.inaxes
-        if ax is None or not hasattr(ax, 'get_proj'):
-            return  # 2B panel üzerindeyse veya eksen dışındaysa bir şey yapma
-        scale = 0.9 if event.button == 'up' else 1.1
+    def _watch_viewer(self, proc, log_path, announced):
+        code = proc.poll()
+        log = ""
         try:
-            x_lim = ax.get_xlim3d(); y_lim = ax.get_ylim3d(); z_lim = ax.get_zlim3d()
-        except Exception:
+            with open(log_path, 'r', encoding='utf-8', errors='replace') as f:
+                log = f.read()
+        except OSError:
+            pass
+        if code is None:
+            if not announced and "FEM_VIEWER_READY" in log:
+                self._log("FEM Viewer window opened (check the taskbar if it is behind this window).")
+                announced = True
+            self.root.after(1000, lambda: self._watch_viewer(proc, log_path, announced))
             return
-        xc, yc, zc = sum(x_lim) / 2, sum(y_lim) / 2, sum(z_lim) / 2
-        xr = (x_lim[1] - x_lim[0]) / 2 * scale
-        yr = (y_lim[1] - y_lim[0]) / 2 * scale
-        zr = (z_lim[1] - z_lim[0]) / 2 * scale
-        ax.set_xlim3d(xc - xr, xc + xr)
-        ax.set_ylim3d(yc - yr, yc + yr)
-        ax.set_zlim3d(zc - zr, zc + zr)
-        self.canvas.draw_idle()
-
-    # ==================== BDF YÜKLEME ====================
-    def load_bdf(self):
-        path = self.bdf_path.get().strip()
-        if not path or not os.path.exists(path):
-            messagebox.showerror("Error", "Select a valid BDF file")
+        if code == 0:
+            self._log("FEM Viewer closed.")
             return
+        # faulthandler'ın çok uzun "Extension modules: ..." satırı asıl hatayı
+        # (örn. Qt plugin / OpenGL mesajı) ekrandan iter - onu atla.
+        lines = [l for l in log.strip().splitlines()
+                 if l.strip() and not l.startswith(("Extension modules:", "FEM_VIEWER_READY"))]
+        tail = "\n".join(lines[-25:]) or "(no output)"
+        self._log(f"FEM Viewer exited with an error (code {code}):\n{tail}")
+        messagebox.showerror("FEM Viewer", f"The FEM Viewer closed with an error (code {code}):\n\n"
+                                           f"{tail[-1500:]}\n\nFull log: {log_path}")
 
-        self._log(f"Loading BDF: {os.path.basename(path)} ...")
-        try:
-            # xref=True: node.get_position() ve elem.node_ids/elem.pid'in
-            # düzgün çözümlenmesi (özellikle farklı koordinat sistemlerine
-            # bağlı GRID'ler) için gerekli - _calculate_offset_csv'nin de
-            # aynı sebeple xref=True kullandığı gibi.
-            model = BDF(debug=False)
-            try:
-                model.read_bdf(path, validate=False, xref=True, read_includes=True, encoding='latin-1')
-            except Exception:
-                # INCLUDE edilen dosyalar diskte bulunamazsa (örn. sadece
-                # ana BDF kullanıcıda varsa), INCLUDE'ları genişletmeden
-                # tekrar dene - en azından ana dosyanın geometrisi görülebilsin.
-                model = BDF(debug=False)
-                model.read_bdf(path, validate=False, xref=True, read_includes=False, encoding='latin-1')
-                self._log("  NOTE: some INCLUDE files could not be resolved - loaded the main file only.")
-
-            self.bdf_model = model
-            self._extract_mesh()
-
-            self.bdf_status.config(
-                text=f"Loaded: {len(self.node_coords)} nodes, {len(self.bar_elements)} bar element(s), "
-                     f"{len(self.shell_elements)} shell element(s)",
-                foreground="green")
-            self._log(f"BDF loaded OK: {len(self.node_coords)} nodes, {len(self.bar_elements)} bar "
-                      f"element(s) (CBAR/CBEAM), {len(self.shell_elements)} shell element(s) "
-                      f"(CQUAD4/CTRIA3/...)")
-            self.plot()
-        except Exception as e:
-            self.bdf_status.config(text="Error", foreground="red")
-            self._log(f"ERROR loading BDF: {e}")
-            messagebox.showerror("Error", f"Could not load BDF:\n{e}")
-
-    # _extract_mesh: xref'lenmiş pyNastran modelinden, çizim için gereken
-    # düğüm koordinatlarını ve CBAR/CBEAM (bar) ile CQUAD4/CTRIA3/... (shell)
-    # elemanlarının düğüm bağlantılarını çıkarır.
-    def _extract_mesh(self):
-        model = self.bdf_model
-        self.node_coords = {}
-        for nid, node in model.nodes.items():
-            try:
-                self.node_coords[nid] = tuple(node.get_position())
-            except Exception:
-                pass  # koordinat sistemi çözülemeyen tekil düğümü atla
-
-        self.bar_elements = []
-        self.shell_elements = []
-        for eid, elem in model.elements.items():
-            if elem.type in ('CBAR', 'CBEAM'):
-                try:
-                    nids = elem.node_ids
-                except Exception:
-                    continue
-                if len(nids) >= 2 and nids[0] in self.node_coords and nids[1] in self.node_coords:
-                    pid = elem.pid if not hasattr(elem, 'Pid') else elem.Pid()
-                    self.bar_elements.append({'eid': eid, 'pid': pid, 'n1': nids[0], 'n2': nids[1]})
-            elif elem.type in ('CQUAD4', 'CTRIA3', 'CQUAD8', 'CTRIA6'):
-                try:
-                    nids = [n for n in elem.node_ids if n in self.node_coords]
-                except Exception:
-                    continue
-                if len(nids) >= 3:
-                    pid = elem.pid if not hasattr(elem, 'Pid') else elem.Pid()
-                    self.shell_elements.append({'eid': eid, 'pid': pid, 'nodes': nids})
-
-    # ==================== SUMMARY CSV YÜKLEME ====================
+    # ==================== CSV YARDIMCILARI (FEM Viewer da kullanır) ====================
     @staticmethod
     def _normalize_header(h):
         return str(h).strip().lower().replace('\n', '').replace(' ', '').replace('(', '').replace(')', '')
 
-    # _standardize_summary_df: bir özet CSV'sinin SADECE iki ID sütununu
-    # ("Bar Element ID"/"Bar Property ID" - gerçek dosyalarda farklı
-    # yazılabiliyor, örn. "BarElementID") tanıyıp sabit isimlere çevirir;
-    # bu ikisi gruplama/indeksleme için özel anlam taşıdığından sabit
-    # kalmaları gerekiyor. DİĞER TÜM sütunlar (t, d, Material, Life, ya da
-    # kullanıcının getirdiği BAŞKA herhangi bir sütun - örn. "Stress",
-    # "Margin of Safety") OLDUĞU GİBİ bırakılır, sadece görünüm için
-    # (satır sonu/boşluk fazlalığı) temizlenir - böylece "Color By" listesi
-    # hangi CSV verilirse verilsin o CSV'nin GERÇEK sütunlarını gösterir.
-    def _standardize_summary_df(self, df):
+    # İki ID sütununu ("Bar Element ID"/"Bar Property ID" - farklı yazılabiliyor)
+    # sabit isimlere çevirir; diğer tüm sütunlar olduğu gibi kalır (sadece
+    # satır sonu/boşluk temizlenir) - Color By listesi CSV'nin gerçek sütunlarıdır.
+    @staticmethod
+    def _standardize_summary_df(df):
         rename = {}
         beid_col = bpid_col = None
         for c in df.columns:
-            norm = self._normalize_header(c)
+            norm = VisualizationResultsTab._normalize_header(c)
             if beid_col is None and norm == 'barelementid':
                 beid_col = c
             elif bpid_col is None and norm == 'barpropertyid':
@@ -8100,11 +7857,6 @@ class VisualizationResultsTab:
                 rename[c] = clean
         return df.rename(columns=rename)
 
-    # _metric_columns: bir özet DataFrame'inde, iki ID sütunu DIŞINDA kalan
-    # - yani "Color By" açılır listesinde gösterilecek - tüm sütun adlarını
-    # döndürür. Bu, uygulamanın sütun isimlerini SABİT olarak bilmesini
-    # gerektirmez; kullanıcı farklı bir CSV formatı getirse bile (Bar
-    # Element ID / Bar Property ID sütunları olduğu sürece) otomatik uyum sağlar.
     @staticmethod
     def _metric_columns(df):
         if df is None:
@@ -8112,25 +7864,18 @@ class VisualizationResultsTab:
         id_cols = {'Bar Element ID', 'Bar Property ID'}
         return [c for c in df.columns if c not in id_cols]
 
-    # _is_numeric_column: verilen sütunun değerlerinin (en az yarısının)
-    # sayıya çevrilebilir olup olmadığına bakarak, bu metriğin sürekli bir
-    # renk skalasıyla mı (contour), yoksa kategorik bir lejantla mı
-    # ("Material" sütunu gibi) gösterilmesi gerektiğine karar verir.
+    # Değerlerin en az yarısı sayıya çevrilebiliyorsa sayısal contour, yoksa
+    # (örn. Material) kategorik lejant.
     @staticmethod
     def _is_numeric_column(series):
         try:
             if len(series) == 0:
                 return False
-            coerced = pd.to_numeric(series, errors='coerce')
-            return coerced.notna().mean() >= 0.5
+            return pd.to_numeric(series, errors='coerce').notna().mean() >= 0.5
         except Exception:
             return False
 
-    # _fmt_fixed: bir sayıyı HER ZAMAN sabit ondalıklı (fixed-point)
-    # gösterimle döndürür - Python'un varsayılan/genel (":.3g" gibi)
-    # biçimlendirmesi büyük/küçük sayılarda "2.25e+04" gibi bilimsel
-    # gösterime kayabiliyor; Min/Max kutuları ve renk skalası (contour)
-    # etiketleri kullanıcı için her zaman okunaklı sabit ondalık göstersin diye.
+    # Her zaman sabit ondalıklı gösterim (bilimsel gösterime kaymaz).
     @staticmethod
     def _fmt_fixed(x):
         try:
@@ -8146,11 +7891,8 @@ class VisualizationResultsTab:
             return f"{x:.2f}"
         elif a >= 0.001:
             return f"{x:.4f}"
-        else:
-            return f"{x:.6f}"
+        return f"{x:.6f}"
 
-    # _scan_summary_files: Summary Folder altında (rekürsif) DT_SIZING_BAR_
-    # SUMMARY.csv / DT_SIZING_PROP_SUMMARY.csv / DT_FULL_SUMMARY.csv dosyalarını ara.
     @staticmethod
     def _scan_summary_files(folder):
         bar_path = prop_path = full_path = None
@@ -8164,440 +7906,6 @@ class VisualizationResultsTab:
                 elif fnl == 'dt_full_summary.csv' and full_path is None:
                     full_path = os.path.join(dirpath, fn)
         return bar_path, prop_path, full_path
-
-    def load_summary(self):
-        folder = self.summary_folder.get().strip()
-        if not folder or not os.path.isdir(folder):
-            messagebox.showerror("Error", "Select a valid Summary Folder")
-            return
-
-        self._log(f"Scanning for summary CSVs under: {folder}")
-        bar_path, prop_path, full_path = self._scan_summary_files(folder)
-        self.bar_summary_df = None
-        self.prop_summary_df = None
-        msgs = []
-
-        try:
-            if bar_path:
-                df = self._standardize_summary_df(pd.read_csv(bar_path))
-                if 'Bar Element ID' in df.columns:
-                    df = df.drop_duplicates(subset=['Bar Element ID']).set_index('Bar Element ID')
-                    self.bar_summary_df = df
-                    msgs.append(f"Bar Element ID: {len(df)} row(s) (DT_SIZING_BAR_SUMMARY.csv)")
-            if prop_path:
-                df = self._standardize_summary_df(pd.read_csv(prop_path))
-                if 'Bar Property ID' in df.columns:
-                    df = df.drop_duplicates(subset=['Bar Property ID']).set_index('Bar Property ID')
-                    self.prop_summary_df = df
-                    msgs.append(f"Bar Property ID: {len(df)} row(s) (DT_SIZING_PROP_SUMMARY.csv)")
-
-            # Sizing özetleri hiç bulunamadıysa, DT_FULL_SUMMARY.csv'den basit
-            # bir geri dönüş (fallback) üret - her ID için İLK görülen satırı
-            # kullanır (Iterative Full Run'ın kendi "governing/en kalın"
-            # seçim mantığını burada TEKRARLAMAZ, sadece hızlı bir önizleme sağlar).
-            if self.bar_summary_df is None and self.prop_summary_df is None and full_path:
-                full_df = self._standardize_summary_df(pd.read_csv(full_path))
-                if 'Bar Element ID' in full_df.columns:
-                    self.bar_summary_df = full_df.drop_duplicates(subset=['Bar Element ID']).set_index('Bar Element ID')
-                    msgs.append(f"Bar Element ID: {len(self.bar_summary_df)} row(s) "
-                                f"(DT_FULL_SUMMARY.csv fallback, first row per ID)")
-                if 'Bar Property ID' in full_df.columns:
-                    self.prop_summary_df = full_df.drop_duplicates(subset=['Bar Property ID']).set_index('Bar Property ID')
-                    msgs.append(f"Bar Property ID: {len(self.prop_summary_df)} row(s) "
-                                f"(DT_FULL_SUMMARY.csv fallback, first row per ID)")
-
-            if not msgs:
-                self.summary_status.config(text="No DT_SIZING_BAR_SUMMARY.csv / DT_SIZING_PROP_SUMMARY.csv / "
-                                                 "DT_FULL_SUMMARY.csv found", foreground="red")
-                self._log("  No usable summary CSV found under that folder.")
-                return
-
-            self.summary_status.config(text="; ".join(msgs), foreground="green")
-            for m in msgs:
-                self._log(f"  {m}")
-            # Yeni yüklenen CSV'nin GERÇEK sütunlarına göre "Color By"
-            # listesini yeniden doldur - farklı bir CSV formatı (farklı
-            # sütun adları) verilmiş olsa bile otomatik uyum sağlanır.
-            self._refresh_metric_options()
-            if self.bdf_model is not None:
-                self.plot()
-        except Exception as e:
-            self.summary_status.config(text="Error", foreground="red")
-            self._log(f"ERROR loading summary: {e}")
-            messagebox.showerror("Error", f"Could not load summary CSV(s):\n{e}")
-
-    # _refresh_metric_options: şu an seçili Group By'a (Bar Element ID /
-    # Bar Property ID) karşılık gelen DataFrame'in sütunlarından "Color By"
-    # açılır listesini yeniden kurar. Mevcut seçim artık mevcut değilse
-    # ("life" içeren bir sütun varsa onu, yoksa ilk sütunu) makul bir
-    # varsayılana geçer.
-    def _refresh_metric_options(self):
-        df = self.bar_summary_df if self.group_by.get() == 'Bar Element ID' else self.prop_summary_df
-        cols = self._metric_columns(df)
-        self.color_combo['values'] = cols
-        if not cols:
-            self.color_by.set("")
-        elif self.color_by.get() not in cols:
-            preferred = next((c for c in cols if 'life' in c.lower()), cols[0])
-            self.color_by.set(preferred)
-
-    # _on_group_by_changed: Group By değiştiğinde - iki özet CSV'nin
-    # (DT_SIZING_BAR_SUMMARY.csv / DT_SIZING_PROP_SUMMARY.csv) sütunları
-    # birbirinden farklı olabileceğinden - önce Color By listesini o
-    # grubun gerçek sütunlarına göre tazele, sonra (bir model yüklüyse) yeniden çiz.
-    def _on_group_by_changed(self):
-        self._refresh_metric_options()
-        self._on_setting_changed()
-
-    # ==================== ÇİZİM (PLOT) ====================
-    def _draw_placeholder(self):
-        self.fig.clear()
-        ax = self.fig.add_subplot(1, 1, 1)
-        ax.text(0.5, 0.5, "Load a BDF file (and optionally a sizing summary)\nto see the FEM visualization here",
-                ha='center', va='center', fontsize=11, color='gray')
-        ax.set_xticks([]); ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-        self.canvas.draw()
-
-    @staticmethod
-    def _get_cmap(name, n=None):
-        # matplotlib sürümleri arasında colormap API'si değişti
-        # (eski: cm.get_cmap(name, n), yeni: matplotlib.colormaps[name]) -
-        # ikisini de deneyerek her iki sürümde de çalışmasını sağla.
-        try:
-            base = matplotlib.colormaps[name]
-        except Exception:
-            base = mpl_cm.get_cmap(name)
-        if n is not None and n > 0:
-            try:
-                return base.resampled(n)
-            except AttributeError:
-                try:
-                    return mpl_cm.get_cmap(name, n)
-                except Exception:
-                    return base
-        return base
-
-    @staticmethod
-    def _set_axes_equal(ax):
-        """3B eksenlerin X/Y/Z oranlarını eşitler (matplotlib'in 3D
-        projeksiyonu varsayılan olarak set_aspect('equal') desteklemez) -
-        aksi halde BDF geometrisi gerçek oranlarından saptırılmış görünür."""
-        x_lim = ax.get_xlim3d(); y_lim = ax.get_ylim3d(); z_lim = ax.get_zlim3d()
-        spans = [abs(x_lim[1] - x_lim[0]), abs(y_lim[1] - y_lim[0]), abs(z_lim[1] - z_lim[0])]
-        centers = [sum(x_lim) / 2, sum(y_lim) / 2, sum(z_lim) / 2]
-        radius = max(spans) / 2 if max(spans) > 0 else 1
-        ax.set_xlim3d([centers[0] - radius, centers[0] + radius])
-        ax.set_ylim3d([centers[1] - radius, centers[1] + radius])
-        ax.set_zlim3d([centers[2] - radius, centers[2] + radius])
-
-    # plot: ana çizim fonksiyonu - solda 3B renklendirilmiş FEM mesh'i,
-    # sağda aynı veriyi (ID'ye göre sıralanmış) 2B grafik olarak gösterir.
-    def plot(self):
-        if not _MATPLOTLIB_AVAILABLE:
-            return
-        if self.bdf_model is None:
-            messagebox.showerror("Error", "Load a BDF file first")
-            return
-
-        try:
-            group_by = self.group_by.get()
-            metric = self.color_by.get()
-            df = self.bar_summary_df if group_by == 'Bar Element ID' else self.prop_summary_df
-            if not metric:
-                messagebox.showerror("Error", "Load a Summary Folder first (no Color By column available)")
-                return
-            # Seçili metrik sütunu SAYISAL mı (örn. Life, t, d, ya da
-            # kullanıcının CSV'sindeki herhangi bir sayısal sütun) yoksa
-            # METİN/KATEGORİK mi (örn. Material) - bu, sütun adına göre
-            # DEĞİL, DEĞERLERE bakarak otomatik belirlenir, böylece farklı
-            # bir CSV formatı verildiğinde de doğru görselleştirme seçilir.
-            if df is not None and metric in df.columns:
-                is_material = not self._is_numeric_column(df[metric])
-            else:
-                is_material = False  # bu grup için hiç veri yok - sayısal yoldaki "veri yok" mesajı daha açıklayıcı
-
-            self.fig.clear()
-            # "Maximize 3D View" işaretliyse yan 2B grafiği hiç oluşturma -
-            # 3B FEM görünümü tüm çizim alanını kaplasın (büyütülmüş, daha
-            # rahat döndürülüp/incelenebilen görünüm). İşaretli değilse,
-            # 3B tarafa 2B tarafından daha fazla pay ver (3:2 oranı) - yine
-            # de varsayılan olarak eski 50/50'den daha büyük bir FEM görünümü.
-            if self.maximize_3d.get():
-                ax3d = self.fig.add_subplot(1, 1, 1, projection='3d')
-                ax2d = None
-            else:
-                gs = self.fig.add_gridspec(1, 2, width_ratios=[3, 2])
-                ax3d = self.fig.add_subplot(gs[0], projection='3d')
-                ax2d = self.fig.add_subplot(gs[1])
-
-            # ---- Her bar elemanının (eid/pid'ine göre) bu metrikteki değerini topla ----
-            records = []  # (bar_element_dict, key, value)
-            for be in self.bar_elements:
-                key = be['eid'] if group_by == 'Bar Element ID' else be['pid']
-                val = None
-                if df is not None and metric in df.columns and key in df.index:
-                    v = df.loc[key, metric]
-                    if isinstance(v, pd.Series):  # aynı ID'den birden fazla satır kalmışsa
-                        v = v.iloc[0]
-                    val = v
-                records.append((be, key, val))
-
-            # ---- Bağlam (context) için shell mesh'i soluk gri çiz ----
-            if self.shell_elements:
-                verts = [[self.node_coords[n] for n in se['nodes']] for se in self.shell_elements]
-                shell_poly = Poly3DCollection(verts, facecolor=(0.6, 0.6, 0.6, 0.12),
-                                              edgecolor=(0.5, 0.5, 0.5, 0.25), linewidths=0.3)
-                ax3d.add_collection3d(shell_poly)
-
-            cmap = None
-            norm = None
-            numeric_vals = []
-            mat_color = {}
-            materials = []
-
-            if is_material:
-                materials = sorted({str(v) for _, _, v in records
-                                    if v is not None and not (isinstance(v, float) and pd.isna(v))})
-                palette = self._get_cmap('tab20', max(len(materials), 1))
-                mat_color = {m: palette(i % 20) for i, m in enumerate(materials)}
-            else:
-                for _, _, v in records:
-                    try:
-                        if v is not None and not (isinstance(v, float) and pd.isna(v)):
-                            numeric_vals.append(float(v))
-                    except (TypeError, ValueError):
-                        pass
-                # "Life" (ya da "life" geçen başka bir metrik adı) için
-                # kırmızı(düşük)-yeşil(yüksek) renk skalası anlamlı - diğer
-                # TÜM sayısal sütunlar (sabit bir liste değil, kullanıcının
-                # getirdiği herhangi bir metrik) için genel amaçlı viridis.
-                cmap_name = 'RdYlGn' if 'life' in metric.lower() else 'viridis'
-
-                # ---- Renk skalası aralığı: Auto ise veriden, değilse
-                # kullanıcının Min/Max kutularından al. Kademe (Levels)
-                # sayısı HER ZAMAN kullanıcıdan okunur (Auto modda da
-                # geçerlidir) - HyperMesh'teki gibi bantlı (discrete)
-                # bir contour skalası elde etmek için. ----
-                if numeric_vals:
-                    auto_vmin, auto_vmax = min(numeric_vals), max(numeric_vals)
-                else:
-                    auto_vmin, auto_vmax = 0.0, 1.0
-
-                if self.scale_auto.get():
-                    vmin, vmax = auto_vmin, auto_vmax
-                    # Kullanıcı Auto'yu kapatırsa düzenlemeye başlayacağı
-                    # makul bir başlangıç değeri görsün diye kutuları güncelle.
-                    self.scale_min.set(self._fmt_fixed(vmin))
-                    self.scale_max.set(self._fmt_fixed(vmax))
-                else:
-                    try:
-                        vmin = float(self.scale_min.get())
-                        vmax = float(self.scale_max.get())
-                        if vmin >= vmax:
-                            raise ValueError
-                    except (TypeError, ValueError):
-                        self._log("  WARNING: invalid Min/Max - falling back to Auto range for this plot.")
-                        vmin, vmax = auto_vmin, auto_vmax
-
-                if vmin == vmax:
-                    vmin, vmax = vmin - 1, vmax + 1
-
-                try:
-                    n_levels = int(float(self.scale_levels.get()))
-                    if n_levels < 1:
-                        raise ValueError
-                except (TypeError, ValueError):
-                    n_levels = 10
-                    self.scale_levels.set("10")
-
-                # ---- Kullanıcının "Generate Levels" ile oluşturup tek tek
-                # elle düzenleyebileceği ara değerler: Auto kapalıyken ve bu
-                # kutular geçerli (artan, >=2 adet) sayılarla doluysa, bu
-                # TAM değerleri bant sınırı (boundary) olarak kullan - eşit
-                # aralıklı hesaplamayı atla. Boş/geçersizse (henüz "Generate
-                # Levels"e basılmadıysa) eski eşit-aralıklı davranışa dön. ----
-                custom_boundaries = None
-                if not self.scale_auto.get() and self.scale_boundary_vars:
-                    try:
-                        candidate = [float(v.get()) for v in self.scale_boundary_vars]
-                        if len(candidate) >= 2 and all(
-                                candidate[i] < candidate[i + 1] for i in range(len(candidate) - 1)):
-                            custom_boundaries = candidate
-                    except (TypeError, ValueError):
-                        custom_boundaries = None
-
-                if custom_boundaries is not None:
-                    boundaries = custom_boundaries
-                    vmin, vmax = boundaries[0], boundaries[-1]
-                    n_levels = len(boundaries) - 1
-                    self.scale_min.set(self._fmt_fixed(vmin))
-                    self.scale_max.set(self._fmt_fixed(vmax))
-                    self.scale_levels.set(str(n_levels))
-                else:
-                    # BoundaryNorm + ayrık (discrete) renk haritası: değer
-                    # aralığını n_levels eşit banda bölüp her banda sabit bir
-                    # renk atar - HyperMesh'teki "contour legend" görünümü.
-                    boundaries = [vmin + (vmax - vmin) * i / n_levels for i in range(n_levels + 1)]
-
-                cmap = self._get_cmap(cmap_name, n_levels)
-                norm = mpl_colors.BoundaryNorm(boundaries, cmap.N, clip=True)
-
-            # ---- Bar elemanlarını (CBAR/CBEAM) renklendirerek çiz ----
-            segments = []
-            seg_colors = []
-            for be, key, val in records:
-                segments.append([self.node_coords[be['n1']], self.node_coords[be['n2']]])
-                if is_material:
-                    seg_colors.append(mat_color.get(str(val), (0.75, 0.75, 0.75, 1.0))
-                                      if val is not None and not (isinstance(val, float) and pd.isna(val))
-                                      else (0.75, 0.75, 0.75, 1.0))
-                else:
-                    try:
-                        if val is None or (isinstance(val, float) and pd.isna(val)):
-                            raise ValueError
-                        seg_colors.append(cmap(norm(float(val))))
-                    except (TypeError, ValueError):
-                        seg_colors.append((0.75, 0.75, 0.75, 1.0))  # veri yok -> nötr gri
-            if segments:
-                line_coll = Line3DCollection(segments, colors=seg_colors, linewidths=2.5)
-                ax3d.add_collection3d(line_coll)
-
-            # ---- Eksen sınırları: tüm düğümlerin kapladığı kutuya göre ----
-            if self.node_coords:
-                xs, ys, zs = zip(*self.node_coords.values())
-                ax3d.set_xlim3d(min(xs), max(xs))
-                ax3d.set_ylim3d(min(ys), max(ys))
-                ax3d.set_zlim3d(min(zs), max(zs))
-                self._set_axes_equal(ax3d)
-            # ---- 3B görünümü büyüt (zoom) ----
-            # matplotlib'in Axes3D'si, kendisine ayrılan dikdörtgen alanı
-            # (özellikle TEK başına tüm figürü kapladığında, yani Maximize
-            # 3D View açıkken) kübik görünüm korumak için otomatik olarak
-            # KÜÇÜLTÜP ortalar - bu da "büyütülmüş" görünümün aslında daha
-            # KÜÇÜK görünmesine yol açar. set_box_aspect'in zoom parametresi
-            # (matplotlib 3.6+), ayrılan alanı değiştirmeden İÇERİĞİ o alan
-            # içinde büyütür - model gerçekten daha büyük ve incelemeye
-            # daha elverişli görünsün diye. Maximize açıkken daha agresif,
-            # kapalıyken (2B panelle paylaşılan dar alanda) daha ölçülü
-            # bir zoom uygulanıyor. Eski matplotlib sürümlerinde zoom
-            # parametresi yoksa (TypeError), sessizce aspect-only'e düş.
-            try:
-                ax3d.set_box_aspect((1, 1, 1), zoom=1.5 if ax2d is None else 1.2)
-            except TypeError:
-                try:
-                    ax3d.set_box_aspect((1, 1, 1))
-                except Exception:
-                    pass
-            ax3d.set_xlabel('X'); ax3d.set_ylabel('Y'); ax3d.set_zlabel('Z')
-            ax3d.set_title(f"{group_by} \u2192 {metric}", fontsize=10)
-
-            if is_material and materials:
-                handles = [Patch(color=mat_color[m], label=m) for m in materials]
-                # Lejant, ax3d'nin KENDİ köşesine değil, FİGÜRÜN sol üst
-                # köşesine sabitleniyor - zoom ile büyütülen 3B içerik
-                # genelde kutusunun ortasına/sağına doğru render edildiği
-                # için (bkz. set_box_aspect zoom notu), eksen-bazlı bir
-                # lejant onun üstüne biner; figür-bazlı lejant bundan bağımsız.
-                self.fig.legend(handles=handles, loc='upper left', fontsize=7, bbox_to_anchor=(0.01, 0.98))
-            elif not is_material and numeric_vals:
-                mappable = mpl_cm.ScalarMappable(norm=norm, cmap=cmap)
-                mappable.set_array([])
-                # boundaries/ticks=boundaries + spacing='uniform': renk
-                # çubuğunu HyperMesh'teki gibi n_levels adet eşit genişlikte
-                # bant olarak çizer, her bandın sınır değerini etiket yapar.
-                # format yerine FuncFormatter: "%.3g" büyük/küçük sayılarda
-                # bilimsel gösterime (2.25e+04) kayabiliyor - kullanıcı her
-                # zaman sabit ondalıklı (fixed-point) etiket görsün diye.
-                self.fig.colorbar(mappable, ax=ax3d, boundaries=boundaries, ticks=boundaries,
-                                  spacing='uniform', shrink=0.7, pad=0.08, label=metric,
-                                  format=mpl_ticker.FuncFormatter(lambda v, pos: self._fmt_fixed(v)))
-
-            # ---- İstatistik satırı: ax2d olsun olmasın (Maximize 3D View
-            # açıkken bile) HER ZAMAN güncellenir. ----
-            if is_material:
-                self.stats_label.config(
-                    text=f"{len(records)} bar element(s), {len(materials)} distinct '{metric}' value(s)")
-            else:
-                ys_vals_all = []
-                for _, _, val in records:
-                    try:
-                        if val is None or (isinstance(val, float) and pd.isna(val)):
-                            continue
-                        ys_vals_all.append(float(val))
-                    except (TypeError, ValueError):
-                        pass
-                if ys_vals_all:
-                    self.stats_label.config(
-                        text=f"{len(ys_vals_all)}/{len(records)} bar element(s) have {metric} data - "
-                             f"min={self._fmt_fixed(min(ys_vals_all))}  max={self._fmt_fixed(max(ys_vals_all))}  "
-                             f"avg={self._fmt_fixed(sum(ys_vals_all)/len(ys_vals_all))}  "
-                             f"(scale: {self._fmt_fixed(vmin)} to {self._fmt_fixed(vmax)}, {n_levels} band(s))")
-                else:
-                    self.stats_label.config(text=f"{len(records)} bar element(s) - no {metric} data loaded")
-
-            # ---- Sağdaki 2B panel: "Maximize 3D View" kapalıyken çizilir -
-            # sayısal değerler için ID'ye göre sıralı dağılım, Material için
-            # eleman sayısı çubuk grafiği. ----
-            if ax2d is not None and is_material:
-                counts = {}
-                for _, _, val in records:
-                    if val is None or (isinstance(val, float) and pd.isna(val)):
-                        continue
-                    key_m = str(val)
-                    counts[key_m] = counts.get(key_m, 0) + 1
-                if counts:
-                    names = list(counts.keys())
-                    vals = [counts[n] for n in names]
-                    bar_colors = [mat_color[n] for n in names]
-                    ax2d.bar(range(len(names)), vals, color=bar_colors)
-                    ax2d.set_xticks(range(len(names)))
-                    ax2d.set_xticklabels(names, rotation=45, ha='right', fontsize=7)
-                    ax2d.set_ylabel('Element count')
-                    ax2d.set_title(f"'{metric}' distribution", fontsize=10)
-                else:
-                    ax2d.text(0.5, 0.5, f'No {metric} data', ha='center', va='center')
-            elif ax2d is not None:
-                xs_ids, ys_vals = [], []
-                for be, key, val in records:
-                    try:
-                        if val is None or (isinstance(val, float) and pd.isna(val)):
-                            continue
-                        ys_vals.append(float(val))
-                        xs_ids.append(key)
-                    except (TypeError, ValueError):
-                        pass
-                if ys_vals:
-                    order = sorted(range(len(xs_ids)), key=lambda i: ys_vals[i])
-                    xs_sorted = [xs_ids[i] for i in order]
-                    ys_sorted = [ys_vals[i] for i in order]
-                    pt_colors = [cmap(norm(v)) for v in ys_sorted]
-                    ax2d.scatter(range(len(xs_sorted)), ys_sorted, c=pt_colors, s=16)
-                    step = max(1, len(xs_sorted) // 15)
-                    tick_idx = list(range(0, len(xs_sorted), step))
-                    ax2d.set_xticks(tick_idx)
-                    ax2d.set_xticklabels([str(xs_sorted[i]) for i in tick_idx], rotation=60, fontsize=6)
-                    ax2d.set_xlabel(group_by)
-                    ax2d.set_ylabel(metric)
-                    ax2d.set_title(f"{metric} by {group_by} (sorted)", fontsize=10)
-                    ax2d.grid(alpha=0.3)
-                else:
-                    ax2d.text(0.5, 0.5, f'No {metric} data loaded for this grouping\n'
-                                        f'(Load Summary first)', ha='center', va='center')
-
-            # tight_layout() 2B paneli varken kenar boşluklarını iyi
-            # ayarlıyor, ama TEK BAŞINA 3B eksen (Maximize açıkken) için
-            # onu tekrar ortalayıp küçültüyor - bu yüzden o durumda sabit,
-            # geniş kenar boşluklarıyla subplots_adjust kullanılıyor.
-            if ax2d is not None:
-                self.fig.tight_layout()
-            else:
-                self.fig.subplots_adjust(left=0.02, right=0.96, top=0.90, bottom=0.08)
-            self.canvas.draw()
-        except Exception as e:
-            self._log(f"ERROR plotting: {e}")
-            messagebox.showerror("Error", f"Could not plot:\n{e}")
 
 
 # ============================================================================
@@ -8761,24 +8069,33 @@ def _run_fem_viewer(argv):
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(_FEM_VIEWER_FLAG, action='store_true')
     parser.add_argument('--bdf', default='')
-    parser.add_argument('--summary', default='')
+    parser.add_argument('--bar-csv', dest='bar_csv', default='')
+    parser.add_argument('--prop-csv', dest='prop_csv', default='')
     parser.add_argument('--group', default='Bar Property ID')
     parser.add_argument('--metric', default='')
     args, _ = parser.parse_known_args(argv)
 
+    # Viewer'ın çıktısı sekmenin açtığı log dosyasına gider; Python hataları
+    # (traceback) ve OpenGL/Qt gibi native çökmeler de oraya yazılsın, sekme
+    # bunları kullanıcıya gösterebilsin.
+    import faulthandler
+    import traceback
+    try:
+        faulthandler.enable()
+    except Exception:
+        pass
+    print(f"FEM Viewer: Python {sys.version.split()[0]} at {sys.executable}", flush=True)
     try:
         import pyvista as pv
         from pyvistaqt import QtInteractor
         from qtpy import QtWidgets, QtCore, QtGui
         from vtkmodules.vtkRenderingCore import vtkCellPicker
-    except Exception as e:
-        r = tk.Tk()
-        r.withdraw()
-        messagebox.showerror("FEM Viewer", "The FEM Viewer needs PyVista and Qt:\n\n"
-                                           "    pip install pyvista pyvistaqt PyQt5\n\n"
-                                           f"Import error: {e}")
-        r.destroy()
-        return
+        import qtpy
+        print(f"pyvista {pv.__version__}, Qt binding {qtpy.API_NAME} (Qt {qtpy.QT_VERSION})", flush=True)
+    except Exception:
+        print("Could not import PyVista / Qt - install with: pip install pyvista pyvistaqt PyQt5", flush=True)
+        traceback.print_exc()
+        sys.exit(2)
 
     V = VisualizationResultsTab   # CSV yardımcıları (_scan_summary_files, _fmt_fixed, ...) buradan
     fmt = V._fmt_fixed
@@ -8864,38 +8181,44 @@ def _run_fem_viewer(argv):
             self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, dock)
 
             # ---- Results ----
-            g = QtWidgets.QGroupBox("Results (summary CSV)")
+            g = QtWidgets.QGroupBox("Results (CSV)")
             gl = QtWidgets.QGridLayout(g)
-            self.summary_edit = QtWidgets.QLineEdit(args.summary)
-            btn_browse = QtWidgets.QPushButton("...")
-            btn_browse.setFixedWidth(30)
-            btn_browse.clicked.connect(self._browse_summary)
-            btn_load = QtWidgets.QPushButton("Load")
-            btn_load.clicked.connect(self.load_summary)
-            gl.addWidget(QtWidgets.QLabel("Summary folder:"), 0, 0)
-            gl.addWidget(self.summary_edit, 0, 1)
-            gl.addWidget(btn_browse, 0, 2)
-            gl.addWidget(btn_load, 0, 3)
-            self.summary_status = QtWidgets.QLabel("No summary loaded")
+            self.bar_csv_edit = QtWidgets.QLineEdit(args.bar_csv)
+            self.prop_csv_edit = QtWidgets.QLineEdit(args.prop_csv)
+            for row, (label, edit) in enumerate([("Bar Element CSV:", self.bar_csv_edit),
+                                                  ("Bar Property CSV:", self.prop_csv_edit)]):
+                btn = QtWidgets.QPushButton("...")
+                btn.setFixedWidth(30)
+                btn.clicked.connect(lambda _=False, e=edit: self._browse_csv(e))
+                gl.addWidget(QtWidgets.QLabel(label), row, 0)
+                gl.addWidget(edit, row, 1, 1, 2)
+                gl.addWidget(btn, row, 3)
+            btn_folder = QtWidgets.QPushButton("Find in Folder...")
+            btn_folder.clicked.connect(self._find_csvs_in_folder)
+            btn_load = QtWidgets.QPushButton("Load CSVs")
+            btn_load.clicked.connect(self.load_results)
+            gl.addWidget(btn_folder, 2, 0, 1, 2)
+            gl.addWidget(btn_load, 2, 2, 1, 2)
+            self.summary_status = QtWidgets.QLabel("No results loaded")
             self.summary_status.setWordWrap(True)
-            gl.addWidget(self.summary_status, 1, 0, 1, 4)
+            gl.addWidget(self.summary_status, 3, 0, 1, 4)
             self.group_combo = QtWidgets.QComboBox()
             self.group_combo.addItems(group_options)
             if args.group in group_options:
                 self.group_combo.setCurrentText(args.group)
             self.group_combo.currentTextChanged.connect(self._on_group_changed)
-            gl.addWidget(QtWidgets.QLabel("Group by:"), 2, 0)
-            gl.addWidget(self.group_combo, 2, 1, 1, 3)
+            gl.addWidget(QtWidgets.QLabel("Group by:"), 4, 0)
+            gl.addWidget(self.group_combo, 4, 1, 1, 3)
             self.metric_combo = QtWidgets.QComboBox()
             self.metric_combo.currentTextChanged.connect(self._on_metric_changed)
-            gl.addWidget(QtWidgets.QLabel("Color by:"), 3, 0)
-            gl.addWidget(self.metric_combo, 3, 1, 1, 3)
+            gl.addWidget(QtWidgets.QLabel("Color by:"), 5, 0)
+            gl.addWidget(self.metric_combo, 5, 1, 1, 3)
             self.only_results_chk = QtWidgets.QCheckBox("Show only bars that have results")
             self.only_results_chk.toggled.connect(lambda _: self.refresh_scene())
-            gl.addWidget(self.only_results_chk, 4, 0, 1, 4)
+            gl.addWidget(self.only_results_chk, 6, 0, 1, 4)
             self.stats_label = QtWidgets.QLabel("")
             self.stats_label.setWordWrap(True)
-            gl.addWidget(self.stats_label, 5, 0, 1, 4)
+            gl.addWidget(self.stats_label, 7, 0, 1, 4)
             lay.addWidget(g)
 
             # ---- Contour ----
@@ -9035,22 +8358,34 @@ def _run_fem_viewer(argv):
             self.tree_key = (tcode << 40) | (np.asarray(grid.cell_data['PID']) + 1)
             self._build_tree()
             self.statusBar().showMessage(f"Loaded {n} elements from {os.path.basename(self.bdf_path)}", 8000)
-            if self.summary_edit.text().strip():
-                self.load_summary(quiet=True)
-            else:
-                self.apply_contour()
+            self.load_results(quiet=True)
             self.plotter.view_isometric()
             self.plotter.reset_camera()
 
-        def _browse_summary(self):
-            folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Summary folder", self.summary_edit.text())
-            if folder:
-                self.summary_edit.setText(folder)
-                self.load_summary()
+        def _browse_csv(self, edit):
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Result CSV", edit.text(), "CSV (*.csv);;All (*)")
+            if path:
+                edit.setText(path)
+                self.load_results()
+
+        def _find_csvs_in_folder(self):
+            folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Folder with summary CSVs")
+            if not folder:
+                return
+            bar_path, prop_path, full_path = V._scan_summary_files(folder)
+            if not bar_path and not prop_path and full_path:
+                bar_path = prop_path = full_path
+            if not bar_path and not prop_path:
+                QtWidgets.QMessageBox.warning(self, "FEM Viewer", "No DT_SIZING_BAR_SUMMARY / DT_SIZING_PROP_SUMMARY / "
+                                                                  "DT_FULL_SUMMARY.csv found in that folder")
+                return
+            self.bar_csv_edit.setText(bar_path or "")
+            self.prop_csv_edit.setText(prop_path or "")
+            self.load_results()
 
         @staticmethod
-        def _read_summary(path, id_col):
-            df = V._standardize_summary_df(V, pd.read_csv(path))
+        def _read_csv(path, id_col):
+            df = V._standardize_summary_df(pd.read_csv(path))
             if id_col not in df.columns:
                 return None
             df[id_col] = pd.to_numeric(df[id_col], errors='coerce')
@@ -9058,32 +8393,37 @@ def _run_fem_viewer(argv):
             df[id_col] = df[id_col].astype(np.int64)
             return df.drop_duplicates(subset=[id_col]).set_index(id_col)
 
-        def load_summary(self, quiet=False):
-            folder = self.summary_edit.text().strip()
-            if not folder or not os.path.isdir(folder):
-                if not quiet:
-                    QtWidgets.QMessageBox.warning(self, "FEM Viewer", "Select a valid summary folder")
-                self.apply_contour()
-                return
-            bar_path, prop_path, full_path = V._scan_summary_files(folder)
+        def load_results(self, quiet=False):
             self.bar_df = self.prop_df = None
-            msgs = []
-            try:
-                if bar_path:
-                    self.bar_df = self._read_summary(bar_path, 'Bar Element ID')
-                if prop_path:
-                    self.prop_df = self._read_summary(prop_path, 'Bar Property ID')
-                if self.bar_df is None and self.prop_df is None and full_path:
-                    self.bar_df = self._read_summary(full_path, 'Bar Element ID')
-                    self.prop_df = self._read_summary(full_path, 'Bar Property ID')
-                    msgs.append("DT_FULL_SUMMARY.csv fallback (first row per ID)")
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, "FEM Viewer", f"Could not read summary CSVs:\n{e}")
-            if self.bar_df is not None:
-                msgs.insert(0, f"Bar Element ID: {len(self.bar_df)} rows")
-            if self.prop_df is not None:
-                msgs.insert(0, f"Bar Property ID: {len(self.prop_df)} rows")
-            self.summary_status.setText("; ".join(msgs) if msgs else "No DT_SIZING_*_SUMMARY.csv / DT_FULL_SUMMARY.csv found")
+            msgs, problems = [], []
+            for edit, id_col, attr in ((self.bar_csv_edit, 'Bar Element ID', 'bar_df'),
+                                       (self.prop_csv_edit, 'Bar Property ID', 'prop_df')):
+                path = edit.text().strip()
+                if not path:
+                    continue
+                name = os.path.basename(path)
+                try:
+                    df = self._read_csv(path, id_col) if os.path.isfile(path) else None
+                    if not os.path.isfile(path):
+                        problems.append(f"Not found: {path}")
+                    elif df is None:
+                        problems.append(f"{name} has no '{id_col}' column")
+                    else:
+                        setattr(self, attr, df)
+                        msgs.append(f"{id_col}: {len(df)} rows ({name})")
+                except Exception as e:
+                    problems.append(f"Could not read {name}: {e}")
+            self.summary_status.setText("\n".join(msgs + problems) or "No result CSV selected - mesh only")
+            if problems and not quiet:
+                QtWidgets.QMessageBox.warning(self, "FEM Viewer", "\n".join(problems))
+            if self.bar_df is None and self.prop_df is not None:
+                self.group_combo.blockSignals(True)
+                self.group_combo.setCurrentText('Bar Property ID')
+                self.group_combo.blockSignals(False)
+            elif self.prop_df is None and self.bar_df is not None:
+                self.group_combo.blockSignals(True)
+                self.group_combo.setCurrentText('Bar Element ID')
+                self.group_combo.blockSignals(False)
             self._refresh_metric_options(preferred=args.metric)
             self.apply_contour()
 
@@ -9471,11 +8811,18 @@ def _run_fem_viewer(argv):
             self.plotter.close()
             super().closeEvent(event)
 
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
-    win = FemViewer()
-    win.show()
+    try:
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+        win = FemViewer()
+        win.showMaximized()
+        win.raise_()
+        win.activateWindow()
+    except Exception:
+        traceback.print_exc()
+        sys.exit(3)
+    print("FEM_VIEWER_READY", flush=True)   # sekme bunu görünce "pencere açıldı" der
     QtCore.QTimer.singleShot(0, win.load_bdf)
-    app.exec_()
+    sys.exit(app.exec_())
 
 
 # ============================================================================

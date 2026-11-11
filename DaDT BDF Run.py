@@ -7799,9 +7799,12 @@ class VisualizationResultsTab:
             messagebox.showerror("Error", f"Could not start the FEM Viewer:\n{e}")
             return
         self._log(f"Starting FEM Viewer for {os.path.basename(bdf)} (PID {proc.pid}) - log: {log_path}")
-        self._watch_viewer(proc, log_path, announced=False)
+        self._watch_viewer(proc, log_path, shown=0)
 
-    def _watch_viewer(self, proc, log_path, announced):
+    # _watch_viewer: viewer'ın log dosyasındaki YENİ satırları her saniye bu
+    # sekmenin log'una aktarır (yükleme ilerlemesi, VTK/OpenGL hataları canlı
+    # görünsün), süreç bitince çıkış koduna göre sonucu bildirir.
+    def _watch_viewer(self, proc, log_path, shown):
         code = proc.poll()
         log = ""
         try:
@@ -7809,21 +7812,38 @@ class VisualizationResultsTab:
                 log = f.read()
         except OSError:
             pass
+        # faulthandler'ın çok uzun "Extension modules: ..." satırı asıl hatayı
+        # (örn. Qt plugin / OpenGL mesajı) ekrandan iter - onu atla.
+        lines = [l for l in log.splitlines()
+                 if l.strip() and not l.startswith("Extension modules:")]
+        complete = lines if code is not None or log.endswith("\n") else lines[:-1]
+        for line in complete[shown:]:
+            if line == "FEM_VIEWER_READY":
+                self._log("  [viewer] window opened (check the taskbar if it is behind this window)")
+            else:
+                self._log(f"  [viewer] {line}")
+        shown = max(shown, len(complete))
         if code is None:
-            if not announced and "FEM_VIEWER_READY" in log:
-                self._log("FEM Viewer window opened (check the taskbar if it is behind this window).")
-                announced = True
-            self.root.after(1000, lambda: self._watch_viewer(proc, log_path, announced))
+            self.root.after(1000, lambda: self._watch_viewer(proc, log_path, shown))
             return
         if code == 0:
             self._log("FEM Viewer closed.")
             return
-        # faulthandler'ın çok uzun "Extension modules: ..." satırı asıl hatayı
-        # (örn. Qt plugin / OpenGL mesajı) ekrandan iter - onu atla.
-        lines = [l for l in log.strip().splitlines()
-                 if l.strip() and not l.startswith(("Extension modules:", "FEM_VIEWER_READY"))]
-        tail = "\n".join(lines[-25:]) or "(no output)"
-        self._log(f"FEM Viewer exited with an error (code {code}):\n{tail}")
+        if "OPENGL_NOT_SUPPORTED" in log:
+            msg = ("The 3D view needs OpenGL 3.2 or newer, but this Windows session only offers "
+                   "the basic OpenGL 1.1 driver.\n\n"
+                   "This is typical of a Remote Desktop session where the server's graphics card "
+                   "is not enabled for remote sessions. Options:\n"
+                   "  - Ask IT to enable the Group Policy 'Use hardware graphics adapters for all "
+                   "Remote Desktop Services sessions' on this machine (needs a GPU), or\n"
+                   "  - Run the tool on a machine you use directly (not over Remote Desktop), or\n"
+                   "  - Use a software OpenGL driver (Mesa 'opengl32.dll' placed next to "
+                   f"{os.path.basename(sys.executable)}) - slower, but works without a GPU.")
+            self._log("FEM Viewer: OpenGL 3.2+ not available in this session - see the message window.")
+            messagebox.showerror("FEM Viewer - OpenGL not available", msg + f"\n\nLog: {log_path}")
+            return
+        tail = "\n".join(l for l in lines[-25:] if l != "FEM_VIEWER_READY") or "(no output)"
+        self._log(f"FEM Viewer exited with an error (code {code}) - see the lines above.")
         messagebox.showerror("FEM Viewer", f"The FEM Viewer closed with an error (code {code}):\n\n"
                                            f"{tail[-1500:]}\n\nFull log: {log_path}")
 
@@ -8097,6 +8117,32 @@ def _run_fem_viewer(argv):
         traceback.print_exc()
         sys.exit(2)
 
+    # VTK hata/uyarılarını (Windows'ta normalde ayrı bir "Output Window"a
+    # gider, kullanıcı görmez) stderr'e - yani log dosyasına - yönlendir.
+    try:
+        from vtkmodules.vtkCommonCore import vtkOutputWindow
+        out_win = vtkOutputWindow.GetInstance()
+        if hasattr(out_win, 'SetDisplayModeToAlwaysStdErr'):
+            out_win.SetDisplayModeToAlwaysStdErr()
+    except Exception:
+        pass
+
+    # VTK en az OpenGL 3.2 ister. Uzak Masaüstü (RDP) oturumlarında, sunucu
+    # GPU'yu RDP'ye açmadıysa Windows sadece OpenGL 1.1 verir - bu durumda
+    # VTK penceresi boş/beyaz kalıp donar. Pencereyi kurmadan önce test et.
+    try:
+        from vtkmodules.vtkRenderingCore import vtkRenderWindow
+        opengl_ok = bool(vtkRenderWindow().SupportsOpenGL())
+    except Exception as e:
+        print(f"OpenGL check failed: {e}", flush=True)
+        opengl_ok = True   # test yapılamadıysa engelleme, normal dene
+    print(f"OpenGL 3.2+ available: {opengl_ok}", flush=True)
+    if not opengl_ok:
+        print("OPENGL_NOT_SUPPORTED: this session has no OpenGL 3.2+ driver, which VTK/PyVista needs "
+              "(typical for a Remote Desktop session where the server's GPU is not enabled for RDP).",
+              flush=True)
+        sys.exit(4)
+
     V = VisualizationResultsTab   # CSV yardımcıları (_scan_summary_files, _fmt_fixed, ...) buradan
     fmt = V._fmt_fixed
     tristate_flag = getattr(QtCore.Qt, 'ItemIsAutoTristate', QtCore.Qt.ItemIsTristate)
@@ -8116,7 +8162,11 @@ def _run_fem_viewer(argv):
 
         def run(self):
             try:
-                self.done.emit(_fem_load_grid(self.bdf_path, log=self.message.emit, use_cache=self.use_cache))
+                def log(m):
+                    print(m, flush=True)   # log dosyasına -> sekmede canlı görünür
+                    self.message.emit(m)
+                log(f"Loading {self.bdf_path} ...")
+                self.done.emit(_fem_load_grid(self.bdf_path, log=log, use_cache=self.use_cache))
             except Exception as e:
                 self.failed.emit(str(e))
 
@@ -8342,11 +8392,18 @@ def _run_fem_viewer(argv):
 
         def _on_load_failed(self, msg):
             QtWidgets.QApplication.restoreOverrideCursor()
+            print(f"ERROR loading BDF: {msg}", flush=True)
             self.statusBar().showMessage("Load failed")
             QtWidgets.QMessageBox.critical(self, "FEM Viewer", f"Could not load the BDF:\n{msg}")
 
         def _on_grid_loaded(self, grid):
             QtWidgets.QApplication.restoreOverrideCursor()
+            print(f"Mesh ready ({grid.n_cells} elements) - building the 3D view ...", flush=True)
+            t0 = time.time()
+            self._setup_grid(grid)
+            print(f"3D view drawn in {time.time() - t0:.1f}s", flush=True)
+
+        def _setup_grid(self, grid):
             self.grid = grid
             self.type_names = [str(t) for t in np.asarray(grid.field_data['TypeNames']).tolist()]
             n = grid.n_cells
@@ -8821,6 +8878,7 @@ def _run_fem_viewer(argv):
         traceback.print_exc()
         sys.exit(3)
     print("FEM_VIEWER_READY", flush=True)   # sekme bunu görünce "pencere açıldı" der
+    QtCore.QTimer.singleShot(0, lambda: print("Viewer event loop running", flush=True))
     QtCore.QTimer.singleShot(0, win.load_bdf)
     sys.exit(app.exec_())
 

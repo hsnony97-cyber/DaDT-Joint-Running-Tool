@@ -6504,6 +6504,11 @@ class IterativeFullRunTab:
         # ---- Section 4: Iterasyon ayarları ----
         self.target_flight_hours = tk.StringVar()   # hedef uçuş saati - boyutlandırmanın "yeterli" sayılma eşiği
         self.n_iterations = tk.StringVar(value="3")  # toplam kaç kere tüm zincirin tekrarlanacağı
+        # Üst sınır ömür (opsiyonel): hedef ile üst sınır arasındaki ömür "yeterince
+        # iyi" sayılır (ölü bölge). Boşsa eski davranış sürer: her iterasyonda
+        # sizing sonucu doğrudan bir sonraki iterasyonun kalınlığı olur.
+        self.upper_life = tk.StringVar(value="")
+        self.reduction_pct = tk.StringVar(value="20")  # ömür üst sınırı aşarsa kalınlığın azaltılacağı yüzde
 
         self.is_running = False
 
@@ -6683,6 +6688,21 @@ class IterativeFullRunTab:
         ttk.Entry(tfh_frame, textvariable=self.target_flight_hours, width=12).pack(side=tk.LEFT, padx=5)
         ttk.Label(tfh_frame, text="(a Bar Element only counts as sized once its Life >= this)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        upper_frame = ttk.Frame(f4)
+        upper_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(upper_frame, text="Upper Bound Life:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(upper_frame, textvariable=self.upper_life, width=12).pack(side=tk.LEFT, padx=5)
+        ttk.Label(upper_frame, text="Reduce thickness by (%):").pack(side=tk.LEFT, padx=(15, 2))
+        ttk.Entry(upper_frame, textvariable=self.reduction_pct, width=6).pack(side=tk.LEFT, padx=5)
+        ttk.Label(upper_frame, text="(optional - blank = off)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+        ttk.Label(f4, text="Life between Target and Upper Bound counts as good enough. If a property's governing "
+                           "Life is above Upper (and the sweep has nothing thinner that failed), the next "
+                           "iteration starts that much thinner - never below the initial t1(mm). The run stops "
+                           "early once every property is settled at the thickness the FEM was solved with.",
+                 font=('Helvetica', 8, 'italic'), foreground="gray", wraplength=1100,
+                 justify=tk.LEFT).pack(anchor=tk.W, padx=(5, 0), pady=(0, 2))
 
         niter_frame = ttk.Frame(f4)
         niter_frame.pack(fill=tk.X, pady=2)
@@ -7039,6 +7059,11 @@ class IterativeFullRunTab:
                       "t1(mm)/tfem not updated.")
             return 0
 
+        # İLK çağrıda (henüz üzerine yazılmamış) orijinal t1(mm) değerlerini PID
+        # başına yakala - Iterative Full Run'da bu, altına inilemeyecek TABAN
+        # kalınlıktır (aynı PID'nin satırlarında farklıysa en büyüğü).
+        collect_floor = getattr(self, '_t1_floor_by_pid', 'missing') is None
+        new_floors = {}
         n_updated = 0
         unmatched = []
         for row in range(2, ws.max_row + 1):
@@ -7058,6 +7083,13 @@ class IterativeFullRunTab:
                     pid = None
             if key is None:
                 continue
+            if collect_floor and pid is not None:
+                try:
+                    orig_t1 = float(ws.cell(row=row, column=t1_col or tfem_col).value)
+                    if np.isfinite(orig_t1) and orig_t1 > 0:
+                        new_floors[pid] = max(new_floors.get(pid, 0.0), orig_t1)
+                except (TypeError, ValueError):
+                    pass
             if pid in dim1_by_pid:
                 val = dim1_by_pid[pid]
                 if t1_col:
@@ -7068,6 +7100,8 @@ class IterativeFullRunTab:
             else:
                 unmatched.append(key)
 
+        if collect_floor:
+            self._t1_floor_by_pid = new_floors
         self._save_working_excel(wb, excel_path)
         key_name = "Bar Element ID" if eid_col else "Bar Property ID"
         self.log(f"  Updated t1(mm)/tfem for {n_updated} DTCG_Input_Excel_Data row(s) "
@@ -7130,9 +7164,9 @@ class IterativeFullRunTab:
         path relative to joint_run_folder - 1st/2nd path component), then
         DT_FULL_SUMMARY / DT_SIZING_BAR_SUMMARY / DT_SIZING_PROP_SUMMARY /
         DT_LIFE_CHECK_BAR_SUMMARY / DT_LIFE_CHECK_PROP_SUMMARY.csv are
-        written into joint_run_folder. Returns (df_prop_sum, t_col) or
-        (None, None) if no summary csvs were found or the expected
-        columns are missing."""
+        written into joint_run_folder. Returns (df_prop_sum, t_col,
+        full_summary) or (None, None, None) if no summary csvs were found or
+        the expected columns are missing."""
         self.log("\n" + "=" * 70)
         self.log("BUILDING FLIGHT HOURS SUMMARY")
         self.log("=" * 70)
@@ -7146,7 +7180,7 @@ class IterativeFullRunTab:
                     csv_files.append(os.path.join(dirpath, fn))
         self.log(f"  Found {len(csv_files)} 'Nasgro Final Summary' csv file(s) under {joint_run_folder}")
         if not csv_files:
-            return None, None
+            return None, None, None
 
         # Her CSV'nin joint_run_folder'a göre RELATİF yolundan Structure_Name
         # (1. klasör - yani Set adı) ve Fastened_Parts (2. klasör, varsa)
@@ -7169,7 +7203,7 @@ class IterativeFullRunTab:
 
         if not frames:
             self.log("  WARNING: none of the 'Nasgro Final Summary' csvs could be read.")
-            return None, None
+            return None, None, None
 
         # TÜM Set'lerin satırlarını tek bir "DT_FULL_SUMMARY" tablosunda birleştir.
         full_summary = pd.concat(frames, ignore_index=True)
@@ -7184,7 +7218,7 @@ class IterativeFullRunTab:
             self.log("  WARNING: expected 'Life' / 't(mm)' / 'Bar Element ID' / 'Bar Property ID' "
                       "columns not found in the Nasgro Final Summary csvs - cannot build "
                       "sizing/life-check summaries.")
-            return None, None
+            return None, None, None
 
         # ---- Boyutlandırma (sizing) mantığı ----
         # 1. Önce SADECE hedef uçuş saatini (Life >= wanted_flight_hours)
@@ -7193,12 +7227,16 @@ class IterativeFullRunTab:
         #    her eleman için (Bar Element ID [+ Type]) İLK (yani EN İNCE,
         #    hedefi hâlâ karşılayan) satırı tut - drop_duplicates varsayılan
         #    olarak ilk görüleni tutar.
+        # NOT: kalınlığa (t_col) göre BÜYÜKTEN küçüğe sıralanan her adımda
+        # ikincil anahtar olarak Life KÜÇÜKTEN büyüğe eklenir (referans
+        # Summary_Creating.py ile aynı) - eşit kalınlıkta EN DÜŞÜK Life'lı
+        # (yani yönetici/governing) satır önde kalır, drop_duplicates onu tutar.
         filtered_for_life = full_summary[full_summary['Life'] >= wanted_flight_hours]
         filtered_sorted = filtered_for_life.sort_values(by=t_col, ascending=True)
         dedup_cols = ['Bar Element ID', 'Bar Element Type'] if 'Bar Element Type' in full_summary.columns \
             else ['Bar Element ID']
         filtered_sorted_rmd = filtered_sorted.drop_duplicates(subset=dedup_cols)
-        filtered_sorted_rmd = filtered_sorted_rmd.sort_values(by=t_col, ascending=False)
+        filtered_sorted_rmd = filtered_sorted_rmd.sort_values(by=[t_col, 'Life'], ascending=[False, True])
 
         # 3. Hedefi karşılayan (en ince) satırları, TÜM satırların kalınlığa
         #    göre büyükten küçüğe sıralanmış haliyle birleştir, sonra aynı
@@ -7209,10 +7247,10 @@ class IterativeFullRunTab:
         #    eleman için satır yoksa) full_summary_th_sort'taki EN KALIN
         #    (en güvenli/muhafazakâr) satır kullanılır - yani "hedefi
         #    karşılayamayan elemanlar için en kalın (en güvenli) değere geri dön" davranışı.
-        full_summary_th_sort = full_summary.sort_values(by=t_col, ascending=False)
+        full_summary_th_sort = full_summary.sort_values(by=[t_col, 'Life'], ascending=[False, True])
         df_bar_sum = pd.concat([filtered_sorted_rmd, full_summary_th_sort], ignore_index=True)
         df_bar_sum = df_bar_sum.drop_duplicates(subset=dedup_cols)
-        df_bar_sum = df_bar_sum.sort_values(by=t_col, ascending=False)
+        df_bar_sum = df_bar_sum.sort_values(by=[t_col, 'Life'], ascending=[False, True])
         df_bar_sum = df_bar_sum.drop_duplicates(subset=['Bar Element ID'])
         df_bar_sum.to_csv(os.path.join(joint_run_folder, 'DT_SIZING_BAR_SUMMARY.csv'),
                            encoding='utf-8', index=False)
@@ -7222,7 +7260,7 @@ class IterativeFullRunTab:
         # bir Property'ye bağlı birden fazla eleman varsa, hepsini güvenle
         # kapsayan en kalın değer seçilir. Bu df_prop_sum, bir sonraki
         # iterasyonun Bar Property Dim1 değerlerinin KAYNAĞIDIR.
-        df_prop_sum = df_bar_sum.sort_values(by=t_col, ascending=False)
+        df_prop_sum = df_bar_sum.sort_values(by=[t_col, 'Life'], ascending=[False, True])
         df_prop_sum = df_prop_sum.drop_duplicates(subset=['Bar Property ID'])
         df_prop_sum.to_csv(os.path.join(joint_run_folder, 'DT_SIZING_PROP_SUMMARY.csv'),
                             encoding='utf-8', index=False)
@@ -7237,7 +7275,106 @@ class IterativeFullRunTab:
 
         self.log(f"  DT_FULL_SUMMARY: {len(full_summary)} rows, DT_SIZING_BAR_SUMMARY: "
                   f"{len(df_bar_sum)} rows, DT_SIZING_PROP_SUMMARY: {len(df_prop_sum)} rows")
-        return df_prop_sum, t_col
+        return df_prop_sum, t_col, full_summary
+
+    # FEM'in çözüldüğü kalınlık ile sizing'in seçtiği kalınlık arasındaki göreli
+    # fark bunun altındaysa "aynı kalınlık" sayılır (yakınsama tutarlılık şartı).
+    _CONVERGENCE_REL_TOL = 0.01
+
+    # _decide_next_thicknesses: iterasyon sonunda, DT_SIZING_PROP_SUMMARY'deki
+    # (yani her Property'nin YÖNETİCİ satırı: en kalın gereksinimi duyan
+    # eleman, eşit kalınlıkta en düşük Life'lı satır) Life değerine bakarak
+    # bir sonraki iterasyonun Bar Property Dim1 değerini belirler.
+    # Hedef ömür (target) ile Üst Sınır (upper) arasındaki Life "yeterince iyi"
+    # sayılır (ölü bölge) - hassas Life değerleri etrafında gidip gelmeyi önler:
+    #   target <= Life <= upper ........ 'in band': kalınlık aynen kalır.
+    #   Life > upper:
+    #       elemanın bundan DAHA İNCE bir satırı tabloda var (ve zaten
+    #       başarısız) ........ 'bracketed': taramanın izin verdiği en ince
+    #                           nokta, kalınlık aynen kalır.
+    #       daha ince satır yok (en alt satır geçiyor, ne kadar inilebileceği
+    #       bilinmiyor; 1e9 gibi tavan değerleri de buraya düşer) .......
+    #                           yeni = max(taban, mevcut x (1 - yüzde/100));
+    #                           zaten tabandaysa 'at floor'.
+    #   Life < target (hiçbir satır hedefi sağlamıyor, sizing en kalına düşmüş,
+    #   ya da Life 0/boş) ... 'below target': kalınlık aynen kalır, uyarılır.
+    # Taban (floor): Property başına İLK iterasyondaki t1(mm) - altına inilmez.
+    # upper_life None ise bu mantık kapalıdır: eski davranış (sizing sonucu
+    # olduğu gibi). Dönüş: (sonraki_kalınlık_haritası, kayıtlar, yakınsadı_mı).
+    # Yakınsama = HER property için durum in band / bracketed / at floor VE
+    # sizing kalınlığı FEM'in çözüldüğü kalınlığa eşit (yani o kalınlık kendi
+    # FEM yükleriyle doğrulanmış).
+    def _decide_next_thicknesses(self, df_prop_sum, t_col, full_summary, target_life, upper_life,
+                                 reduction_pct, floor_by_pid, solved_dim1_by_pid):
+        next_map = {}
+        records = []
+        factor = 1.0 - reduction_pct / 100.0
+        for _, g in df_prop_sum.iterrows():
+            try:
+                pid = int(g['Bar Property ID'])
+                t_s = float(g[t_col])
+            except (TypeError, ValueError):
+                continue
+            try:
+                life = float(g['Life'])
+            except (TypeError, ValueError):
+                life = float('nan')
+            solved = solved_dim1_by_pid.get(pid)
+            floor = floor_by_pid.get(pid)
+            new_t = t_s
+            if upper_life is None:
+                decision, settled = 'sizing', False
+            elif not np.isfinite(life) or life < target_life:
+                decision, settled = 'below target', False
+            elif life <= upper_life:
+                decision, settled = 'in band', True
+            else:
+                mask = full_summary['Bar Element ID'] == g['Bar Element ID']
+                if 'Bar Element Type' in full_summary.columns:
+                    mask &= full_summary['Bar Element Type'] == g['Bar Element Type']
+                thinner = pd.to_numeric(full_summary.loc[mask, t_col], errors='coerce')
+                if bool((thinner < t_s - 1e-9).any()):
+                    decision, settled = 'bracketed', True
+                elif floor is not None and t_s <= floor + 1e-9:
+                    decision, settled = 'at floor', True
+                else:
+                    new_t = max(floor if floor is not None else 0.0, t_s * factor)
+                    decision, settled = 'reduce', False
+            new_t = round(new_t, 4)
+            consistent = solved is not None and abs(t_s - solved) <= self._CONVERGENCE_REL_TOL * max(solved, 1e-9)
+            next_map[pid] = new_t
+            records.append({'Bar Property ID': pid, 'Solved t(mm)': solved, 'Sized t(mm)': t_s,
+                            'Life': life, 'Decision': decision, 'Next t(mm)': new_t,
+                            'Floor t(mm)': floor, 'Settled': bool(settled and consistent)})
+        converged = upper_life is not None and bool(records) and all(r['Settled'] for r in records)
+        return next_map, records, converged
+
+    # _log_thickness_decisions: karar tablosunu log'a yazar ve iterasyonun
+    # Joint Run klasörüne DT_ITERATION_DECISIONS.csv olarak kaydeder.
+    def _log_thickness_decisions(self, decisions, iteration, target_life, upper_life, reduction_pct, folder):
+        self.log("\n" + "-" * 70)
+        self.log(f"THICKNESS DECISIONS (iteration {iteration}) - target {target_life:g}, "
+                  f"upper bound {upper_life:g}, reduce {reduction_pct:g}%")
+        self.log("-" * 70)
+        self.log(f"  {'PID':>8} {'FEM t':>8} {'sized t':>8} {'Life':>14}  {'decision':<13} {'next t':>8}")
+        counts = {}
+        for r in decisions:
+            counts[r['Decision']] = counts.get(r['Decision'], 0) + 1
+            fem_t = f"{r['Solved t(mm)']:.3f}" if r['Solved t(mm)'] is not None else "?"
+            self.log(f"  {r['Bar Property ID']:>8} {fem_t:>8} {r['Sized t(mm)']:>8.3f} "
+                      f"{r['Life']:>14,.0f}  {r['Decision']:<13} {r['Next t(mm)']:>8.3f}")
+        n_settled = sum(1 for r in decisions if r['Settled'])
+        self.log("  " + ", ".join(f"{n} {d}" for d, n in sorted(counts.items())) +
+                  f"  ->  {n_settled}/{len(decisions)} Bar Properties settled")
+        if counts.get('below target'):
+            self.log(f"  WARNING: {counts['below target']} Bar Property(ies) don't reach the target life even "
+                      f"at the thickest swept value (or have no Life value) - their thickness is kept; "
+                      f"check their loads.")
+        try:
+            pd.DataFrame(decisions).to_csv(os.path.join(folder, 'DT_ITERATION_DECISIONS.csv'),
+                                           encoding='utf-8', index=False)
+        except OSError as e:
+            self.log(f"  WARNING: could not write DT_ITERATION_DECISIONS.csv: {e}")
 
     # _delete_h5_files: verilen klasör altındaki (rekürsif) TÜM .h5
     # dosyalarını sil - son iterasyon DIŞINDAKİ her iterasyonun Load
@@ -7386,6 +7523,21 @@ class IterativeFullRunTab:
         except (ValueError, TypeError):
             messagebox.showerror("Error", "Number of Iterations must be a positive number")
             return
+        if self.upper_life.get().strip():
+            try:
+                upper = float(self.upper_life.get())
+                if upper < float(self.target_flight_hours.get()):
+                    raise ValueError
+            except (ValueError, TypeError):
+                messagebox.showerror("Error", "Upper Bound Life must be a number >= Target Flight Hours "
+                                              "(or leave it blank)")
+                return
+            try:
+                if not 0 < float(self.reduction_pct.get()) < 100:
+                    raise ValueError
+            except (ValueError, TypeError):
+                messagebox.showerror("Error", "Reduce thickness by (%) must be a number between 0 and 100")
+                return
 
         self.is_running = True
         self.btn_run.config(state=tk.DISABLED)
@@ -7411,11 +7563,18 @@ class IterativeFullRunTab:
             shutil.copy2(self.master_input_excel_path.get().strip(), working_excel)
             self._excel_recalc_ok = None        # None = henüz denenmedi (bkz. _save_working_excel)
             self._formula_freeze_logged = False
+            self._t1_floor_by_pid = None        # ilk DTCG güncellemesinde doldurulur (taban kalınlıklar)
+
+            upper_life = float(self.upper_life.get()) if self.upper_life.get().strip() else None
+            reduction_pct = float(self.reduction_pct.get()) if upper_life is not None else 0.0
+            floor_by_pid = {}
             self.log(f"  Working copy of the Master Input Excel: {working_excel}")
             self.log(f"  Target flight hours: {target_life}, Iterations: {n_iterations}")
+            if upper_life is not None:
+                self.log(f"  Upper bound life: {upper_life} (Life between target and upper bound is "
+                          f"accepted), thickness reduction step: {reduction_pct:g}%")
 
-            prop_summary_df = None  # önceki iterasyonun boyutlandırma özeti (ilk iterasyonda yok)
-            t_col = None
+            next_prop_map = None  # önceki iterasyonun sonunda belirlenen {PID: yeni Dim1} (ilk iterasyonda yok)
 
             for iteration in range(1, n_iterations + 1):
                 iter_t_start = time.time()
@@ -7428,9 +7587,8 @@ class IterativeFullRunTab:
                 # HARİÇ, bir önceki iterasyonun boyutlandırma özetindeki
                 # (prop_summary_df) kalınlık değerleri, bu iterasyonun
                 # çözümünden ÖNCE working_excel'in Bar Property Dim1'ine yazılır.
-                if iteration > 1 and prop_summary_df is not None and t_col is not None:
-                    prop_map = dict(zip(prop_summary_df['Bar Property ID'], prop_summary_df[t_col]))
-                    self._update_bar_property_dim1(working_excel, prop_map)
+                if iteration > 1 and next_prop_map:
+                    self._update_bar_property_dim1(working_excel, next_prop_map)
 
                 # ---- STAGE A: UNDERSTANDING STRUCTURE TYPE ----
                 # FullRunTab'daki aynı mantık: t3 nesnesinin alanlarını
@@ -7502,6 +7660,17 @@ class IterativeFullRunTab:
                 self.log(f"  Read {len(dim1_by_pid)} PBARL dim1 value(s) and {len(pid_by_eid)} "
                           f"CBAR/CBEAM -> PID mapping(s) from {len(stru_bdfs)} solved BDF(s)")
                 self._update_dtcg_t1_tfem(working_excel, dim1_by_pid, pid_by_eid)
+                if iteration == 1:
+                    # Taban kalınlık: önce ilk çözümde okunan PBARL dim1, onun
+                    # üstüne Bar Property sayfasının ilk Dim1'i, en üste de
+                    # DTCG'deki ORİJİNAL t1(mm) (varsa) yazılır.
+                    floor_by_pid = dict(dim1_by_pid)
+                    floor_by_pid.update({pid: v['dim1'] for pid, v in self.tab3_tool.bar_properties.items()})
+                    n_from_t1 = len(self._t1_floor_by_pid or {})
+                    floor_by_pid.update(self._t1_floor_by_pid or {})
+                    if upper_life is not None:
+                        self.log(f"  Minimum thickness fixed for {len(floor_by_pid)} Bar Properties "
+                                  f"({n_from_t1} from the initial t1(mm), the rest from the initial Dim1)")
 
                 # Bu iterasyonun working_excel durumunu, o iterasyonun kendi
                 # _base_model klasörüne anlık görüntü (snapshot) olarak
@@ -7588,21 +7757,32 @@ class IterativeFullRunTab:
 
                 # ---- STAGE D: BOYUTLANDIRMA ÖZETİ ----
                 # Bu iterasyonun Joint Run sonuçlarından (Nasgro Final
-                # Summary CSV'leri) prop_summary_df'i üret - bu değişken bir
-                # SONRAKİ iterasyonun başındaki geri besleme adımında
-                # (yukarıda) kullanılacak.
-                prop_summary_df, t_col = self._build_flight_hours_summary(joint_run_dir, target_life)
+                # Summary CSV'leri) boyutlandırma özetini üret ve bir
+                # SONRAKİ iterasyonun Bar Property Dim1 değerlerini belirle
+                # (bkz. _decide_next_thicknesses; Upper Bound Life boşsa
+                # sizing sonucu aynen kullanılır). next_prop_map, sonraki
+                # iterasyonun başındaki geri besleme adımında (yukarıda) yazılır.
+                prop_summary_df, t_col, full_summary = self._build_flight_hours_summary(
+                    joint_run_dir, target_life)
                 if prop_summary_df is None:
                     self.log(f"\nSTOPPED (iteration {iteration}): no sizing summary could be built "
                               "- not continuing to further iterations. See the log above.")
                     return
 
+                next_prop_map, decisions, converged = self._decide_next_thicknesses(
+                    prop_summary_df, t_col, full_summary, target_life, upper_life,
+                    reduction_pct, floor_by_pid, dim1_by_pid)
+                if upper_life is not None and decisions:
+                    self._log_thickness_decisions(decisions, iteration, target_life, upper_life,
+                                                  reduction_pct, joint_run_dir)
+
                 # SON iterasyon DIŞINDAKİ her iterasyonda: bu iterasyonun H5
                 # dosyaları (hem Load Extraction hem Joint Run) artık
                 # gerekli değil (sonraki iterasyon kendi H5'lerini üretecek)
                 # - disk yer açmak için sil. SON iterasyonun H5'leri
-                # kullanıcı inceleyebilsin diye KORUNUR.
-                if iteration < n_iterations:
+                # kullanıcı inceleyebilsin diye KORUNUR; yakınsayıp erken
+                # duracağımız iterasyon da "son" sayılır.
+                if iteration < n_iterations and not converged:
                     n_del_le = self._delete_h5_files(le_results_dir)
                     n_del_jr = self._delete_h5_files(joint_run_dir)
                     self.log(f"  Deleted {n_del_le} H5 file(s) from Load Extraction Results and "
@@ -7616,6 +7796,13 @@ class IterativeFullRunTab:
 
                 self.log(f"\nIteration {iteration}/{n_iterations} complete "
                           f"({time.time() - iter_t_start:.1f}s)")
+
+                if converged:
+                    self.log(f"\nCONVERGED after iteration {iteration}: every Bar Property is within the "
+                              f"target/upper-bound band (or at its minimum / bracketed by the sweep) at the "
+                              f"thickness the FEM was solved with - stopping early"
+                              f"{'' if iteration == n_iterations else f' (skipping iterations {iteration + 1}-{n_iterations})'}.")
+                    break
 
             self.root.after(0, lambda: self.progress_var.set(100))
             self.log(f"\n{'#' * 70}")

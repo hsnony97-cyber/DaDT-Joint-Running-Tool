@@ -198,9 +198,13 @@ class IntegratedBDFRFTool:
         # Pencere başlığı (Windows'ta pencerenin üst çubuğunda görünen yazı).
         self.root.title("DaDT Joint Optimization Tool")
         # Pencerenin açılış boyutu (genişlik x yükseklik, piksel).
-        self.root.geometry("1150x950")
+        # Arayüz büyüdü (yeni Web Flaw sekmeleri): ekrana sığdığı sürece 1500x1000, daha
+        # küçük ekranlarda ekran boyutunun biraz altı.
+        _win_w = min(1500, max(1000, self.root.winfo_screenwidth() - 60))
+        _win_h = min(1000, max(700, self.root.winfo_screenheight() - 100))
+        self.root.geometry(f"{_win_w}x{_win_h}")
         # Pencerenin küçültülebileceği en küçük boyut sınırı.
-        self.root.minsize(1000, 700)
+        self.root.minsize(1200, 750)
         # Yukarıda tanımlanan _configure_app_style() fonksiyonunu çağırıp
         # tüm uygulamanın renk/tema ayarlarını bir kere, en başta uyguluyoruz.
         # Dönen renk sözlüğü self.colors içinde de saklanıyor (ayrıca global
@@ -267,6 +271,8 @@ class IntegratedBDFRFTool:
         _TAB_COLOR_YELLOW = '#eab308'
         _TAB_COLOR_MAROON = '#800000'
         _TAB_COLOR_PURPLE = '#9333ea'
+        _TAB_COLOR_TEAL = '#0d9488'
+        _TAB_COLOR_ORANGE = '#ea580c'
 
         # ---- Sekme 1: BDF Merge Preparation (mavi) ----
         # Bu sekmenin içeriği ayrı bir sınıfa çıkarılmamış; setup_tab1()
@@ -321,6 +327,22 @@ class IntegratedBDFRFTool:
         self.notebook.add(self.tab7, text="\U0001F501  Iterative Full Run")
         self.notebook.tab(self.tab7, image=self._make_tab_icon(_TAB_COLOR_MAROON), compound='left')
         self.tab7_tool = IterativeFullRunTab(self.tab7, self.root, self.tab3_tool, self.tab4_tool, self.tab5_tool)
+
+        # ---- Sekme: Web Flaw Run (turkuaz) ----
+        # Web flaw load extraction + All_Loads_Sta.h5 + Web Flaw exe. Bağımsız
+        # çalışır; aşağıdaki Improved Iterative Full Run da bu nesneyi dışarıdan sürer.
+        self.tab9 = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab9, text="\U0001F9E9  Web Flaw Run")
+        self.notebook.tab(self.tab9, image=self._make_tab_icon(_TAB_COLOR_TEAL), compound='left')
+        self.tab9_tool = WebFlawRunTab(self.tab9, self.root)
+
+        # ---- Sekme: Improved Iterative Full Run (turuncu) ----
+        # Iterative Full Run + her iterasyonda Joint Run'dan sonra Web Flaw Run.
+        self.tab10 = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab10, text="\U0001F680  Improved Iterative Full Run")
+        self.notebook.tab(self.tab10, image=self._make_tab_icon(_TAB_COLOR_ORANGE), compound='left')
+        self.tab10_tool = ImprovedIterativeFullRunTab(self.tab10, self.root, self.tab3_tool, self.tab4_tool,
+                                                      self.tab5_tool, self.tab9_tool)
 
         # ---- Sekme 7: Visualization Results (mor) ----
         # Diğer sekmelerden bağımsız, kendi kendine yeten yeni bir sekme -
@@ -7829,6 +7851,1335 @@ class IterativeFullRunTab:
         t3.maneuver_listbox.delete(0, tk.END)
         for p in t3.maneuver_bdfs:
             t3.maneuver_listbox.insert(tk.END, os.path.basename(p))
+
+
+# ============================================================================
+# Web Flaw yardımcıları  --  WebFlawRunTab ve ImprovedIterativeFullRunTab kullanır
+# ============================================================================
+# Bu bölümdeki fonksiyonlar tamamen yeni; mevcut hiçbir sekme/sınıf bunları
+# kullanmıyor ve onlardan hiçbir şeyi değiştirmiyor.
+
+# _wf_norm: başlık / sayfa adı karşılaştırması için - boşluk, alt çizgi, tire,
+# satır sonu ve büyük/küçük harf farkı yok sayılır ("Min Thick" == "min_thick").
+def _wf_norm(s):
+    return re.sub(r'[\s_\-]+', '', str(s)).lower()
+
+
+# _wf_fmt_t: PSHELL kalınlığını (T) 8 karakterlik sabit alana sığacak şekilde yazar.
+def _wf_fmt_t(t):
+    s = f"{float(t):.4f}"
+    return s if len(s) <= 8 else f"{float(t):.8g}"[:8]
+
+
+# _wf_parse_pshell: bir BDF satırı PSHELL kartının ilk satırıysa (PID, T) döner,
+# değilse None. Üç yazım biçimi desteklenir: sabit 8'lik alan (PSHELL), büyük
+# alan (PSHELL*, 16'lık alanlar) ve serbest biçim (PSHELL,pid,mid,t,...).
+# Kalınlık alanı boşsa T = None döner.
+def _wf_parse_pshell(line):
+    head = line[:8].upper()
+    if not head.startswith('PSHELL'):
+        return None
+    if len(head) > 6 and head[6] not in ' \t,*\r\n':       # PSHELLX gibi başka bir kart adı PSHELL sayılmaz
+        return None
+    try:
+        if head.startswith('PSHELL,'):                       # serbest biçim
+            parts = line.rstrip('\r\n').split(',')
+            pid = int(parts[1].strip())
+            t = float(parts[3].strip()) if len(parts) > 3 and parts[3].strip() else None
+            return 'free', pid, t
+        if head.startswith('PSHELL*'):                       # büyük alan: PID [8:24], T [40:56]
+            pid = int(line[8:24].strip())
+            tt = line[40:56].strip()
+            return 'large', pid, (float(tt) if tt else None)
+        pid = int(line[8:16].strip())                        # sabit alan: PID [8:16], T [24:32]
+        tt = line[24:32].strip()
+        return 'small', pid, (float(tt) if tt else None)
+    except (ValueError, IndexError):
+        return None
+
+
+# _wf_extract_pshell_t: BDF'teki tüm PSHELL kartlarının {PID: T} haritası.
+def _wf_extract_pshell_t(bdf_path):
+    result = {}
+    with open(bdf_path, 'r', encoding='latin-1', newline='') as f:
+        for line in f:
+            parsed = _wf_parse_pshell(line)
+            if parsed and parsed[2] is not None:
+                result[parsed[1]] = parsed[2]
+    return result
+
+
+# _wf_update_pshell_file: src BDF'ini dst'ye yazar; PID'i t_by_pid içinde olan
+# PSHELL kartlarının kalınlığını (T) değiştirir, geri kalan her satır aynen kalır
+# (satır sonları dahil). Dönüş: (güncellenen kart sayısı, bulunan PID kümesi).
+def _wf_update_pshell_file(src, dst, t_by_pid):
+    found = set()
+    n_cards = 0
+    out_lines = []
+    with open(src, 'r', encoding='latin-1', newline='') as f:
+        for line in f:
+            parsed = _wf_parse_pshell(line)
+            if parsed is None or parsed[1] not in t_by_pid:
+                out_lines.append(line)
+                continue
+            kind, pid, _ = parsed
+            t = t_by_pid[pid]
+            eol = '\r\n' if line.endswith('\r\n') else ('\n' if line.endswith('\n') else '')
+            body = line.rstrip('\r\n')
+            if kind == 'free':
+                parts = body.split(',')
+                while len(parts) < 4:
+                    parts.append('')
+                parts[3] = _wf_fmt_t(t)
+                new_body = ','.join(parts)
+            elif kind == 'large':
+                body = body.ljust(56)
+                new_body = body[:40] + f"{float(t):.6f}".rjust(16) + body[56:]
+            else:
+                body = body.ljust(32)
+                new_body = body[:24] + _wf_fmt_t(t).rjust(8) + body[32:]
+            out_lines.append(new_body + eol)
+            found.add(pid)
+            n_cards += 1
+    os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
+    with open(dst, 'w', encoding='latin-1', newline='') as f:
+        f.writelines(out_lines)
+    return n_cards, found
+
+
+# _wf_scale_h5: src_h5'i dst_h5 olarak KOPYALAR (böylece ağaç yapısı birebir aynı
+# kalır), sonra kopyadaki 'ELFORCE_SHELL_COMBINED' grubunun içindeki MX, MY, MXY
+# değerlerini scale ile çarpar. Diğer tüm sütunlar/gruplar dokunulmadan kalır.
+# Desteklenen yerleşimler: (1) compound (yapısal) dataset - MX/MY/MXY alan adları,
+# (2) adı MX/MY/MXY olan tek sütunlu dataset, (3) pandas "fixed" biçimi
+# (blockN_values + blockN_items). Hiçbiri bulunamazsa açıklayıcı bir hata verir.
+# Dönüş: {dataset_yolu: [çarpılan sütun adları]}.
+def _wf_scale_h5(src_h5, dst_h5, scale, group_name='ELFORCE_SHELL_COMBINED',
+                 columns=('MX', 'MY', 'MXY'), log=None):
+    try:
+        import h5py
+    except ImportError:
+        raise RuntimeError("h5py is not installed - run 'pip install h5py' to scale the Web Flaw loads")
+    want = {c.upper() for c in columns}
+    scale = float(scale)
+    if os.path.exists(dst_h5):
+        os.remove(dst_h5)
+    shutil.copy2(src_h5, dst_h5)
+
+    def _dec(x):
+        return x.decode('utf-8', 'ignore') if isinstance(x, (bytes, np.bytes_)) else str(x)
+
+    scaled = {}
+    chunk_rows = 500000
+    with h5py.File(dst_h5, 'r+') as f:
+        # Hedef grubu bul: önce kökte, sonra iç içe (büyük/küçük harf fark etmez).
+        target = None
+        for key in f.keys():
+            if key.strip().upper() == group_name.upper():
+                target = f[key]
+                break
+        if target is None:
+            def _search(name, obj):
+                nonlocal target
+                if target is None and name.split('/')[-1].strip().upper() == group_name.upper():
+                    target = obj
+            f.visititems(_search)
+        if target is None:
+            raise ValueError(f"'{group_name}' not found in {os.path.basename(src_h5)} "
+                             f"(root keys: {list(f.keys())})")
+
+        datasets = []
+        if isinstance(target, h5py.Dataset):
+            datasets.append(target)
+        else:
+            target.visititems(lambda n, o: datasets.append(o) if isinstance(o, h5py.Dataset) else None)
+
+        for ds in datasets:
+            n_rows = ds.shape[0] if ds.shape else 0
+            hit = []
+            if ds.dtype.names:                                # (1) compound dataset
+                hit = [n for n in ds.dtype.names if n.strip().upper() in want]
+                for start in range(0, n_rows, chunk_rows):
+                    arr = ds[start:start + chunk_rows]
+                    for name in hit:
+                        arr[name] = (arr[name].astype(np.float64) * scale).astype(arr.dtype[name])
+                    ds[start:start + chunk_rows] = arr
+            elif ds.name.split('/')[-1].strip().upper() in want and ds.dtype.kind == 'f':   # (2)
+                hit = [ds.name.split('/')[-1]]
+                for start in range(0, n_rows, chunk_rows):
+                    ds[start:start + chunk_rows] = (ds[start:start + chunk_rows].astype(np.float64)
+                                                    * scale).astype(ds.dtype)
+            elif ds.name.endswith('_values') and ds.ndim == 2 and ds.dtype.kind == 'f':      # (3)
+                items_name = ds.name[:-len('_values')] + '_items'
+                if items_name in f:
+                    items = [_dec(x) for x in f[items_name][...]]
+                    cols = [i for i, n in enumerate(items) if n.strip().upper() in want]
+                    hit = [items[i] for i in cols]
+                    for start in range(0, n_rows, chunk_rows):
+                        arr = ds[start:start + chunk_rows]
+                        for i in cols:
+                            arr[:, i] = arr[:, i] * scale
+                        ds[start:start + chunk_rows] = arr
+            if hit:
+                scaled[ds.name] = hit
+        if not scaled:
+            found = [f"{d.name} {d.dtype.names or d.dtype}" for d in datasets][:10]
+            raise ValueError(f"No {'/'.join(columns)} column found under '{group_name}' "
+                             f"(datasets: {found})")
+    if log:
+        for path, cols in scaled.items():
+            log(f"    scaled {', '.join(cols)} x {scale:g}  ({path})")
+    return scaled
+
+
+# ============================================================================
+# WebFlawRunTab  --  "Web Flaw Run" sekmesi
+# ============================================================================
+# Joint Run'a benzer ama web flaw analizi için: (1) Example LE Folder'ın bir
+# kopyasında 'Property_Input' sayfasını Master Input Excel'in
+# 'Web_Flaw_Load_Extraction' sayfasıyla doldurup Load_Ext_H5.exe'yi --mode "All"
+# ile TEK SEFER çalıştırır (All_Loads.h5), (2) All_Loads.h5'i Web Flaw Run
+# klasörüne taşır, (3) ELFORCE_SHELL_COMBINED içindeki MX/MY/MXY'yi kullanıcının
+# scale değeriyle çarpıp aynı ağaç yapısında All_Loads_Sta.h5 üretir, (4) Example
+# Web Flaw Excel'i 'Web_Flaw_Input_Excel_Data' sayfasıyla doldurur ('DaDT/Static
+# Load Extraction .csv Folder Path' = All_Loads*.h5'in klasörü), (5) Web Flaw
+# exe'sini o klasörde çalıştırıp bitmesini bekler ve '*_Prop_Results.xlsx'i okur.
+# Iterative sekmesi bu nesneyi (Full Run'ın tab3/4/5 nesnelerini kullandığı gibi)
+# dışarıdan sürer: StringVar'ları doldurup run_web_flaw()'u çağırır.
+class WebFlawRunTab:
+    def __init__(self, parent_frame, root):
+        self.root = root
+        self.parent_frame = parent_frame
+
+        self.master_input_excel_path = tk.StringVar()   # Web_Flaw_Load_Extraction + Web_Flaw_Input_Excel_Data sayfalarını içeren Excel
+        self.output_folder = tk.StringVar()             # Web Flaw Run klasörü (her şey burada oluşur)
+        self.h5_folder = tk.StringVar()                 # Post Processing H5 sonuçları (Control sayfasına C17+ olarak yazılır)
+        self.maneuver_bdf_path = tk.StringVar()         # çözülmüş maneuver '..._stru.bdf'
+        self.thermal_bdf_path = tk.StringVar()          # çözülmüş thermal '..._stru.bdf'
+        self.pickle_path = tk.StringVar()
+        self.le_example_folder = tk.StringVar()         # Load Extraction şablon klasörü
+        self.le_exe_path = tk.StringVar()               # Load_Ext_H5.exe
+        self.le_max_memory = tk.StringVar(value="50")
+        self.example_excel_path = tk.StringVar()        # Example Web Flaw Excel
+        self.wf_exe_path = tk.StringVar()               # Web Flaw exe
+        self.scale_factor = tk.StringVar(value="1")     # MX/MY/MXY çarpanı
+
+        self.results_df = None                          # son koşunun Prop_Results tablosu
+        self.results_path = None
+        self.is_running = False
+
+        self.setup_ui()
+
+    # ==================== GUI ====================
+    def setup_ui(self):
+        canvas = tk.Canvas(self.parent_frame)
+        scrollbar = ttk.Scrollbar(self.parent_frame, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        main = scrollable_frame
+
+        ttk.Label(main, text="Web Flaw Run", style='Header.TLabel').pack(pady=10)
+        ttk.Label(main, text="Web flaw load extraction (All_Loads.h5) -> scaled All_Loads_Sta.h5 -> "
+                              "Web Flaw Excel -> Web Flaw exe -> *_Prop_Results.xlsx",
+                 style='Subtitle.TLabel').pack()
+
+        # ---- Section 1: Inputs ----
+        f1 = ttk.LabelFrame(main, text="\U0001F4E5  1. Inputs", padding=10)
+        f1.pack(fill=tk.X, pady=5, padx=10)
+        self._add_file_row(f1, "Master Input Excel:", self.master_input_excel_path,
+                            [("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
+        ttk.Label(f1, text="(needs the 'Web_Flaw_Load_Extraction' and 'Web_Flaw_Input_Excel_Data' sheets - "
+                            "never modified)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+        self._add_folder_row(f1, "Web Flaw Run Folder:", self.output_folder)
+        ttk.Label(f1, text="(everything is created here: the Load Extraction copy, All_Loads.h5, "
+                            "All_Loads_Sta.h5, the Web Flaw Excel/exe copy and the results - must NOT be "
+                            "inside the Example LE Folder)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+
+        # ---- Section 2: Web Flaw Load Extraction ----
+        f2 = ttk.LabelFrame(main, text="\U0001F4E6  2. Web Flaw Load Extraction", padding=10)
+        f2.pack(fill=tk.X, pady=5, padx=10)
+        self._add_folder_row(f2, "H5 Folder:", self.h5_folder)
+        self._add_file_row(f2, "BDF (Maneuver):", self.maneuver_bdf_path, [("BDF", "*.bdf *.dat"), ("All", "*.*")])
+        self._add_file_row(f2, "BDF (Thermal):", self.thermal_bdf_path, [("BDF", "*.bdf *.dat"), ("All", "*.*")])
+        self._add_file_row(f2, "Pickle File:", self.pickle_path, [("Pickle", "*.pickle *.pkl"), ("All", "*.*")])
+        self._add_folder_row(f2, "Example LE Folder:", self.le_example_folder)
+        self._add_file_row(f2, "Load Extraction Exe:", self.le_exe_path, [("Executable", "*.exe"), ("All", "*.*")])
+        mem_frame = ttk.Frame(f2)
+        mem_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(mem_frame, text="Max Memory (GB):", width=26).pack(side=tk.LEFT)
+        ttk.Entry(mem_frame, textvariable=self.le_max_memory, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(f2, text="(the same Example LE Folder / exe as Post Processing - runs ONCE with --mode \"All\", "
+                            "'Property_Input' is filled from 'Web_Flaw_Load_Extraction')",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+
+        # ---- Section 3: Web Flaw Run ----
+        f3 = ttk.LabelFrame(main, text="\U0001F9E9  3. Web Flaw Run", padding=10)
+        f3.pack(fill=tk.X, pady=5, padx=10)
+        scale_frame = ttk.Frame(f3)
+        scale_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(scale_frame, text="Scale (MX, MY, MXY):", width=26).pack(side=tk.LEFT)
+        ttk.Entry(scale_frame, textvariable=self.scale_factor, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(scale_frame, text="(ELFORCE_SHELL_COMBINED MX/MY/MXY are multiplied by this -> All_Loads_Sta.h5)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+        self._add_file_row(f3, "Example Web Flaw Excel:", self.example_excel_path,
+                            [("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")])
+        self._add_file_row(f3, "Web Flaw Exe:", self.wf_exe_path, [("Executable", "*.exe"), ("All", "*.*")])
+
+        # ---- Section 4: Actions ----
+        f4 = ttk.LabelFrame(main, text="▶  4. Actions", padding=10)
+        f4.pack(fill=tk.X, pady=5, padx=10)
+        btn_row = ttk.Frame(f4)
+        btn_row.pack(fill=tk.X)
+        self.btn_run = ttk.Button(btn_row, text="▶  RUN", command=self.start_run, style='Accent.TButton')
+        self.btn_run.pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_row, text="Clear Log", command=self.clear_log).pack(side=tk.LEFT, padx=5)
+        ttk.Label(btn_row, text="(Load Extraction -> All_Loads.h5 -> All_Loads_Sta.h5 -> Web Flaw Excel -> exe -> results)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(f4, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, pady=5)
+
+        # ---- Section 5: Log ----
+        f5 = ttk.LabelFrame(main, text="\U0001F4DC  5. Log", padding=10)
+        f5.pack(fill=tk.BOTH, expand=True, pady=5, padx=10)
+        self.log_text = scrolledtext.ScrolledText(f5, height=20, width=100, font=('Consolas', 10),
+                                                    bg=_APP_COLORS['log_bg'], fg=_APP_COLORS['log_fg'],
+                                                    insertbackground=_APP_COLORS['log_fg'], relief='flat',
+                                                    borderwidth=0)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+    def _add_file_row(self, parent, label, var, filetypes):
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X, pady=2)
+        ttk.Label(frame, text=label, width=26).pack(side=tk.LEFT)
+        ttk.Entry(frame, textvariable=var, width=60).pack(side=tk.LEFT, padx=5)
+        ttk.Button(frame, text="Browse", command=lambda: var.set(
+            filedialog.askopenfilename(filetypes=filetypes) or var.get())).pack(side=tk.LEFT)
+
+    def _add_folder_row(self, parent, label, var):
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X, pady=2)
+        ttk.Label(frame, text=label, width=26).pack(side=tk.LEFT)
+        ttk.Entry(frame, textvariable=var, width=60).pack(side=tk.LEFT, padx=5)
+        ttk.Button(frame, text="Browse", command=lambda: var.set(
+            filedialog.askdirectory() or var.get())).pack(side=tk.LEFT)
+
+    def log(self, msg):
+        def _do():
+            self.log_text.insert(tk.END, msg + "\n")
+            self.log_text.see(tk.END)
+        self.root.after(0, _do)
+
+    def clear_log(self):
+        self.log_text.delete(1.0, tk.END)
+
+    def _set_progress(self, p):
+        self.root.after(0, lambda: self.progress_var.set(p))
+
+    # ==================== RUN ====================
+    # start_run: RUN butonu - tüm girdileri baştan doğrular, sonra arka plan
+    # thread'inde _run_pipeline'ı başlatır.
+    def start_run(self):
+        checks = [
+            (self.master_input_excel_path, 'file', "Master Input Excel"),
+            (self.h5_folder, 'dir', "H5 Folder"),
+            (self.maneuver_bdf_path, 'file', "BDF (Maneuver)"),
+            (self.thermal_bdf_path, 'file', "BDF (Thermal)"),
+            (self.pickle_path, 'file', "Pickle File"),
+            (self.le_example_folder, 'dir', "Example LE Folder"),
+            (self.le_exe_path, 'file', "Load Extraction Exe"),
+            (self.example_excel_path, 'file', "Example Web Flaw Excel"),
+            (self.wf_exe_path, 'file', "Web Flaw Exe"),
+        ]
+        for var, kind, label in checks:
+            p = var.get().strip()
+            ok = os.path.isdir(p) if kind == 'dir' else os.path.isfile(p)
+            if not p or not ok:
+                messagebox.showerror("Error", f"Select a valid {label}")
+                return
+        if not self.output_folder.get().strip():
+            messagebox.showerror("Error", "Select a Web Flaw Run Folder")
+            return
+        try:
+            if float(self.le_max_memory.get()) <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            messagebox.showerror("Error", "Max Memory (GB) must be a positive number")
+            return
+        try:
+            float(self.scale_factor.get())
+        except (ValueError, TypeError):
+            messagebox.showerror("Error", "Scale must be a number")
+            return
+        self.is_running = True
+        self.btn_run.config(state=tk.DISABLED)
+        self._set_progress(0)
+        threading.Thread(target=self._run_pipeline, daemon=True).start()
+
+    def _run_pipeline(self):
+        t_start = time.time()
+        try:
+            df = self.run_web_flaw()
+            self._set_progress(100)
+            self.log(f"\nWEB FLAW RUN COMPLETE: {len(df)} element row(s), "
+                      f"{df['Property'].nunique()} property(ies) (total {time.time() - t_start:.1f}s)")
+        except Exception as e:
+            self.log(f"\nERROR after {time.time() - t_start:.1f}s: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
+
+    # ---- küçük yardımcılar ----
+    @staticmethod
+    def _read_master_sheet(master_path, norm_name):
+        """Master Excel'den normalize adı norm_name olan sayfayı DataFrame olarak oku."""
+        xl = pd.ExcelFile(master_path)
+        for sheet in xl.sheet_names:
+            if _wf_norm(sheet) == norm_name:
+                return pd.read_excel(xl, sheet_name=sheet)
+        raise ValueError(f"No '{norm_name}' sheet found in {os.path.basename(master_path)} "
+                         f"(sheets: {xl.sheet_names})")
+
+    @staticmethod
+    def _find_file(folder, name_lower):
+        """folder altında (rekürsif) adı name_lower olan ilk dosya (büyük/küçük harf fark etmez)."""
+        for dirpath, _, filenames in os.walk(folder):
+            for fn in filenames:
+                if fn.lower() == name_lower:
+                    return os.path.join(dirpath, fn)
+        return None
+
+    def _wait_for_exe_to_finish(self, exe_name, poll_seconds=10, max_wait_seconds=12 * 3600):
+        """cmd /c bat döndükten sonra exe hâlâ çalışıyor olabilir (arka plana atmış olabilir) -
+        tasklist ile imaj adına göre bitmesini bekle."""
+        waited = 0
+        while waited < max_wait_seconds:
+            try:
+                result = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {exe_name}"],
+                                         capture_output=True, text=True)
+                if exe_name.lower() not in result.stdout.lower():
+                    return
+            except Exception:
+                return          # tasklist yok/çalışmıyor - bekleme yapmadan devam et
+            time.sleep(poll_seconds)
+            waited += poll_seconds
+        self.log(f"  WARNING: gave up waiting for '{exe_name}' after {waited}s - proceeding anyway.")
+
+    # ==================== ASIL İŞ ====================
+    # run_web_flaw: 5 aşamayı sırayla çalıştırır ve Prop_Results tablosunu
+    # (Element, Property, Material, Thickness, Life_of_Element, Angle) döndürür.
+    # Hata olursa istisna fırlatır (çağıran taraf loglayıp durdurur).
+    def run_web_flaw(self):
+        t_start = time.time()
+        master = self.master_input_excel_path.get().strip()
+        out_dir = os.path.abspath(self.output_folder.get().strip())
+        example_le = os.path.abspath(self.le_example_folder.get().strip())
+        scale = float(self.scale_factor.get())
+        self.results_df = None
+        self.results_path = None
+
+        # Çıktı klasörü şablonun İÇİNDEYSE copytree kendi kendini sonsuza kadar kopyalar.
+        try:
+            inside = os.path.commonpath([out_dir, example_le]) == example_le
+        except ValueError:
+            inside = False
+        if inside:
+            raise RuntimeError(f"Web Flaw Run Folder ({out_dir}) is inside the Example LE Folder "
+                               f"({example_le}) - choose a folder outside it")
+        os.makedirs(out_dir, exist_ok=True)
+
+        self.log("\n" + "=" * 70)
+        self.log("WEB FLAW RUN")
+        self.log("=" * 70)
+
+        # ---- 1. Load Extraction klasörünü hazırla ----
+        self.log("\n--- Web Flaw Load Extraction: preparing ---")
+        le_dir = os.path.join(out_dir, "Web_Flaw_Load_Extraction")
+        if os.path.isdir(le_dir):
+            shutil.rmtree(le_dir)
+        shutil.copytree(example_le, le_dir)
+        self.log(f"  Template copied to: {le_dir}")
+        tfx_path = PostProcessingTab._find_tfx_workbook_path(le_dir)
+        if not tfx_path:
+            raise RuntimeError("No '...Load_Extraction....xls*' workbook found in the copied Example LE Folder")
+        if tfx_path.lower().endswith('.xlsb'):
+            raise RuntimeError(f"{os.path.basename(tfx_path)} is a binary .xlsb workbook - openpyxl can't edit it")
+
+        le_df = self._read_master_sheet(master, 'webflawloadextraction')
+        self.log(f"  Read 'Web_Flaw_Load_Extraction': {len(le_df)} row(s)")
+        keep_vba = tfx_path.lower().endswith(('.xlsm', '.xltm', '.xlam'))
+        wb = openpyxl.load_workbook(tfx_path, keep_vba=keep_vba)
+        data_ws = None
+        for ws in wb.worksheets:
+            if _wf_norm(ws.title) == 'propertyinput':
+                data_ws = ws
+                break
+        if data_ws is None:
+            raise RuntimeError(f"No 'Property_Input' sheet in {os.path.basename(tfx_path)} "
+                               f"(sheets: {wb.sheetnames})")
+        # Başlık satırından (1. satır) sütun adı -> sütun numarası haritası.
+        header_map = {}
+        for cell in next(data_ws.iter_rows(min_row=1, max_row=1)):
+            if cell.value:
+                header_map[_wf_norm(cell.value)] = cell.column
+        for col_idx in header_map.values():               # eski örnek satırları temizle
+            for r in range(2, 2002):
+                data_ws.cell(row=r, column=col_idx).value = None
+        for r_off, (_, row) in enumerate(le_df.iterrows()):
+            for col_name in le_df.columns:
+                col_idx = header_map.get(_wf_norm(col_name))
+                if col_idx:
+                    val = row[col_name]
+                    data_ws.cell(row=r_off + 2, column=col_idx).value = None if pd.isna(val) else val
+        self.log(f"  Wrote {len(le_df)} row(s) into '{data_ws.title}'")
+
+        # Control sayfası: C9/C10/C11 (maneuver/thermal BDF, pickle) ve C17+ (H5 yolları).
+        h5_files = []
+        for dirpath, _, filenames in os.walk(self.h5_folder.get().strip()):
+            for fn in filenames:
+                if fn.lower().endswith('.h5') and not fn.lower().startswith('all_loads'):
+                    h5_files.append(os.path.join(dirpath, fn))
+        h5_files.sort()
+        man_bdf = self.maneuver_bdf_path.get().strip()
+        thm_bdf = self.thermal_bdf_path.get().strip()
+        pickle_path = self.pickle_path.get().strip()
+        control_ws = PostProcessingTab._find_control_sheet(wb, "BDF File for Sprung System")
+        if control_ws is None:
+            self.log("  WARNING: no control sheet (with 'BDF File for Sprung System') found - "
+                      "C9/C10/C11/C17+ not written.")
+        else:
+            control_ws['C9'] = man_bdf
+            control_ws['C10'] = thm_bdf
+            control_ws['C11'] = pickle_path
+            for r in range(17, 2017):
+                control_ws.cell(row=r, column=3).value = None
+            for r_off, p in enumerate(h5_files):
+                control_ws.cell(row=17 + r_off, column=3).value = p
+            self.log(f"  Wrote C9/C10/C11 and {len(h5_files)} H5 path(s) from C17 into '{control_ws.title}'")
+        wb.save(tfx_path)
+        self._set_progress(15)
+
+        # ---- 2. Load_Ext_H5.exe'yi --mode "All" ile TEK SEFER çalıştır ve bitmesini bekle ----
+        self.log("\n--- Web Flaw Load Extraction: running (--mode \"All\") ---")
+        exe_path = self.le_exe_path.get().strip()
+        exe_dir = os.path.dirname(exe_path) or None
+        exe_name = os.path.basename(exe_path)
+        cmd_line = (
+            f'{exe_name} --mode "All" --bdf "{man_bdf}" --sprung-bdf "{thm_bdf}" '
+            f'--xls "{tfx_path}" --cid "Material" --nsigma "1.28" --pickle "{pickle_path}" '
+            f'--preproc "HM" --stress_output "NO" --output_coord "Buckling" --skin-angle-limit "30" '
+            f'--max-memory {self.le_max_memory.get().strip()} --machine "Local"'
+        )
+        bat_path = os.path.join(le_dir, "loadext.bat")
+        with open(bat_path, 'w', encoding='latin-1') as f:
+            f.write(f'cd /d "{exe_dir}"\n{cmd_line}\n')
+        log_path = os.path.join(le_dir, "loadext_log.txt")
+        self.log(f"  Batch file written: {bat_path}")
+        t_le = time.time()
+        with open(log_path, 'w') as log_file:
+            subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, stdout=log_file, stderr=subprocess.STDOUT)
+        self._wait_for_exe_to_finish(exe_name)
+        self.log(f"  Load Extraction finished (took {time.time() - t_le:.1f}s)")
+
+        found = self._find_file(le_dir, 'all_loads.h5')
+        if not found:
+            tail = ""
+            try:
+                with open(log_path, 'r', errors='replace') as lf:
+                    tail = "".join(lf.readlines()[-15:])
+            except OSError:
+                pass
+            raise RuntimeError(f"All_Loads.h5 was not produced under {le_dir}. Last lines of "
+                               f"loadext_log.txt:\n{tail}")
+        all_loads = os.path.join(out_dir, "All_Loads.h5")
+        if os.path.exists(all_loads):
+            os.remove(all_loads)
+        shutil.move(found, all_loads)
+        self.log(f"  All_Loads.h5 moved to: {all_loads}")
+        self._set_progress(45)
+
+        # ---- 3. All_Loads_Sta.h5: MX/MY/MXY x scale ----
+        self.log(f"\n--- All_Loads_Sta.h5 (scale {scale:g}) ---")
+        sta = os.path.join(out_dir, "All_Loads_Sta.h5")
+        _wf_scale_h5(all_loads, sta, scale, log=self.log)
+        self.log(f"  All_Loads_Sta.h5 written: {sta}")
+        self._set_progress(60)
+
+        # ---- 4. Web Flaw Excel'i doldur ----
+        self.log("\n--- Web Flaw Excel ---")
+        example_xl = self.example_excel_path.get().strip()
+        wf_xl = os.path.join(out_dir, os.path.basename(example_xl))    # exe adı Excel adından türetiyor olabilir: adı KORU
+        shutil.copy2(example_xl, wf_xl)
+        input_df = self._read_master_sheet(master, 'webflawinputexceldata')
+        self.log(f"  Read 'Web_Flaw_Input_Excel_Data': {len(input_df)} row(s)")
+        keep_vba = wf_xl.lower().endswith(('.xlsm', '.xltm', '.xlam'))
+        wb = openpyxl.load_workbook(wf_xl, keep_vba=keep_vba)
+        target_ws, header_row = None, None
+        for ws in wb.worksheets:
+            for r in range(1, 11):
+                norms = {_wf_norm(c.value) for c in ws[r] if c.value}
+                if 'elementid' in norms and 'minthick' in norms:
+                    target_ws, header_row = ws, r
+                    break
+            if target_ws is not None:
+                break
+        if target_ws is None:
+            raise RuntimeError(f"No sheet with 'Element ID' and 'Min Thick' headers found in "
+                               f"{os.path.basename(wf_xl)} (sheets: {wb.sheetnames})")
+        xl_header = {}
+        for cell in target_ws[header_row]:
+            if cell.value:
+                xl_header[_wf_norm(cell.value)] = cell.column
+        for col_idx in xl_header.values():
+            for r in range(header_row + 1, header_row + 2001):
+                target_ws.cell(row=r, column=col_idx).value = None
+        data_by_norm = {_wf_norm(c): c for c in input_df.columns}
+        for r_off, (_, row) in enumerate(input_df.iterrows()):
+            r = header_row + 1 + r_off
+            for norm, col_idx in xl_header.items():
+                if 'dadtloadextraction' in norm:             # DaDT Load Extraction .csv Folder Path
+                    target_ws.cell(row=r, column=col_idx).value = out_dir
+                elif 'staticloadextraction' in norm:         # Static Load Extraction .csv Folder Path
+                    target_ws.cell(row=r, column=col_idx).value = out_dir
+                elif norm in data_by_norm:
+                    val = row[data_by_norm[norm]]
+                    target_ws.cell(row=r, column=col_idx).value = None if pd.isna(val) else val
+        wb.save(wf_xl)
+        self.log(f"  Wrote {len(input_df)} row(s) into '{target_ws.title}' ({os.path.basename(wf_xl)}); "
+                  f"both Load Extraction paths = {out_dir}")
+        self._set_progress(70)
+
+        # ---- 5. Web Flaw exe'sini klasörde çalıştır, bitmesini bekle, sonucu oku ----
+        self.log("\n--- Web Flaw exe ---")
+        for fn in os.listdir(out_dir):                        # eski sonuç dosyası yeni sanılmasın
+            if fn.lower().endswith('_prop_results.xlsx'):
+                os.remove(os.path.join(out_dir, fn))
+        wf_exe = self.wf_exe_path.get().strip()
+        local_exe = os.path.join(out_dir, os.path.basename(wf_exe))
+        shutil.copy2(wf_exe, local_exe)
+        wf_log = os.path.join(out_dir, "web_flaw_log.txt")
+        t_wf = time.time()
+        with open(wf_log, 'w') as log_file:
+            result = subprocess.run([local_exe], cwd=out_dir, stdout=log_file, stderr=subprocess.STDOUT)
+        self.log(f"  Web Flaw exe finished (exit code {result.returncode}, took {time.time() - t_wf:.1f}s)")
+        if result.returncode != 0:
+            self.log(f"  WARNING: non-zero exit code - see {wf_log}")
+
+        candidates = [os.path.join(out_dir, fn) for fn in os.listdir(out_dir)
+                      if fn.lower().endswith('_prop_results.xlsx')]
+        if not candidates:
+            raise RuntimeError(f"No '*_Prop_Results.xlsx' appeared in {out_dir} - see {wf_log}")
+        res_path = max(candidates, key=os.path.getmtime)
+        raw = pd.read_excel(res_path)
+        canon = {'element': 'Element', 'property': 'Property', 'material': 'Material',
+                 'thickness': 'Thickness', 'lifeofelement': 'Life_of_Element', 'angle': 'Angle'}
+        raw = raw.rename(columns={c: canon[_wf_norm(c)] for c in raw.columns if _wf_norm(c) in canon})
+        missing = [c for c in ('Element', 'Property', 'Thickness', 'Life_of_Element') if c not in raw.columns]
+        if missing:
+            raise RuntimeError(f"{os.path.basename(res_path)} lacks column(s) {missing} "
+                               f"(found: {list(raw.columns)})")
+        for c in ('Element', 'Property'):
+            raw[c] = pd.to_numeric(raw[c], errors='coerce')
+        raw = raw.dropna(subset=['Property']).copy()
+        raw['Property'] = raw['Property'].astype(int)
+        for c in ('Thickness', 'Life_of_Element'):
+            raw[c] = pd.to_numeric(raw[c], errors='coerce')
+        self.results_df = raw
+        self.results_path = res_path
+        self.log(f"  Read {os.path.basename(res_path)}: {len(raw)} element row(s), "
+                  f"{raw['Property'].nunique()} propert(ies)")
+        self.log(f"\nWEB FLAW RUN finished in {time.time() - t_start:.1f}s")
+        return raw
+
+
+# ============================================================================
+# ImprovedIterativeFullRunTab  --  "Improved Iterative Full Run" sekmesi
+# ============================================================================
+# Iterative Full Run'ın (Upper Bound / % azaltma / erken yakınsama dahil) aynı
+# mantığı + her iterasyonda Joint Run'dan SONRA bir Web Flaw aşaması:
+#   - her iterasyonun başında 'Web Property' kalınlıkları, BDF'lerin çalışma
+#     kopyalarındaki PSHELL kartlarına yazılır (offset yok),
+#   - çözümden sonra gerçekten çözülen web kalınlığı 'Web_Flaw_Input_Excel_Data'
+#     sayfasının 'Min Thick' sütununa yazılır (Joint'teki t1/tfem mantığı),
+#   - Joint Run bitince Web Flaw Run çalışır (WebFlawRunTab nesnesi sürülür),
+#   - Prop_Results'tan her Web Property'nin sonraki kalınlığı, Joint'tekiyle
+#     AYNI karar fonksiyonuyla (_decide_next_thicknesses) belirlenir ve sonraki
+#     iterasyonun başında 'Web Property' sayfasına yazılır.
+# Bu sınıf IterativeFullRunTab'ı MİRAS alır (arayüz + yardımcı metodlar orada
+# duruyor); o sınıfın kendisi hiç değiştirilmedi. _run_pipeline, onun
+# kaynağından türetilip web adımları eklenmiş halidir.
+class ImprovedIterativeFullRunTab(IterativeFullRunTab):
+    def __init__(self, parent_frame, root, tab3_tool, tab4_tool, tab5_tool, webflaw_tool):
+        self.webflaw_tool = webflaw_tool                     # WebFlawRunTab nesnesi (dışarıdan sürülür)
+        self.wf_le_example_folder = tk.StringVar()           # boşsa Post Processing'in Example LE Folder'ı kullanılır
+        self.wf_example_excel_path = tk.StringVar()
+        self.wf_exe_path = tk.StringVar()
+        self.wf_scale_factor = tk.StringVar(value="1")
+        super().__init__(parent_frame, root, tab3_tool, tab4_tool, tab5_tool)
+
+    # setup_ui: temel arayüzü kurar, sonra 'Actions' bölümünün hemen önüne
+    # "Web Flaw Run" bölümünü ekler ve başlığı günceller.
+    def setup_ui(self):
+        super().setup_ui()
+        w = self.log_text
+        while not isinstance(w, ttk.LabelFrame):             # ScrolledText -> iç Frame -> Log LabelFrame
+            w = w.master
+        log_frame = w
+        main = log_frame.master
+        children = main.winfo_children()
+        # children: [başlık, alt başlık, 1.Solver, 2.Post, 3.Joint, 4.Iteration, 5.Actions, 6.Log] ->
+        # Web Flaw bölümü '3. Joint Run'ın hemen altına (4. Iteration Settings'in önüne) girer.
+        iteration_frame = children[children.index(log_frame) - 2]
+        children[0].config(text="Improved Iterative Full Run")
+        children[1].config(text="Iterative Full Run + Web Flaw Run after every Joint Run - Bar Property AND "
+                                 "Web Property thicknesses are fed back each iteration")
+
+        wf = ttk.LabelFrame(main, text="\U0001F9E9  3b. Web Flaw Run (after Joint Run)", padding=10)
+        wf.pack(fill=tk.X, pady=5, padx=10, before=iteration_frame)
+
+        def _row(label, var, browse):
+            fr = ttk.Frame(wf)
+            fr.pack(fill=tk.X, pady=2)
+            ttk.Label(fr, text=label, width=28).pack(side=tk.LEFT)
+            ttk.Entry(fr, textvariable=var, width=45).pack(side=tk.LEFT, padx=5)
+            if browse == 'dir':
+                ttk.Button(fr, text="Browse", command=lambda: var.set(filedialog.askdirectory() or var.get())).pack(side=tk.LEFT)
+            elif browse == 'exe':
+                ttk.Button(fr, text="Browse", command=lambda: var.set(filedialog.askopenfilename(
+                    filetypes=[("Executable", "*.exe"), ("All", "*.*")]) or var.get())).pack(side=tk.LEFT)
+            else:
+                ttk.Button(fr, text="Browse", command=lambda: var.set(filedialog.askopenfilename(
+                    filetypes=[("Excel", "*.xlsx *.xlsm *.xls"), ("All", "*.*")]) or var.get())).pack(side=tk.LEFT)
+
+        _row("Example Web Flaw LE Folder:", self.wf_le_example_folder, 'dir')
+        ttk.Label(wf, text="(optional - blank = the Example LE Folder from Post Processing above; Load Extraction "
+                            "runs once per iteration with --mode \"All\", 'Property_Input' is filled from "
+                            "'Web_Flaw_Load_Extraction')",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(0, 2))
+        _row("Example Web Flaw Excel:", self.wf_example_excel_path, 'xl')
+        _row("Web Flaw Exe:", self.wf_exe_path, 'exe')
+        sc = ttk.Frame(wf)
+        sc.pack(fill=tk.X, pady=2)
+        ttk.Label(sc, text="Scale (MX, MY, MXY):", width=28).pack(side=tk.LEFT)
+        ttk.Entry(sc, textvariable=self.wf_scale_factor, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(sc, text="(All_Loads.h5 -> All_Loads_Sta.h5)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+        ttk.Label(wf, text="(needs the 'Web Property', 'Web_Flaw_Input_Excel_Data' and 'Web_Flaw_Load_Extraction' "
+                            "sheets in the Master Input Excel; Target Flight Hours / Upper Bound / Reduce % in "
+                            "section 4 apply to the Web Properties too)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(anchor=tk.W, pady=(4, 2))
+
+    # start_run: web alanlarını + Master Excel'deki 3 web sayfasını doğrular,
+    # sonra temel (Iterative) doğrulamaları ve thread başlatmayı yapar.
+    def start_run(self):
+        master = self.master_input_excel_path.get().strip()
+        if master and os.path.exists(master):
+            try:
+                wb = openpyxl.load_workbook(master, read_only=True, data_only=True)
+                names = {_wf_norm(n) for n in wb.sheetnames}
+                wb.close()
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not read the Master Input Excel: {e}")
+                return
+            for need, label in (('webproperty', 'Web Property'),
+                                 ('webflawinputexceldata', 'Web_Flaw_Input_Excel_Data'),
+                                 ('webflawloadextraction', 'Web_Flaw_Load_Extraction')):
+                if need not in names:
+                    messagebox.showerror("Error", f"The Master Input Excel has no '{label}' sheet")
+                    return
+            le_folder = self.wf_le_example_folder.get().strip() or self.le_example_folder.get().strip()
+            if not le_folder or not os.path.isdir(le_folder):
+                messagebox.showerror("Error", "Select a valid Example LE Folder (or Example Web Flaw LE Folder)")
+                return
+            if not self.wf_example_excel_path.get().strip() or not os.path.isfile(self.wf_example_excel_path.get().strip()):
+                messagebox.showerror("Error", "Select a valid Example Web Flaw Excel")
+                return
+            if not self.wf_exe_path.get().strip() or not os.path.isfile(self.wf_exe_path.get().strip()):
+                messagebox.showerror("Error", "Select a valid Web Flaw Exe")
+                return
+            try:
+                float(self.wf_scale_factor.get())
+            except (ValueError, TypeError):
+                messagebox.showerror("Error", "Web Flaw Scale must be a number")
+                return
+        super().start_run()
+
+    # ==================== WEB PROPERTY / WEB FLAW EXCEL YARDIMCILARI ====================
+    # _read_web_property: 'Web Property' sayfasından {Web Property ID: Thickness}.
+    def _read_web_property(self, excel_path):
+        df = WebFlawRunTab._read_master_sheet(excel_path, 'webproperty')
+        norm = {_wf_norm(c): c for c in df.columns}
+        pid_col = norm.get('webpropertyid', df.columns[0])
+        t_col = norm.get('thickness', df.columns[1] if len(df.columns) > 1 else None)
+        out = {}
+        for _, r in df.iterrows():
+            try:
+                pid = int(r[pid_col])
+                t = float(r[t_col])
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(t) and t > 0:
+                out[pid] = t
+        return out
+
+    # _update_web_property_thickness: 'Web Property' sayfasının Thickness sütununu
+    # prop_map ({PID: yeni kalınlık}) ile günceller (bir sonraki iterasyon için).
+    def _update_web_property_thickness(self, excel_path, prop_map):
+        keep_vba = excel_path.lower().endswith(('.xlsm', '.xltm', '.xlam'))
+        wb = openpyxl.load_workbook(excel_path, keep_vba=keep_vba)
+        ws = next((s for s in wb.worksheets if _wf_norm(s.title) == 'webproperty'), None)
+        if ws is None:
+            self.log("  WARNING: no 'Web Property' sheet found - web thicknesses not updated.")
+            return 0
+        hdr = {_wf_norm(c.value): c.column for c in ws[1] if c.value}
+        pid_col = hdr.get('webpropertyid', 1)
+        t_col = hdr.get('thickness', 2)
+        n = 0
+        for row in range(2, ws.max_row + 1):
+            v = ws.cell(row=row, column=pid_col).value
+            if v is None:
+                continue
+            try:
+                pid = int(v)
+            except (TypeError, ValueError):
+                continue
+            if pid in prop_map:
+                ws.cell(row=row, column=t_col).value = prop_map[pid]
+                n += 1
+        self._save_working_excel(wb, excel_path)
+        self.log(f"  Updated Thickness for {n} Web Property row(s) from the previous iteration's web flaw sizing")
+        return n
+
+    # _prepare_web_bdfs: kullanıcının BDF'lerinin (All BDF Files + Maneuver) çalışma
+    # kopyalarını <output>/_WebPSHELL_Iteration_N altına yazar; 'Web Property'deki
+    # PID'lerin PSHELL kalınlığı (T) güncellenir. Dönüş: {orijinal yol: kopya yolu}.
+    def _prepare_web_bdfs(self, working_excel, output_base, iteration):
+        web_thk = self._read_web_property(working_excel)
+        if not web_thk:
+            self.log("  WARNING: 'Web Property' sheet has no usable rows - PSHELL thicknesses left as in the BDFs.")
+            return {}
+        # Skin Property sayfasıyla çakışma: Nastran Solver skin kalınlığını sonradan ezer.
+        try:
+            skin_df = WebFlawRunTab._read_master_sheet(working_excel, 'skinproperty')
+            skin_pids = set()
+            for v in skin_df.iloc[:, 0].tolist():
+                try:
+                    skin_pids.add(int(v))
+                except (TypeError, ValueError):
+                    pass
+            overlap = sorted(skin_pids & set(web_thk))
+            if overlap:
+                self.log(f"  WARNING: Web Property ID(s) {overlap[:10]} are ALSO in 'Skin Property' - "
+                          f"the Skin Property thickness will win in the solve.")
+        except ValueError:
+            pass
+        prev_dir = os.path.join(output_base, f"_WebPSHELL_Iteration_{iteration - 1}")
+        if iteration > 1 and os.path.isdir(prev_dir):
+            shutil.rmtree(prev_dir, ignore_errors=True)       # önceki iterasyonun kopyaları artık gerekmiyor
+        dest_root = os.path.join(output_base, f"_WebPSHELL_Iteration_{iteration}")
+        os.makedirs(dest_root, exist_ok=True)
+        mapping = {}
+        found_all = set()
+        originals = []
+        for p in list(self.bdf_paths) + list(self.maneuver_bdfs):
+            if p not in originals:
+                originals.append(p)
+        for idx, p in enumerate(originals):
+            dst = os.path.join(dest_root, f"{idx:02d}", os.path.basename(p))
+            n_cards, found = _wf_update_pshell_file(p, dst, web_thk)
+            mapping[p] = dst
+            found_all |= found
+            self.log(f"    {os.path.basename(p)}: {n_cards} PSHELL card(s) set to the Web Property thickness")
+        missing = sorted(set(web_thk) - found_all)
+        if missing:
+            self.log(f"  WARNING: Web Property ID(s) {missing[:15]} have no PSHELL card in any BDF.")
+        self.log(f"  Web Property thicknesses applied to {len(found_all)}/{len(web_thk)} propert(ies) "
+                  f"(BDF working copies in {dest_root})")
+        return mapping
+
+    # _read_solved_web_thickness: çözülmüş '..._stru.bdf' dosyalarından web PID'lerinin PSHELL T değeri.
+    def _read_solved_web_thickness(self, stru_bdfs, working_excel):
+        web_pids = set(self._read_web_property(working_excel))
+        solved = {}
+        for p in stru_bdfs:
+            for pid, t in _wf_extract_pshell_t(p).items():
+                if pid in web_pids:
+                    if pid in solved and abs(solved[pid] - t) > 1e-6:
+                        self.log(f"  WARNING: Web Property {pid} has different PSHELL thicknesses in the solved "
+                                  f"BDFs ({solved[pid]} vs {t}) - using the first.")
+                        continue
+                    solved.setdefault(pid, t)
+        self.log(f"  Read {len(solved)} solved Web Property PSHELL thickness(es) from {len(stru_bdfs)} BDF(s)")
+        return solved
+
+    # _update_web_flaw_min_thick: 'Web_Flaw_Input_Excel_Data'nın 'Min Thick' sütununu
+    # (Joint'teki t1(mm) gibi) çözülen kalınlıkla doldurur; satırlar 'Property ID'
+    # ile eşleşir. İLK çağrıda her property'nin ORİJİNAL Min Thick değeri taban
+    # (floor) olarak yakalanır. Max Thick, Thick Inc vb. hiçbir sütuna dokunulmaz.
+    def _update_web_flaw_min_thick(self, excel_path, solved_by_pid):
+        collect_floor = getattr(self, '_web_floor_by_pid', 'missing') is None
+        new_floors = {}
+        keep_vba = excel_path.lower().endswith(('.xlsm', '.xltm', '.xlam'))
+        wb = openpyxl.load_workbook(excel_path, keep_vba=keep_vba)
+        ws = next((s for s in wb.worksheets if _wf_norm(s.title) == 'webflawinputexceldata'), None)
+        if ws is None:
+            self.log("  WARNING: no 'Web_Flaw_Input_Excel_Data' sheet found - Min Thick not updated.")
+            return 0
+        hdr = {_wf_norm(c.value): c.column for c in ws[1] if c.value}
+        pid_col, min_col, max_col = hdr.get('propertyid'), hdr.get('minthick'), hdr.get('maxthick')
+        if pid_col is None or min_col is None:
+            self.log("  WARNING: 'Web_Flaw_Input_Excel_Data' needs 'Property ID' and 'Min Thick' headers - "
+                      "Min Thick not updated.")
+            return 0
+        n = 0
+        for row in range(2, ws.max_row + 1):
+            v = ws.cell(row=row, column=pid_col).value
+            if v is None:
+                continue
+            try:
+                pid = int(v)
+            except (TypeError, ValueError):
+                continue
+            if collect_floor:
+                try:
+                    orig = float(ws.cell(row=row, column=min_col).value)
+                    if np.isfinite(orig) and orig > 0:
+                        new_floors[pid] = max(new_floors.get(pid, 0.0), orig)
+                except (TypeError, ValueError):
+                    pass
+            if pid in solved_by_pid:
+                ws.cell(row=row, column=min_col).value = solved_by_pid[pid]
+                n += 1
+                if max_col is not None:
+                    try:
+                        if float(ws.cell(row=row, column=max_col).value) < solved_by_pid[pid]:
+                            self.log(f"  WARNING: Web Property {pid}: Min Thick {solved_by_pid[pid]} is above "
+                                      f"Max Thick {ws.cell(row=row, column=max_col).value} - the sweep will be empty.")
+                    except (TypeError, ValueError):
+                        pass
+        if collect_floor:
+            self._web_floor_by_pid = new_floors
+        self._save_working_excel(wb, excel_path)
+        self.log(f"  Min Thick updated for {n} Web_Flaw_Input_Excel_Data row(s) from the solved PSHELL thickness")
+        return n
+
+    # _run_web_flaw_stage: WebFlawRunTab nesnesinin alanlarını doldurup run_web_flaw()'u çağırır.
+    def _run_web_flaw_stage(self, working_excel, h5_results_dir, maneuver_stru, thermal_stru, web_flaw_dir,
+                            target_life):
+        # Excel'deki 'Life (Factored Flight Hour)' hedeften farklıysa bir kez uyar (karar hedefe göre verilir).
+        try:
+            idf = WebFlawRunTab._read_master_sheet(working_excel, 'webflawinputexceldata')
+            life_col = next((c for c in idf.columns if _wf_norm(c).startswith('lifefactored')), None)
+            if life_col is not None:
+                vals = pd.to_numeric(idf[life_col], errors='coerce').dropna().unique()
+                if len(vals) and any(abs(v - target_life) > 1e-6 for v in vals):
+                    self.log(f"  NOTE: 'Life (Factored Flight Hour)' in Web_Flaw_Input_Excel_Data is "
+                              f"{sorted(set(float(v) for v in vals))[:5]} but Target Flight Hours is {target_life:g} - "
+                              f"the web exe sizes to the Excel value, the iteration decision uses the target.")
+        except ValueError:
+            pass
+        wf = self.webflaw_tool
+        wf.master_input_excel_path.set(working_excel)
+        wf.output_folder.set(web_flaw_dir)
+        wf.h5_folder.set(h5_results_dir)
+        wf.maneuver_bdf_path.set(maneuver_stru or "")
+        wf.thermal_bdf_path.set(thermal_stru or "")
+        wf.pickle_path.set(self.le_pickle_path.get())
+        wf.le_example_folder.set(self.wf_le_example_folder.get().strip() or self.le_example_folder.get().strip())
+        wf.le_exe_path.set(self.le_exe_path.get())
+        wf.le_max_memory.set(self.le_max_memory.get())
+        wf.example_excel_path.set(self.wf_example_excel_path.get())
+        wf.wf_exe_path.set(self.wf_exe_path.get())
+        wf.scale_factor.set(self.wf_scale_factor.get())
+        return wf.run_web_flaw()
+
+    # _decide_web_thicknesses: Prop_Results'tan Web Property bazında sonraki kalınlığı belirler.
+    # Property kalınlığı = elemanlarının istediği EN KALIN değer; o kalınlığı belirleyen
+    # (aynı kalınlıkta en düşük ömürlü) eleman 'governing' sayılır. Karar, Joint'tekiyle
+    # AYNI _decide_next_thicknesses fonksiyonuyla verilir: web exe taramaya Min Thick'ten
+    # (= çözülen kalınlık) başladığı için "sized > solved" = daha ince bir satır başarısız
+    # oldu (bracketed); sized == solved ve ömür > Upper = daha inceye inilebilir (reduce).
+    # Dönüş: (sonraki_kalınlık_haritası, kayıtlar, yakınsadı_mı)
+    def _decide_web_thicknesses(self, results_df, target_life, upper_life, reduction_pct,
+                                floor_by_pid, solved_by_pid):
+        rows_prop, rows_full = [], []
+        for pid, g in results_df.groupby('Property'):
+            g = g.dropna(subset=['Thickness'])
+            if g.empty:
+                continue
+            t_s = float(g['Thickness'].max())
+            gov = g[np.isclose(g['Thickness'], t_s)].sort_values('Life_of_Element', na_position='first')
+            life = gov['Life_of_Element'].iloc[0]
+            eid0 = gov['Element'].iloc[0]
+            rows_prop.append({'Bar Property ID': int(pid), 'Bar Element ID': int(eid0) if pd.notna(eid0) else -1,
+                              't(mm)': t_s, 'Life': life})
+            start_t = solved_by_pid.get(int(pid))
+            if start_t is not None:
+                for e in g['Element'].tolist():
+                    rows_full.append({'Bar Element ID': int(e) if pd.notna(e) else -1, 't(mm)': start_t})
+        missing = sorted(set(solved_by_pid) - {r['Bar Property ID'] for r in rows_prop})
+        if missing:
+            self.log(f"  WARNING: no Prop_Results rows for Web Property ID(s) {missing[:15]} - thickness kept.")
+        if not rows_prop:
+            return {}, [], False
+        next_map, records, converged = self._decide_next_thicknesses(
+            pd.DataFrame(rows_prop), 't(mm)', pd.DataFrame(rows_full), target_life, upper_life,
+            reduction_pct, floor_by_pid, solved_by_pid)
+        for r in records:
+            r['Web Property ID'] = r.pop('Bar Property ID')
+        # Sonuçta olmayan (eksik) web property'ler "settled" sayılamaz.
+        return next_map, records, bool(converged and not missing)
+
+    # _log_web_decisions: web karar tablosunu log'a yazar, Web_Flaw_Run klasörüne CSV kaydeder.
+    def _log_web_decisions(self, records, iteration, target_life, upper_life, reduction_pct, folder):
+        self.log("\n" + "-" * 70)
+        if upper_life is not None:
+            self.log(f"WEB FLAW THICKNESS DECISIONS (iteration {iteration}) - target {target_life:g}, "
+                      f"upper bound {upper_life:g}, reduce {reduction_pct:g}%")
+        else:
+            self.log(f"WEB FLAW SIZING (iteration {iteration}) - target {target_life:g}, no upper bound "
+                      f"(sizing result is used as is)")
+        self.log("-" * 70)
+        self.log(f"  {'Web PID':>8} {'FEM t':>8} {'sized t':>8} {'Life':>14}  {'decision':<13} {'next t':>8}")
+        counts = {}
+        for r in records:
+            counts[r['Decision']] = counts.get(r['Decision'], 0) + 1
+            fem_t = f"{r['Solved t(mm)']:.3f}" if r['Solved t(mm)'] is not None else "?"
+            life = r['Life']
+            life_s = f"{life:>14,.0f}" if np.isfinite(life) else f"{'n/a':>14}"
+            self.log(f"  {r['Web Property ID']:>8} {fem_t:>8} {r['Sized t(mm)']:>8.3f} {life_s}  "
+                      f"{r['Decision']:<13} {r['Next t(mm)']:>8.3f}")
+        if records:
+            n_settled = sum(1 for r in records if r['Settled'])
+            self.log("  " + ", ".join(f"{n} {d}" for d, n in sorted(counts.items())) +
+                      f"  ->  {n_settled}/{len(records)} Web Properties settled")
+            if counts.get('below target'):
+                self.log(f"  WARNING: {counts['below target']} Web Property(ies) don't reach the target life "
+                          f"even at the thickest swept value (or have no Life value) - check their loads.")
+            try:
+                pd.DataFrame(records).to_csv(os.path.join(folder, 'WEB_FLAW_DECISIONS.csv'),
+                                             encoding='utf-8', index=False)
+            except OSError as e:
+                self.log(f"  WARNING: could not write WEB_FLAW_DECISIONS.csv: {e}")
+
+    # ==================== RUN (IMPROVED ITERATIVE FULL PIPELINE) ====================
+    # _run_pipeline: Iterative'in _run_pipeline kaynağından türetildi; farklar
+    # '# ---- STAGE C2', web_* değişkenleri ve _prepare_web_bdfs/_update_web_* çağrılarıdır.
+    def _run_pipeline(self):
+        t_start = time.time()
+        try:
+            self.log("\n" + "#" * 70)
+            self.log("IMPROVED ITERATIVE FULL RUN (Joint Run + Web Flaw Run)")
+            self.log("#" * 70)
+
+            n_iterations = int(float(self.n_iterations.get()))
+            target_life = float(self.target_flight_hours.get())
+            output_base = self.isu_output_folder.get().strip()
+            os.makedirs(output_base, exist_ok=True)
+
+            # Kullanıcının Master Input Excel'i HİÇ DOKUNULMADAN kalır -
+            # tüm iterasyonlar, bu özel "working excel" ÇALIŞMA KOPYASI
+            # üzerinde okuma/yazma yapar.
+            working_excel = os.path.join(output_base, "_ImprovedIterativeFullRun_Working_Input.xlsx")
+            shutil.copy2(self.master_input_excel_path.get().strip(), working_excel)
+            self._excel_recalc_ok = None        # None = henüz denenmedi (bkz. _save_working_excel)
+            self._formula_freeze_logged = False
+            self._t1_floor_by_pid = None        # ilk DTCG güncellemesinde doldurulur (taban kalınlıklar)
+            self._web_floor_by_pid = None       # ilk Web_Flaw_Input_Excel_Data güncellemesinde doldurulur (orijinal Min Thick)
+
+            upper_life = float(self.upper_life.get()) if self.upper_life.get().strip() else None
+            reduction_pct = float(self.reduction_pct.get()) if upper_life is not None else 0.0
+            floor_by_pid = {}
+            self.log(f"  Working copy of the Master Input Excel: {working_excel}")
+            self.log(f"  Target flight hours: {target_life}, Iterations: {n_iterations}")
+            if upper_life is not None:
+                self.log(f"  Upper bound life: {upper_life} (Life between target and upper bound is "
+                          f"accepted), thickness reduction step: {reduction_pct:g}%")
+
+            next_prop_map = None  # önceki iterasyonun sonunda belirlenen {PID: yeni Dim1} (ilk iterasyonda yok)
+            next_web_map = None   # önceki iterasyonun web flaw sonucundan {Web Property ID: yeni kalınlık}
+            web_floor_by_pid = {}
+
+            for iteration in range(1, n_iterations + 1):
+                iter_t_start = time.time()
+                self.log("\n" + "#" * 70)
+                self.log(f"ITERATION {iteration}/{n_iterations}")
+                self.log("#" * 70)
+                self.root.after(0, lambda p=(iteration - 1) / n_iterations * 100: self.progress_var.set(p))
+
+                # Bu, DÖNGÜNÜN GERİ BESLEME (feedback) ADIMI: ilk iterasyon
+                # HARİÇ, bir önceki iterasyonun boyutlandırma özetindeki
+                # (prop_summary_df) kalınlık değerleri, bu iterasyonun
+                # çözümünden ÖNCE working_excel'in Bar Property Dim1'ine yazılır.
+                if iteration > 1 and next_prop_map:
+                    self._update_bar_property_dim1(working_excel, next_prop_map)
+                if iteration > 1 and next_web_map:
+                    self._update_web_property_thickness(working_excel, next_web_map)
+
+                # ---- STAGE A: UNDERSTANDING STRUCTURE TYPE ----
+                # FullRunTab'daki aynı mantık: t3 nesnesinin alanlarını
+                # doldur ve _run_solve()'u çağır - TEK FARK, Property/Element
+                # Excel'in HER İKİSİNİN de aynı working_excel'i göstermesi
+                # (Master Input Excel tek dosyada hepsini içerdiği için).
+                self.log(f"\n--- Iteration {iteration}: Understanding Structure Type ---")
+                t3 = self.tab3_tool
+                # Web Property kalınlıkları PSHELL'lere, BDF'lerin ÇALIŞMA KOPYALARINDA yazılır
+                # (kullanıcının BDF'lerine dokunulmaz); Nastran Solver bu kopyaları kullanır.
+                web_bdf_map = self._prepare_web_bdfs(working_excel, output_base, iteration)
+                t3.bdf_paths = [web_bdf_map.get(p, p) for p in self.bdf_paths]
+                t3.maneuver_bdfs = [web_bdf_map.get(p, p) for p in self.maneuver_bdfs]
+                t3.property_excel_path.set(working_excel)
+                t3.element_excel_path.set(working_excel)
+                t3.nastran_path.set(self.nastran_path.get())
+                t3.nastran_memory.set(self.nastran_memory.get())
+                t3.scratch_folder.set(self.scratch_folder.get())
+                t3.output_folder.set(output_base)
+                t3.cases_per_split.set(self.cases_per_split.get())
+                t3.max_parallel_runs.set(self.isu_max_parallel_runs.get())
+                self.root.after(0, self._refresh_tab3_listboxes)
+
+                t3.load_properties()
+                if not t3.properties_loaded:
+                    self.log("\nSTOPPED: Property Excel failed to load - see the Understanding "
+                              "Structure Type log/tab above for details.")
+                    return
+                t3.load_element_ids()
+
+                before_folders = self._list_base_model_folders(output_base)
+                t3._run_solve()
+                after_folders = self._list_base_model_folders(output_base)
+                new_folders = after_folders - before_folders
+                if len(new_folders) == 1:
+                    run_folder = os.path.join(output_base, new_folders.pop())
+                elif new_folders:
+                    candidates = [os.path.join(output_base, n) for n in new_folders]
+                    run_folder = max(candidates, key=os.path.getmtime)
+                else:
+                    run_folder = None
+
+                if not run_folder:
+                    self.log(f"\nSTOPPED (iteration {iteration}): no new BaseModel_<timestamp> "
+                              "folder appeared - the solve likely failed. See the Understanding "
+                              "Structure Type log/tab above.")
+                    return
+                self.log(f"  Base model run folder: {run_folder}")
+
+                base_model_folder = os.path.join(run_folder, "_base_model")
+                op2_count_check = sum(
+                    1 for dirpath, _, filenames in os.walk(base_model_folder) for fn in filenames
+                    if fn.lower().endswith('.op2')
+                )
+                if op2_count_check == 0:
+                    self.log(f"\nSTOPPED (iteration {iteration}): no .op2 files were produced. "
+                              "See the Understanding Structure Type log/tab above.")
+                    return
+                self.log(f"  {op2_count_check} .op2 file(s) found")
+
+                # Bu iterasyonda ÇÖZÜLEN her BDF'teki (maneuver + thermal,
+                # hepsi) PBARL dim1 değerlerini oku ve DTCG_Input_Excel_
+                # Data'nın t1(mm)/tfem sütunlarına geri yaz - Joint Run'a
+                # giden Excel, "istenen" değeri değil GERÇEKTEN ÇÖZÜLEN
+                # kalınlığı yansıtsın.
+                stru_bdfs = self._find_all_stru_bdfs(base_model_folder)
+                dim1_by_pid = {}
+                pid_by_eid = {}
+                for p in stru_bdfs:
+                    dim1_by_pid.update(self._extract_pbarl_dim1(p))
+                    pid_by_eid.update(self._extract_bar_pid_by_eid(p))
+                self.log(f"  Read {len(dim1_by_pid)} PBARL dim1 value(s) and {len(pid_by_eid)} "
+                          f"CBAR/CBEAM -> PID mapping(s) from {len(stru_bdfs)} solved BDF(s)")
+                self._update_dtcg_t1_tfem(working_excel, dim1_by_pid, pid_by_eid)
+                # Web: gerçekten çözülen PSHELL kalınlığını Web_Flaw_Input_Excel_Data'nın Min Thick
+                # sütununa yaz (t1/tfem mantığının aynısı) ve ilk iterasyonda taban kalınlıkları yakala.
+                web_solved_by_pid = self._read_solved_web_thickness(stru_bdfs, working_excel)
+                self._update_web_flaw_min_thick(working_excel, web_solved_by_pid)
+                if iteration == 1:
+                    web_floor_by_pid = dict(web_solved_by_pid)
+                    web_floor_by_pid.update(self._web_floor_by_pid or {})
+                    self.log(f"  Web Property minimum thickness fixed for {len(web_floor_by_pid)} "
+                              f"propert(ies) ({len(self._web_floor_by_pid or {})} from the initial Min Thick)")
+                if iteration == 1:
+                    # Taban kalınlık: önce ilk çözümde okunan PBARL dim1, onun
+                    # üstüne Bar Property sayfasının ilk Dim1'i, en üste de
+                    # DTCG'deki ORİJİNAL t1(mm) (varsa) yazılır.
+                    floor_by_pid = dict(dim1_by_pid)
+                    floor_by_pid.update({pid: v['dim1'] for pid, v in self.tab3_tool.bar_properties.items()})
+                    n_from_t1 = len(self._t1_floor_by_pid or {})
+                    floor_by_pid.update(self._t1_floor_by_pid or {})
+                    if upper_life is not None:
+                        self.log(f"  Minimum thickness fixed for {len(floor_by_pid)} Bar Properties "
+                                  f"({n_from_t1} from the initial t1(mm), the rest from the initial Dim1)")
+
+                # Bu iterasyonun working_excel durumunu, o iterasyonun kendi
+                # _base_model klasörüne anlık görüntü (snapshot) olarak
+                # kaydet - sonradan "bu iterasyonda hangi kalınlıklar
+                # kullanıldı" diye geri bakılabilsin.
+                iter_snapshot = os.path.join(base_model_folder, f"Main_Input_Iteration_{iteration}.xlsx")
+                shutil.copy2(working_excel, iter_snapshot)
+                self.log(f"  Working excel snapshot saved: {iter_snapshot}")
+
+                # ---- STAGE B: POST PROCESSING ----
+                self.log(f"\n--- Iteration {iteration}: Post Processing ---")
+                op2_results_dir = os.path.join(base_model_folder, "OP2_Results")
+                h5_results_dir = os.path.join(base_model_folder, "H5_Results")
+                le_results_dir = os.path.join(base_model_folder, "Load_Extraction_Results")
+                os.makedirs(op2_results_dir, exist_ok=True)
+                os.makedirs(h5_results_dir, exist_ok=True)
+                os.makedirs(le_results_dir, exist_ok=True)
+
+                n_moved = self._move_op2_files(base_model_folder, op2_results_dir)
+                self.log(f"  Moved {n_moved} .op2 file(s) into {op2_results_dir}")
+
+                maneuver_stru = self._find_stru_bdf(base_model_folder, "maneuver")
+                thermal_stru = self._find_stru_bdf(base_model_folder, "thermal")
+                if not maneuver_stru:
+                    self.log("  WARNING: no '..._stru.bdf' with 'maneuver' in its name found.")
+                if not thermal_stru:
+                    self.log("  WARNING: no '..._stru.bdf' with 'thermal' in its name found.")
+
+                t4 = self.tab4_tool
+                t4.op2_folder.set(op2_results_dir)
+                t4.converter_exe_path.set(self.converter_exe_path.get())
+                t4.output_folder.set(h5_results_dir)
+                t4.le_input_excel_path.set(working_excel)
+                t4.le_example_folder.set(self.le_example_folder.get())
+                t4.le_maneuver_bdf_path.set(maneuver_stru or "")
+                t4.le_thermal_bdf_path.set(thermal_stru or "")
+                t4.le_pickle_path.set(self.le_pickle_path.get())
+                t4.le_split_count.set(self.le_split_count.get())
+                t4.le_output_folder.set(le_results_dir)
+                t4.le_exe_path.set(self.le_exe_path.get())
+                t4.le_max_memory.set(self.le_max_memory.get())
+
+                t4._run_pipeline()
+
+                group_folders_found = [
+                    name for name in (os.listdir(le_results_dir) if os.path.isdir(le_results_dir) else [])
+                    if os.path.isdir(os.path.join(le_results_dir, name)) and name.lower().startswith('loadextraction_')
+                ]
+                if not group_folders_found:
+                    self.log(f"\nSTOPPED (iteration {iteration}): no LoadExtraction_NN folders "
+                              "were created. See the Post Processing log/tab above.")
+                    return
+                self.log(f"  {len(group_folders_found)} LoadExtraction_NN group folder(s) found")
+
+                # t4._run_pipeline() döndüğünde loadext.bat'lar henüz
+                # BAŞLATILMIŞ olabilir (fire-and-forget) - Joint Run'ın H5
+                # taraması bunların çıktısına bağımlı olduğundan, hepsinin
+                # gerçekten bitmesini bekle.
+                self._wait_for_exe_to_finish(os.path.basename(self.le_exe_path.get().strip()))
+
+                # ---- STAGE C: JOINT RUN ----
+                # FullRunTab ile aynı mantık: t5 nesnesinin alanlarını doldur
+                # (Main Input Excel = bu iterasyonun working_excel'i) ve
+                # t5._run_pipeline()'ı çağır - bu metod zaten Joint Run exe
+                # havuzunun tamamının bitmesini bekler.
+                self.log(f"\n--- Iteration {iteration}: Joint Run ---")
+                joint_run_dir = os.path.join(base_model_folder, "Joint_Run")
+                os.makedirs(joint_run_dir, exist_ok=True)
+
+                t5 = self.tab5_tool
+                t5.h5_folder.set(le_results_dir)
+                t5.main_input_excel_path.set(working_excel)
+                t5.example_joint_excel_path.set(self.jr_example_joint_excel_path.get())
+                t5.util_folder.set(self.jr_util_folder.get())
+                t5.license_checker_exe_path.set(self.jr_license_checker_exe_path.get())
+                t5.load_modifying_exe_path.set(self.jr_load_modifying_exe_path.get())
+                t5.rss_exe_path.set(self.jr_rss_exe_path.get())
+                t5.joint_run_exe_path.set(self.jr_joint_run_exe_path.get())
+                t5.output_folder.set(joint_run_dir)
+                t5.max_parallel_runs.set(self.jr_max_parallel_runs.get())
+                t5.scale_factor.set(self.jr_scale_factor.get())
+
+                t5._run_pipeline()
+
+                # ---- STAGE C2: WEB FLAW RUN ----
+                # Joint Run bittikten SONRA, Joint ile aynı çözülmüş model/H5'ler üzerinde.
+                self.log(f"\n--- Iteration {iteration}: Web Flaw Run ---")
+                web_flaw_dir = os.path.join(base_model_folder, "Web_Flaw_Run")
+                web_results_df = self._run_web_flaw_stage(working_excel, h5_results_dir, maneuver_stru,
+                                                          thermal_stru, web_flaw_dir, target_life)
+
+                # ---- STAGE D: BOYUTLANDIRMA ÖZETİ ----
+                # Bu iterasyonun Joint Run sonuçlarından (Nasgro Final
+                # Summary CSV'leri) boyutlandırma özetini üret ve bir
+                # SONRAKİ iterasyonun Bar Property Dim1 değerlerini belirle
+                # (bkz. _decide_next_thicknesses; Upper Bound Life boşsa
+                # sizing sonucu aynen kullanılır). next_prop_map, sonraki
+                # iterasyonun başındaki geri besleme adımında (yukarıda) yazılır.
+                prop_summary_df, t_col, full_summary = self._build_flight_hours_summary(
+                    joint_run_dir, target_life)
+                if prop_summary_df is None:
+                    self.log(f"\nSTOPPED (iteration {iteration}): no sizing summary could be built "
+                              "- not continuing to further iterations. See the log above.")
+                    return
+
+                next_prop_map, decisions, converged = self._decide_next_thicknesses(
+                    prop_summary_df, t_col, full_summary, target_life, upper_life,
+                    reduction_pct, floor_by_pid, dim1_by_pid)
+                if upper_life is not None and decisions:
+                    self._log_thickness_decisions(decisions, iteration, target_life, upper_life,
+                                                  reduction_pct, joint_run_dir)
+
+                # Web flaw: Prop_Results'tan her Web Property'nin sonraki kalınlığını belirle.
+                # Yakınsama = bar property'ler VE web property'ler birlikte settled.
+                next_web_map, web_decisions, web_converged = self._decide_web_thicknesses(
+                    web_results_df, target_life, upper_life, reduction_pct, web_floor_by_pid,
+                    web_solved_by_pid)
+                self._log_web_decisions(web_decisions, iteration, target_life, upper_life,
+                                        reduction_pct, web_flaw_dir)
+                converged = converged and web_converged
+
+                # SON iterasyon DIŞINDAKİ her iterasyonda: bu iterasyonun H5
+                # dosyaları (hem Load Extraction hem Joint Run) artık
+                # gerekli değil (sonraki iterasyon kendi H5'lerini üretecek)
+                # - disk yer açmak için sil. SON iterasyonun H5'leri
+                # kullanıcı inceleyebilsin diye KORUNUR; yakınsayıp erken
+                # duracağımız iterasyon da "son" sayılır.
+                if iteration < n_iterations and not converged:
+                    n_del_le = self._delete_h5_files(le_results_dir)
+                    n_del_jr = self._delete_h5_files(joint_run_dir)
+                    n_del_wf = self._delete_h5_files(web_flaw_dir)
+                    self.log(f"  Deleted {n_del_le} H5 file(s) from Load Extraction Results, "
+                              f"{n_del_jr} from Joint Run and {n_del_wf} from Web Flaw Run (not the last iteration)")
+
+                # Her iterasyonun sonunda (son dahil, sizing özeti zaten
+                # üretildikten SONRA) Set klasörlerine kopyalanan Util Folder
+                # kopyalarını sil - sadece yardımcı dosyaların kopyası, sonuç değil.
+                n_del_util = self._delete_util_folders(joint_run_dir, self.jr_util_folder.get().strip())
+                self.log(f"  Deleted {n_del_util} copied Util Folder(s) from the Joint Run Set folders")
+
+                self.log(f"\nIteration {iteration}/{n_iterations} complete "
+                          f"({time.time() - iter_t_start:.1f}s)")
+
+                if converged:
+                    self.log(f"\nCONVERGED after iteration {iteration}: every Bar and Web Property is within the "
+                              f"target/upper-bound band (or at its minimum / bracketed by the sweep) at the "
+                              f"thickness the FEM was solved with - stopping early"
+                              f"{'' if iteration == n_iterations else f' (skipping iterations {iteration + 1}-{n_iterations})'}.")
+                    break
+
+            self.root.after(0, lambda: self.progress_var.set(100))
+            self.log(f"\n{'#' * 70}")
+            self.log(f"IMPROVED ITERATIVE FULL RUN COMPLETE (total {time.time() - t_start:.1f}s)")
+            self.log(f"{'#' * 70}")
+
+        except Exception as e:
+            self.log(f"\nERROR after {time.time() - t_start:.1f}s: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+
+        finally:
+            self.is_running = False
+            self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL))
 
 
 # ============================================================================

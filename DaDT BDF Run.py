@@ -203,6 +203,14 @@ class IntegratedBDFRFTool:
         _win_w = min(1500, max(1000, self.root.winfo_screenwidth() - 60))
         _win_h = min(1000, max(700, self.root.winfo_screenheight() - 100))
         self.root.geometry(f"{_win_w}x{_win_h}")
+        # Açılışta tam ekran (maximize): Windows'ta 'zoomed' durumu, Linux'ta '-zoomed' özniteliği.
+        try:
+            self.root.state('zoomed')
+        except tk.TclError:
+            try:
+                self.root.attributes('-zoomed', True)
+            except tk.TclError:
+                pass
         # Pencerenin küçültülebileceği en küçük boyut sınırı.
         self.root.minsize(1200, 750)
         # Yukarıda tanımlanan _configure_app_style() fonksiyonunu çağırıp
@@ -10567,12 +10575,29 @@ def _run_fem_viewer(argv):
 # IntegratedBDFRFTool uygulamasını bu pencere üzerine kurar, ve Tkinter'ın
 # olay döngüsünü (mainloop) başlatır - bu çağrı, pencere kapatılana kadar
 # bloklar (GUI olaylarını işler).
+# _apply_ui_scale: TÜM arayüzün (yazı tipleri, kutular, butonlar) boyutunu birlikte
+# büyütür. Tk, "puntoyla" verilen yazı tiplerini 'tk scaling' ile piksele çevirir;
+# bu yüzden her sekmenin kodu değişmeden hepsi aynı oranda büyür. Varsayılan 1.25x;
+# değiştirmek için DADT_UI_SCALE ortam değişkeni (örn. 1.0 = eski boyut, 1.5 = daha büyük).
+def _apply_ui_scale(root, default_factor=1.25):
+    try:
+        factor = float(os.environ.get('DADT_UI_SCALE', default_factor))
+    except ValueError:
+        factor = default_factor
+    factor = max(0.8, min(2.0, factor))
+    try:
+        root.tk.call('tk', 'scaling', float(root.tk.call('tk', 'scaling')) * factor)
+    except tk.TclError:
+        pass
+
+
 def main():
     # "Open FEM Viewer" bu dosyayı --fem-viewer ile ayrı bir süreç olarak başlatır.
     if _FEM_VIEWER_FLAG in sys.argv[1:]:
         _run_fem_viewer(sys.argv[1:])
         return
     root = tk.Tk()
+    _apply_ui_scale(root)       # sekmeler oluşturulmadan ÖNCE uygulanmalı (sonradan mevcut widget'ları büyütmez)
     app = IntegratedBDFRFTool(root)
     root.mainloop()
 

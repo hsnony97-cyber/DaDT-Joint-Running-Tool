@@ -134,7 +134,8 @@ def _configure_app_style(root):
     # Notebook = sekme (tab) çubuğunun kendisi.
     style.configure('TNotebook', background=colors['bg'], borderwidth=0)
     # Her bir sekme sekmesi (örn. "Post Processing" yazan tıklanabilir kulakçık).
-    style.configure('TNotebook.Tab', font=('Segoe UI', 10, 'bold'), padding=(16, 8),
+    # 9 sekme yan yana sığsın diye yazı 9 punto ve yan boşluk 10 (önceden 10 punto / 16).
+    style.configure('TNotebook.Tab', font=('Segoe UI', 9, 'bold'), padding=(10, 8),
                     background=colors['border'], foreground=colors['text'])
     # style.map(): widget'ın DURUMUNA göre (örn. seçili/seçili değil) farklı
     # renk uygulamak için kullanılır. Burada: seçili (aktif) sekme beyaz zeminli

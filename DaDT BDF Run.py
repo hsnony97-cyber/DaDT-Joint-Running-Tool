@@ -9207,6 +9207,7 @@ class VisualizationResultsTab:
         self.bdf_path = tk.StringVar()
         self.bar_csv_path = tk.StringVar()    # Bar Element ID bazlı sonuçlar (örn. DT_SIZING_BAR_SUMMARY.csv)
         self.prop_csv_path = tk.StringVar()   # Bar Property ID bazlı sonuçlar (örn. DT_SIZING_PROP_SUMMARY.csv)
+        self.web_file_path = tk.StringVar()   # Web Flaw sonuçları (*_Prop_Summary.xlsx / *_Prop_Results.xlsx)
         self.software_gl = tk.BooleanVar(value=False)  # GPU'suz Uzak Masaüstü için CPU (Mesa) ile çizim
         self.setup_ui()
 
@@ -9226,7 +9227,9 @@ class VisualizationResultsTab:
                 ("Bar Element CSV:", self.bar_csv_path, [("CSV", "*.csv"), ("All", "*.*")],
                  "(optional - rows keyed by Bar Element ID, e.g. DT_SIZING_BAR_SUMMARY.csv)"),
                 ("Bar Property CSV:", self.prop_csv_path, [("CSV", "*.csv"), ("All", "*.*")],
-                 "(optional - rows keyed by Bar Property ID, e.g. DT_SIZING_PROP_SUMMARY.csv)")]
+                 "(optional - rows keyed by Bar Property ID, e.g. DT_SIZING_PROP_SUMMARY.csv)"),
+                ("Web Flaw Excel:", self.web_file_path, [("Excel / CSV", "*.xlsx *.xlsm *.xls *.csv"), ("All", "*.*")],
+                 "(optional - Web Flaw Run's *_Prop_Summary / *_Prop_Results.xlsx)")]
         for label, var, types, hint in rows:
             fr = ttk.Frame(f1)
             fr.pack(fill=tk.X, pady=2)
@@ -9238,9 +9241,9 @@ class VisualizationResultsTab:
         fr = ttk.Frame(f1)
         fr.pack(fill=tk.X, pady=(6, 0))
         ttk.Button(fr, text="Find CSVs in Folder...", command=self._find_csvs_in_folder).pack(side=tk.LEFT)
-        ttk.Label(fr, text="(searches a folder, e.g. an Iterative Full Run's Joint_Run folder, for "
-                           "DT_SIZING_BAR_SUMMARY / DT_SIZING_PROP_SUMMARY.csv - DT_FULL_SUMMARY.csv "
-                           "as a fallback - and fills both CSV fields)",
+        ttk.Label(fr, text="(searches a folder (e.g. Joint_Run) for DT_SIZING_BAR/PROP_SUMMARY.csv - "
+                           "DT_FULL_SUMMARY.csv as a fallback - and the Web Flaw "
+                           "*_Prop_Summary / *_Prop_Results.xlsx)",
                   font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=8)
 
         f2 = ttk.LabelFrame(main, text="\U0001F5A5  2. FEM Viewer", padding=10)
@@ -9292,11 +9295,16 @@ class VisualizationResultsTab:
             self.bar_csv_path.set(bar_path)
         if prop_path:
             self.prop_csv_path.set(prop_path)
-        if bar_path or prop_path:
-            self._log(f"Found in {folder}:\n  Bar Element CSV: {bar_path or '-'}\n  Bar Property CSV: {prop_path or '-'}")
+        web_path = self._scan_web_file(folder)
+        if web_path:
+            self.web_file_path.set(web_path)
+        if bar_path or prop_path or web_path:
+            self._log(f"Found in {folder}:\n  Bar Element CSV: {bar_path or '-'}\n  Bar Property CSV: {prop_path or '-'}"
+                      f"\n  Web Flaw Excel: {web_path or '-'}")
         else:
-            self._log(f"No DT_SIZING_BAR_SUMMARY / DT_SIZING_PROP_SUMMARY / DT_FULL_SUMMARY.csv under {folder}")
-            messagebox.showwarning("Not found", "No summary CSVs found in that folder")
+            self._log(f"No DT_SIZING_BAR_SUMMARY / DT_SIZING_PROP_SUMMARY / DT_FULL_SUMMARY.csv or "
+                      f"*_Prop_Summary / *_Prop_Results.xlsx under {folder}")
+            messagebox.showwarning("Not found", "No summary CSVs / Web Flaw Excel found in that folder")
 
     @staticmethod
     def _missing_viewer_packages():
@@ -9329,7 +9337,8 @@ class VisualizationResultsTab:
         cmd += [_FEM_VIEWER_FLAG, '--bdf', bdf]
         if self.software_gl.get():
             cmd.append('--software-gl')
-        for flag, var in (('--bar-csv', self.bar_csv_path), ('--prop-csv', self.prop_csv_path)):
+        for flag, var in (('--bar-csv', self.bar_csv_path), ('--prop-csv', self.prop_csv_path),
+                          ('--web-file', self.web_file_path)):
             p = var.get().strip()
             if p:
                 if not os.path.isfile(p):
@@ -9505,6 +9514,108 @@ class VisualizationResultsTab:
                 elif fnl == 'dt_full_summary.csv' and full_path is None:
                     full_path = os.path.join(dirpath, fn)
         return bar_path, prop_path, full_path
+
+    # ---- Web Flaw sonuç dosyası (*_Prop_Summary.xlsx / *_Prop_Results.xlsx) ----
+    # _scan_web_file: klasörde (rekürsif) önce *_Prop_Summary, yoksa *_Prop_Results dosyasını bulur.
+    @staticmethod
+    def _scan_web_file(folder):
+        found = {'summary': None, 'results': None}
+        exts = ('.xlsx', '.xlsm', '.csv')
+        for dirpath, _, filenames in os.walk(folder):
+            for fn in filenames:
+                fnl = fn.lower()
+                if fnl.startswith('~$') or fnl.startswith('dt_'):
+                    continue            # Excel kilit dosyası ve bar sonuçları (DT_SIZING_PROP_SUMMARY.csv vb.) atlanır
+                for key, suffix in (('summary', '_prop_summary'), ('results', '_prop_results')):
+                    if found[key] is None and any(fnl.endswith(suffix + e) for e in exts):
+                        found[key] = os.path.join(dirpath, fn)
+        return found['summary'] or found['results']
+
+    # _normalize_web_id: başlık Element / Property kimliği ise standart adı, değilse None döner.
+    @staticmethod
+    def _normalize_web_id(col):
+        norm = VisualizationResultsTab._normalize_header(col).replace('_', '').replace('-', '')
+        if norm in ('element', 'elementid', 'elem', 'eid', 'webelementid'):
+            return 'Web Element ID'
+        if norm in ('property', 'propertyid', 'pid', 'webpropertyid'):
+            return 'Web Property ID'
+        return None
+
+    # _aggregate_web_properties: eleman satırlarından Web Property bazlı tablo üretir. Property kalınlığı =
+    # elemanlarının en kalını; o kalınlıktaki en düşük ömürlü eleman "governing" sayılır ve diğer sütunlar
+    # (Material vb.) ondan alınır (Iterative'in karar mantığıyla aynı). Eleman-özel 'Angle' atlanır.
+    @staticmethod
+    def _aggregate_web_properties(df):
+        V = VisualizationResultsTab
+        t_col = next((c for c in df.columns if V._normalize_header(c) in ('thickness', 't', 'tmm')), None)
+        life_col = next((c for c in df.columns if 'life' in V._normalize_header(c)), None)
+        rows = []
+        for pid, g in df.groupby('Web Property ID'):
+            gov = g
+            if t_col is not None:
+                tt = pd.to_numeric(g[t_col], errors='coerce')
+                if tt.notna().any():
+                    gov = g[np.isclose(tt.fillna(-1.0), tt.max())]
+                    if life_col is not None:
+                        order = pd.to_numeric(gov[life_col], errors='coerce').fillna(-1.0).argsort(kind='stable')
+                        gov = gov.iloc[order.to_numpy()]
+            first = gov.iloc[0]
+            rec = {'Web Property ID': int(pid), 'Elements': int(len(g))}
+            for c in df.columns:
+                if c in ('Web Property ID', 'Web Element ID') or V._normalize_header(c) == 'angle':
+                    continue
+                rec[c] = first[c]
+            if 'Web Element ID' in g.columns and pd.notna(first['Web Element ID']):
+                rec['Governing Element'] = int(first['Web Element ID'])
+            rows.append(rec)
+        return pd.DataFrame(rows).set_index('Web Property ID')
+
+    # _read_web_results: Web Flaw dosyasını (xlsx/csv) okur. Dönüş: (eleman_df, property_df); olmayan None.
+    # eleman_df index = 'Web Element ID', property_df index = 'Web Property ID'. Dosya sadece property
+    # satırlarıysa (*_Prop_Summary) property_df doğrudan, eleman satırlarıysa (*_Prop_Results) özetlenerek üretilir.
+    @staticmethod
+    def _read_web_results(path):
+        V = VisualizationResultsTab
+        if path.lower().endswith('.csv'):
+            raw = pd.read_csv(path)
+        else:
+            xl = pd.ExcelFile(path)
+            raw = None
+            for sheet in xl.sheet_names:
+                cand = xl.parse(sheet)
+                if any(V._normalize_web_id(c) == 'Web Property ID' for c in cand.columns):
+                    raw = cand
+                    break
+            if raw is None:
+                raw = xl.parse(xl.sheet_names[0])
+        df = raw.rename(columns=lambda c: ' '.join(str(c).strip().replace('\n', ' ').split()))
+        rename, used = {}, set()
+        for c in df.columns:
+            std = V._normalize_web_id(c)
+            if std and std not in used:
+                rename[c] = std
+                used.add(std)
+        df = df.rename(columns=rename)
+        has_e, has_p = 'Web Element ID' in df.columns, 'Web Property ID' in df.columns
+        if not has_e and not has_p:
+            return None, None
+        elem_df = prop_df = None
+        if has_e:
+            e = df.copy()
+            e['Web Element ID'] = pd.to_numeric(e['Web Element ID'], errors='coerce')
+            e = e.dropna(subset=['Web Element ID'])
+            e['Web Element ID'] = e['Web Element ID'].astype(np.int64)
+            elem_df = e.drop_duplicates(subset=['Web Element ID']).set_index('Web Element ID')
+        if has_p:
+            p = df.copy()
+            p['Web Property ID'] = pd.to_numeric(p['Web Property ID'], errors='coerce')
+            p = p.dropna(subset=['Web Property ID'])
+            p['Web Property ID'] = p['Web Property ID'].astype(np.int64)
+            if has_e:
+                prop_df = V._aggregate_web_properties(p)
+            else:
+                prop_df = p.drop_duplicates(subset=['Web Property ID']).set_index('Web Property ID')
+        return elem_df, prop_df
 
 
 # ============================================================================
@@ -9775,6 +9886,7 @@ def _run_fem_viewer(argv):
     parser.add_argument('--bdf', default='')
     parser.add_argument('--bar-csv', dest='bar_csv', default='')
     parser.add_argument('--prop-csv', dest='prop_csv', default='')
+    parser.add_argument('--web-file', dest='web_file', default='')
     parser.add_argument('--group', default='Bar Property ID')
     parser.add_argument('--metric', default='')
     parser.add_argument('--software-gl', dest='software_gl', action='store_true')
@@ -9832,7 +9944,7 @@ def _run_fem_viewer(argv):
     V = VisualizationResultsTab   # CSV yardımcıları (_scan_summary_files, _fmt_fixed, ...) buradan
     fmt = V._fmt_fixed
     tristate_flag = getattr(QtCore.Qt, 'ItemIsAutoTristate', QtCore.Qt.ItemIsTristate)
-    group_options = ['Bar Property ID', 'Bar Element ID']
+    group_options = ['Bar Property ID', 'Bar Element ID', 'Web Property ID', 'Web Element ID']
     cmap_options = ['Auto', 'jet', 'rainbow', 'turbo', 'RdYlGn', 'RdYlGn_r', 'viridis', 'coolwarm']
 
     class _LoadWorker(QtCore.QThread):
@@ -9864,6 +9976,9 @@ def _run_fem_viewer(argv):
             self.type_names = []
             self.bar_df = None       # index: Bar Element ID
             self.prop_df = None      # index: Bar Property ID
+            self.web_elem_df = None  # index: Web Element ID (Web Flaw sonuçları)
+            self.web_prop_df = None  # index: Web Property ID
+            self.bar_any = self.web_any = self.is_shell = None   # CSV'de/Excel'de satırı olan bar / web shell'leri
             self.tree_mask = None    # property/tip ağacına göre görünürlük
             self.id_hidden = None    # ID ile gizlenen elemanlar
             self.has_result = None   # CSV'de değeri olan bar'lar
@@ -9917,12 +10032,14 @@ def _run_fem_viewer(argv):
             self.addDockWidget(QtCore.Qt.LeftDockWidgetArea, dock)
 
             # ---- Results ----
-            g = QtWidgets.QGroupBox("Results (CSV)")
+            g = QtWidgets.QGroupBox("Results (CSV / Excel)")
             gl = QtWidgets.QGridLayout(g)
             self.bar_csv_edit = QtWidgets.QLineEdit(args.bar_csv)
             self.prop_csv_edit = QtWidgets.QLineEdit(args.prop_csv)
+            self.web_edit = QtWidgets.QLineEdit(args.web_file)
             for row, (label, edit) in enumerate([("Bar Element CSV:", self.bar_csv_edit),
-                                                  ("Bar Property CSV:", self.prop_csv_edit)]):
+                                                  ("Bar Property CSV:", self.prop_csv_edit),
+                                                  ("Web Flaw Excel:", self.web_edit)]):
                 btn = QtWidgets.QPushButton("...")
                 btn.setFixedWidth(30)
                 btn.clicked.connect(lambda _=False, e=edit: self._browse_csv(e))
@@ -9933,28 +10050,32 @@ def _run_fem_viewer(argv):
             btn_folder.clicked.connect(self._find_csvs_in_folder)
             btn_load = QtWidgets.QPushButton("Load CSVs")
             btn_load.clicked.connect(self.load_results)
-            gl.addWidget(btn_folder, 2, 0, 1, 2)
-            gl.addWidget(btn_load, 2, 2, 1, 2)
+            gl.addWidget(btn_folder, 3, 0, 1, 2)
+            gl.addWidget(btn_load, 3, 2, 1, 2)
             self.summary_status = QtWidgets.QLabel("No results loaded")
             self.summary_status.setWordWrap(True)
-            gl.addWidget(self.summary_status, 3, 0, 1, 4)
+            gl.addWidget(self.summary_status, 4, 0, 1, 4)
             self.group_combo = QtWidgets.QComboBox()
             self.group_combo.addItems(group_options)
             if args.group in group_options:
                 self.group_combo.setCurrentText(args.group)
             self.group_combo.currentTextChanged.connect(self._on_group_changed)
-            gl.addWidget(QtWidgets.QLabel("Group by:"), 4, 0)
-            gl.addWidget(self.group_combo, 4, 1, 1, 3)
+            gl.addWidget(QtWidgets.QLabel("Group by:"), 5, 0)
+            gl.addWidget(self.group_combo, 5, 1, 1, 3)
             self.metric_combo = QtWidgets.QComboBox()
             self.metric_combo.currentTextChanged.connect(self._on_metric_changed)
-            gl.addWidget(QtWidgets.QLabel("Color by:"), 5, 0)
-            gl.addWidget(self.metric_combo, 5, 1, 1, 3)
+            gl.addWidget(QtWidgets.QLabel("Color by:"), 6, 0)
+            gl.addWidget(self.metric_combo, 6, 1, 1, 3)
             self.only_results_chk = QtWidgets.QCheckBox("Show only bars that have results")
             self.only_results_chk.toggled.connect(lambda _: self.refresh_scene())
-            gl.addWidget(self.only_results_chk, 6, 0, 1, 4)
+            gl.addWidget(self.only_results_chk, 7, 0, 1, 4)
+            # Web tarafı için aynı seçenek: sadece Web Flaw sonucu olan shell'leri (web FEM'ini) göster.
+            self.only_web_chk = QtWidgets.QCheckBox("Show only web elements that have results")
+            self.only_web_chk.toggled.connect(lambda _: self.refresh_scene())
+            gl.addWidget(self.only_web_chk, 8, 0, 1, 4)
             self.stats_label = QtWidgets.QLabel("")
             self.stats_label.setWordWrap(True)
-            gl.addWidget(self.stats_label, 7, 0, 1, 4)
+            gl.addWidget(self.stats_label, 9, 0, 1, 4)
             lay.addWidget(g)
 
             # ---- Contour ----
@@ -10097,6 +10218,9 @@ def _run_fem_viewer(argv):
             self.id_hidden = np.zeros(n, dtype=bool)
             self.has_result = np.zeros(n, dtype=bool)
             self.is_bar = np.asarray(grid.cell_data['Category']) == 0
+            self.is_shell = np.asarray(grid.cell_data['Category']) == 1
+            self.bar_any = np.zeros(n, dtype=bool)
+            self.web_any = np.zeros(n, dtype=bool)
             tcode = np.asarray(grid.cell_data['TypeCode']).astype(np.int64)
             self.tree_key = (tcode << 40) | (np.asarray(grid.cell_data['PID']) + 1)
             self._build_tree()
@@ -10118,12 +10242,17 @@ def _run_fem_viewer(argv):
             bar_path, prop_path, full_path = V._scan_summary_files(folder)
             if not bar_path and not prop_path and full_path:
                 bar_path = prop_path = full_path
-            if not bar_path and not prop_path:
+            web_path = V._scan_web_file(folder)
+            if not bar_path and not prop_path and not web_path:
                 QtWidgets.QMessageBox.warning(self, "FEM Viewer", "No DT_SIZING_BAR_SUMMARY / DT_SIZING_PROP_SUMMARY / "
-                                                                  "DT_FULL_SUMMARY.csv found in that folder")
+                                                                  "DT_FULL_SUMMARY.csv or *_Prop_Summary / "
+                                                                  "*_Prop_Results.xlsx found in that folder")
                 return
-            self.bar_csv_edit.setText(bar_path or "")
-            self.prop_csv_edit.setText(prop_path or "")
+            if bar_path or prop_path:
+                self.bar_csv_edit.setText(bar_path or "")
+                self.prop_csv_edit.setText(prop_path or "")
+            if web_path:
+                self.web_edit.setText(web_path)
             self.load_results()
 
         @staticmethod
@@ -10138,6 +10267,7 @@ def _run_fem_viewer(argv):
 
         def load_results(self, quiet=False):
             self.bar_df = self.prop_df = None
+            self.web_elem_df = self.web_prop_df = None
             msgs, problems = [], []
             for edit, id_col, attr in ((self.bar_csv_edit, 'Bar Element ID', 'bar_df'),
                                        (self.prop_csv_edit, 'Bar Property ID', 'prop_df')):
@@ -10156,22 +10286,66 @@ def _run_fem_viewer(argv):
                         msgs.append(f"{id_col}: {len(df)} rows ({name})")
                 except Exception as e:
                     problems.append(f"Could not read {name}: {e}")
+            web_path = self.web_edit.text().strip()
+            if web_path:
+                wname = os.path.basename(web_path)
+                try:
+                    if not os.path.isfile(web_path):
+                        problems.append(f"Not found: {web_path}")
+                    else:
+                        self.web_elem_df, self.web_prop_df = V._read_web_results(web_path)
+                        if self.web_elem_df is None and self.web_prop_df is None:
+                            problems.append(f"{wname} has no 'Element' / 'Property' column")
+                        else:
+                            if self.web_prop_df is not None:
+                                msgs.append(f"Web Property ID: {len(self.web_prop_df)} rows ({wname})")
+                            if self.web_elem_df is not None:
+                                msgs.append(f"Web Element ID: {len(self.web_elem_df)} rows ({wname})")
+                except Exception as e:
+                    problems.append(f"Could not read {wname}: {e}")
             self.summary_status.setText("\n".join(msgs + problems) or "No result CSV selected - mesh only")
             if problems and not quiet:
                 QtWidgets.QMessageBox.warning(self, "FEM Viewer", "\n".join(problems))
-            if self.bar_df is None and self.prop_df is not None:
+            # Seçili "Group by" için tablo yoksa, tablosu olan ilk seçeneğe geç.
+            available = [g for g in group_options if self._df_for_group(g) is not None]
+            if available and self._df_for_group(self.group_combo.currentText()) is None:
                 self.group_combo.blockSignals(True)
-                self.group_combo.setCurrentText('Bar Property ID')
+                self.group_combo.setCurrentText(available[0])
                 self.group_combo.blockSignals(False)
-            elif self.prop_df is None and self.bar_df is not None:
-                self.group_combo.blockSignals(True)
-                self.group_combo.setCurrentText('Bar Element ID')
-                self.group_combo.blockSignals(False)
+            self._compute_any_masks()
             self._refresh_metric_options(preferred=args.metric)
             self.apply_contour()
 
+        def _df_for_group(self, group):
+            return {'Bar Element ID': self.bar_df, 'Bar Property ID': self.prop_df,
+                    'Web Element ID': self.web_elem_df, 'Web Property ID': self.web_prop_df}.get(group)
+
         def _current_df(self):
-            return self.bar_df if self.group_combo.currentText() == 'Bar Element ID' else self.prop_df
+            return self._df_for_group(self.group_combo.currentText())
+
+        def _target_is_web(self):
+            return self.group_combo.currentText().startswith('Web')
+
+        # _compute_any_masks: sonucu (satırı) olan bar'ları / web shell'lerini, o an seçili metrikten
+        # BAĞIMSIZ olarak işaretler - "Show only ... that have results" seçenekleri bunu kullanır.
+        def _compute_any_masks(self):
+            if self.grid is None:
+                return
+            n = self.grid.n_cells
+            eid = np.asarray(self.grid.cell_data['EID'])
+            pid = np.asarray(self.grid.cell_data['PID'])
+            bar_any = np.zeros(n, dtype=bool)
+            if self.bar_df is not None:
+                bar_any |= np.isin(eid, self.bar_df.index.to_numpy())
+            if self.prop_df is not None:
+                bar_any |= np.isin(pid, self.prop_df.index.to_numpy())
+            web_any = np.zeros(n, dtype=bool)
+            if self.web_elem_df is not None:
+                web_any |= np.isin(eid, self.web_elem_df.index.to_numpy())
+            if self.web_prop_df is not None:
+                web_any |= np.isin(pid, self.web_prop_df.index.to_numpy())
+            self.bar_any = bar_any & self.is_bar
+            self.web_any = web_any & self.is_shell
 
         def _refresh_metric_options(self, preferred=''):
             cols = [str(c) for c in V._metric_columns(self._current_df())]
@@ -10270,10 +10444,14 @@ def _run_fem_viewer(argv):
             df = self._current_df()
             metric = self.metric_combo.currentText()
             if df is not None and metric in df.columns:
-                key_name = 'EID' if self.group_combo.currentText() == 'Bar Element ID' else 'PID'
-                keys = np.asarray(self.grid.cell_data[key_name])[self.is_bar]
+                grp = self.group_combo.currentText()
+                web_target = grp.startswith('Web')
+                word = 'web element' if web_target else 'bar'
+                res_mask = self.is_shell if web_target else self.is_bar    # sonucun boyanacağı hücreler
+                key_name = 'EID' if grp.endswith('Element ID') else 'PID'
+                keys = np.asarray(self.grid.cell_data[key_name])[res_mask]
                 mapped = pd.Series(keys).map(df[metric])
-                bar_idx = np.nonzero(self.is_bar)[0]
+                bar_idx = np.nonzero(res_mask)[0]
                 if V._is_numeric_column(df[metric]):
                     vals = pd.to_numeric(mapped, errors='coerce').to_numpy(dtype=float)
                     values[bar_idx] = vals
@@ -10286,10 +10464,10 @@ def _run_fem_viewer(argv):
                     self.legend = {'n': n, 'annotations': {float(i): fmt(b) for i, b in enumerate(bounds)}}
                     if data.size:
                         self.stats_label.setText(
-                            f"{data.size} bar(s) with '{metric}': min={fmt(data.min())}  "
+                            f"{data.size} {word}(s) with '{metric}': min={fmt(data.min())}  "
                             f"max={fmt(data.max())}  avg={fmt(data.mean())}")
                     else:
-                        self.stats_label.setText(f"No bar in this BDF matches a '{key_name}' in the CSV")
+                        self.stats_label.setText(f"No {word} in this BDF matches a '{key_name}' in the results file")
                 else:
                     names = [None if pd.isna(x) else str(x) for x in mapped]
                     cats = sorted({x for x in names if x is not None})
@@ -10299,7 +10477,7 @@ def _run_fem_viewer(argv):
                     values = band.copy()
                     self.color_mode = 'categorical'
                     self.legend = {'n': max(len(cats), 1), 'annotations': {float(i): c for i, c in enumerate(cats)}}
-                    self.stats_label.setText(f"{int(np.sum(~np.isnan(band)))} bar(s) with '{metric}', "
+                    self.stats_label.setText(f"{int(np.sum(~np.isnan(band)))} {word}(s) with '{metric}', "
                                              f"{len(cats)} distinct value(s)")
                 self.grid.cell_data['__band'] = band
                 self.has_result[:] = ~np.isnan(values)
@@ -10317,15 +10495,24 @@ def _run_fem_viewer(argv):
         # ==================== ÇİZİM ====================
         def visible_mask(self):
             vis = self.tree_mask & ~self.id_hidden
-            if self.only_results_chk.isChecked() and self.color_mode:
-                vis &= ~self.is_bar | self.has_result
+            if self.only_results_chk.isChecked():
+                if not self._target_is_web():
+                    if self.color_mode:
+                        vis &= ~self.is_bar | self.has_result
+                elif self.bar_df is not None or self.prop_df is not None:     # web boyanırken bar sonuçları da yüklüyse
+                    vis &= ~self.is_bar | self.bar_any
+            if self.only_web_chk.isChecked() and (self.web_elem_df is not None or self.web_prop_df is not None):
+                # web FEM'i dışındaki shell'ler gizlenir. Bar'daki seçenek gibi: web boyanıyorsa o an seçili
+                # metrikte değeri olanlar, değilse Web Flaw dosyasında satırı olanlar kalır.
+                vis &= ~self.is_shell | (self.has_result if (self._target_is_web() and self.color_mode) else self.web_any)
             return vis
 
         def refresh_scene(self):
             if self.grid is None:
                 return
             vis = self.visible_mask()
-            for name in ('others', 'bars'):
+            web_target = self._target_is_web()
+            for name in ('others', 'bars', 'webs'):
                 self.plotter.remove_actor(name, render=False)
                 self.actors.pop(name, None)
             try:
@@ -10333,7 +10520,11 @@ def _run_fem_viewer(argv):
             except Exception:
                 pass
 
-            other_ids = np.nonzero(vis & ~self.is_bar)[0]
+            # Gri zemin: bar olmayan hücreler (web hedefindeyken shell'ler renklendirildiği için hariç).
+            other_mask = vis & ~self.is_bar
+            if web_target:
+                other_mask &= ~self.is_shell
+            other_ids = np.nonzero(other_mask)[0]
             if other_ids.size:
                 self.actors['others'] = self.plotter.add_mesh(
                     self.grid.extract_cells(other_ids), name='others', color='#c9ced6',
@@ -10344,28 +10535,45 @@ def _run_fem_viewer(argv):
             if bar_ids.size:
                 bars = self.grid.extract_cells(bar_ids)
                 common = dict(name='bars', line_width=self.width_spin.value(), reset_camera=False, render=False)
-                if self.color_mode:
-                    n = self.legend['n']
-                    if self.color_mode == 'numeric':
-                        cmap, clim = self._cmap_name(), [0, n]
-                    else:
-                        cmap, clim = ('tab20' if n <= 20 else 'hsv'), [-0.5, n - 0.5]
-                    self.actors['bars'] = self.plotter.add_mesh(
-                        bars, scalars='__band', cmap=cmap, n_colors=n, clim=clim,
-                        nan_color='#9aa0a6', annotations=self.legend['annotations'],
-                        scalar_bar_args=dict(title=self.metric_name, n_labels=0, vertical=True,
-                                             position_x=0.86, position_y=0.08, width=0.08, height=0.84,
-                                             title_font_size=16, label_font_size=13, color='black'),
-                        **common)
+                if self.color_mode and not web_target:
+                    self.actors['bars'] = self.plotter.add_mesh(bars, **self._scalar_kwargs(), **common)
                 else:
                     self.actors['bars'] = self.plotter.add_mesh(bars, color='#1f5fbf', **common)
+
+            if web_target:                      # web shell'leri sonuca göre boyanır
+                web_ids = np.nonzero(vis & self.is_shell)[0]
+                if web_ids.size:
+                    webs = self.grid.extract_cells(web_ids)
+                    common = dict(name='webs', show_edges=self.edges_chk.isChecked(), edge_color='#4d5560',
+                                  opacity=self.opacity_slider.value() / 100.0, reset_camera=False, render=False)
+                    if self.color_mode:
+                        self.actors['webs'] = self.plotter.add_mesh(webs, **self._scalar_kwargs(), **common)
+                    else:
+                        self.actors['webs'] = self.plotter.add_mesh(webs, color='#c9ced6', **common)
 
             if self.last_pick_eid is not None:
                 self._highlight(self.last_pick_eid)
             self.plotter.render()
             self.status_label.setText(f"Visible: {int(vis.sum())} / {self.grid.n_cells} elements   ")
 
+        # _scalar_kwargs: bar'ları da web shell'lerini de aynı renk/lejant ayarlarıyla boyamak için ortak add_mesh argümanları.
+        def _scalar_kwargs(self):
+            n = self.legend['n']
+            if self.color_mode == 'numeric':
+                cmap, clim = self._cmap_name(), [0, n]
+            else:
+                cmap, clim = ('tab20' if n <= 20 else 'hsv'), [-0.5, n - 0.5]
+            return dict(scalars='__band', cmap=cmap, n_colors=n, clim=clim, nan_color='#9aa0a6',
+                        annotations=self.legend['annotations'],
+                        scalar_bar_args=dict(title=self.metric_name, n_labels=0, vertical=True,
+                                             position_x=0.86, position_y=0.08, width=0.08, height=0.84,
+                                             title_font_size=16, label_font_size=13, color='black'))
+
         def _apply_display(self):
+            act = self.actors.get('webs')
+            if act is not None:
+                act.GetProperty().SetOpacity(self.opacity_slider.value() / 100.0)
+                act.GetProperty().SetEdgeVisibility(self.edges_chk.isChecked())
             act = self.actors.get('others')
             if act is not None:
                 act.GetProperty().SetOpacity(self.opacity_slider.value() / 100.0)
@@ -10540,13 +10748,18 @@ def _run_fem_viewer(argv):
             etype = self.type_names[int(self.grid.cell_data['TypeCode'][i])]
             lines = [f"EID: {eid}", f"Type: {etype}", f"PID: {pid if pid >= 0 else '-'}"]
             if self.is_bar[i]:
-                for label, df, key in (("Bar Element ID row", self.bar_df, eid), ("Bar Property ID row", self.prop_df, pid)):
-                    if df is not None and key in df.index:
-                        lines.append(f"\n{label}:")
-                        for col, val in df.loc[key].items():
-                            if isinstance(val, (int, float, np.number)) and not pd.isna(val):
-                                val = str(int(val)) if float(val).is_integer() else fmt(val)
-                            lines.append(f"  {col}: {val}")
+                rows = (("Bar Element ID row", self.bar_df, eid), ("Bar Property ID row", self.prop_df, pid))
+            elif self.is_shell[i]:
+                rows = (("Web Element ID row", self.web_elem_df, eid), ("Web Property ID row", self.web_prop_df, pid))
+            else:
+                rows = ()
+            for label, df, key in rows:
+                if df is not None and key in df.index:
+                    lines.append(f"\n{label}:")
+                    for col, val in df.loc[key].items():
+                        if isinstance(val, (int, float, np.number)) and not pd.isna(val):
+                            val = str(int(val)) if float(val).is_integer() else fmt(val)
+                        lines.append(f"  {col}: {val}")
             self.info_text.setPlainText("\n".join(lines))
             self.statusBar().showMessage(f"Picked EID {eid} ({etype}, PID {pid})", 8000)
 

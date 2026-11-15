@@ -3975,6 +3975,7 @@ class PostProcessingTab:
         self.le_output_folder = tk.StringVar()       # where the split LoadExtraction_NN folders are created
         self.le_exe_path = tk.StringVar()             # Load_Ext_H5.exe
         self.le_max_memory = tk.StringVar(value="50")  # --max-memory, GB
+        self.le_max_parallel = tk.StringVar(value="")   # boş/0 = tüm gruplar birden (eski davranış); N = en fazla N grup aynı anda
 
         self.is_running = False
 
@@ -4153,6 +4154,14 @@ class PostProcessingTab:
         ttk.Label(le_mem_frame, text="Max Memory (GB):", width=18).pack(side=tk.LEFT)
         ttk.Entry(le_mem_frame, textvariable=self.le_max_memory, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Label(le_mem_frame, text="(passed as --max-memory to Load_Ext_H5.exe)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        # Max parallel runs (LE): boş/0 = hepsi birden, N = havuz
+        par_le_frame = ttk.Frame(f2)
+        par_le_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(par_le_frame, text="Max Parallel Runs:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(par_le_frame, textvariable=self.le_max_parallel, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(par_le_frame, text="(Load Extraction: at most this many groups run at the same time, a new one starts as soon as one finishes - blank / 0 = start all groups at once, 20 s apart)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         # ---- Section 3: Actions (RUN sits at the very bottom, after every
@@ -4381,6 +4390,7 @@ class PostProcessingTab:
         Output Folder is now complete (only called after a fully-successful
         _convert_op2_to_h5()). Returns (n_done, n_total_groups)."""
         t_start = time.time()
+        self._le_group_sets = {}      # LoadExtraction_NN klasörü -> o gruba düşen Set adları (havuz çıktı kontrolü için)
         input_excel = self.le_input_excel_path.get().strip()
         example_folder = self.le_example_folder.get().strip()
         out_base = self.le_output_folder.get().strip()
@@ -4440,6 +4450,7 @@ class PostProcessingTab:
             idx = i + 1
             self.log(f"\n  --- Group {idx}/{n}: {len(chunk_sets)} Set(s) ---")
             dest_folder = os.path.join(out_base, f"LoadExtraction_{idx:02d}")
+            self._le_group_sets[dest_folder] = [str(x) for x in chunk_sets]
             # Şablon klasörü (Example LE Folder) bu gruba özel klasöre
             # kopyala - her grup kendi bağımsız, tam çalışır kopyasına sahip olur.
             shutil.copytree(example_folder, dest_folder, dirs_exist_ok=True)
@@ -4560,6 +4571,14 @@ class PostProcessingTab:
         pickle_path = self.le_pickle_path.get().strip()
         max_memory = self.le_max_memory.get().strip()
 
+        try:
+            max_parallel = int(float(self.le_max_parallel.get())) if self.le_max_parallel.get().strip() else 0
+        except (ValueError, TypeError):
+            max_parallel = 0
+        if max_parallel > 0:                  # havuz modu: en fazla N grup aynı anda, biten yerine yenisi başlar
+            return self._run_tfx_pool(group_folders, exe_path, exe_dir, exe_name, maneuver_bdf, thermal_bdf,
+                                      pickle_path, max_memory, max_parallel, t_start)
+
         n_started = 0
         for i, dest_folder in enumerate(group_folders):
             idx = i + 1
@@ -4609,6 +4628,220 @@ class PostProcessingTab:
                   f"Each runs independently - check each group's loadext_log.txt for progress.")
         return n_started, n
 
+    # ==================== LOAD EXTRACTION: SINIRLI PARALEL HAVUZ ====================
+    # "Max Parallel Runs" > 0 ise gruplar bir havuzda çalışır: en fazla N grup aynı anda, biri bitince sıradaki
+    # hemen başlar (Joint Run'daki gibi). Başlatmalar arasında en az _LE_START_STAGGER sn (lisans sunucusunu
+    # boğmamak için). Bir grubun BİTTİĞİ ÜÇ şeyle anlaşılır: (1) o grubun bat süreci çıktı, (2) o sürecin altında
+    # (çocuk process'ler dahil) hiç süreç kalmadı, (3) o gruba düşen Set'lerin Joint_Loads_<Set>.h5 çıktıları
+    # oluştu ve boyutları sabitlendi. Çıktısı eksik kalan grup uyarı olarak yazılır, akış DEVAM eder.
+    _LE_START_STAGGER = 20       # iki başlatma arasındaki en az süre (sn)
+    _LE_POLL_SECONDS = 10        # çocuk process'leri kontrol aralığı (sn)
+    _LE_OUTPUT_GRACE = 180       # bat bittikten sonra çıktıların diske yazılması için tanınan süre (sn)
+    _LE_STABLE_POLL = 5          # dosya boyutu sabitlik kontrol aralığı (sn)
+
+    # _process_table: {pid: parent_pid} (tüm süreçler) ya da okunamazsa None.
+    # Windows: PowerShell CIM; olmazsa wmic. Ek paket gerekmez.
+    @staticmethod
+    def _process_table():
+        cmds = (["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | "
+                 "ConvertTo-Csv -NoTypeInformation"],
+                ["wmic", "process", "get", "ProcessId,ParentProcessId", "/format:csv"])
+        for cmd in cmds:
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+            except Exception:
+                continue
+            table, pid_i, ppid_i = {}, None, None
+            for line in res.stdout.splitlines():
+                cells = [c.strip().strip('"') for c in line.strip().split(',')]
+                if pid_i is None:
+                    low = [c.lower() for c in cells]
+                    if 'processid' in low and 'parentprocessid' in low:
+                        pid_i, ppid_i = low.index('processid'), low.index('parentprocessid')
+                    continue
+                try:
+                    table[int(cells[pid_i])] = int(cells[ppid_i])
+                except (ValueError, IndexError):
+                    continue
+            if table:
+                return table
+        return None
+
+    # _alive_descendants: root_pid'nin (ParentProcessId zinciriyle) şu an YAŞAYAN tüm torunları; süreç
+    # tablosu okunamazsa None. Ebeveyn çıksa bile çocuğun ParentProcessId değeri kalır, bu yüzden bat çıktıktan
+    # sonra da exe ve onun çocukları bulunabilir.
+    @classmethod
+    def _alive_descendants(cls, root_pid):
+        table = cls._process_table()
+        if table is None:
+            return None
+        children = {}
+        for pid, ppid in table.items():
+            children.setdefault(ppid, []).append(pid)
+        found, stack = set(), [root_pid]
+        while stack:
+            cur = stack.pop()
+            for c in children.get(cur, []):
+                if c != root_pid and c not in found:
+                    found.add(c)
+                    stack.append(c)
+        return found
+
+    @staticmethod
+    def _norm_set(name):
+        return re.sub(r'[^a-z0-9]', '', str(name).lower())
+
+    # _group_h5_files: bir LoadExtraction_NN klasörü altındaki (rekürsif) Joint_Loads_<Set>.h5 dosyaları.
+    @staticmethod
+    def _group_h5_files(dest_folder):
+        files = []
+        for dirpath, _, filenames in os.walk(dest_folder):
+            for fn in filenames:
+                low = fn.lower()
+                if low.startswith('joint_loads_') and low.endswith('.h5') and low != 'joint_loads_arranged.h5':
+                    files.append(os.path.join(dirpath, fn))
+        return files
+
+    # _le_wait_group: başlatılmış bir grubun bitişini 3 kontrolle bekler; sonuç sözlüğü döner.
+    def _le_wait_group(self, name, dest_folder, proc, expected_sets):
+        t0 = time.time()
+        warnings = []
+        rc = proc.wait()                                           # (1) bat süreci
+        tree_checked, waited = True, 0
+        while True:                                                # (2) çocuk process'ler
+            alive = self._alive_descendants(proc.pid)
+            if alive is None:
+                tree_checked = False
+                break
+            if not alive:
+                break
+            time.sleep(self._LE_POLL_SECONDS)
+            waited += self._LE_POLL_SECONDS
+            if waited >= 12 * 3600:
+                warnings.append("child processes still running after 12 h - gave up waiting")
+                break
+        missing, n_found = [], 0
+        if expected_sets:                                          # (3) çıktı dosyaları
+            deadline = time.time() + self._LE_OUTPUT_GRACE
+            while True:
+                files = self._group_h5_files(dest_folder)
+                found_norm = {self._norm_set(os.path.basename(f)[len('Joint_Loads_'):-len('.h5')]) for f in files}
+                missing = [x for x in expected_sets if self._norm_set(x) not in found_norm]
+                if not missing or time.time() >= deadline:
+                    break
+                time.sleep(self._LE_STABLE_POLL)
+            n_found = len(expected_sets) - len(missing)
+            if files:
+                prev = None
+                for _ in range(60):                                # boyutlar iki ölçümde aynıysa yazım bitmiştir
+                    cur = {f: os.path.getsize(f) for f in files if os.path.exists(f)}
+                    if cur == prev:
+                        break
+                    prev = cur
+                    time.sleep(self._LE_STABLE_POLL)
+        if rc not in (0, None):
+            warnings.append(f"exit code {rc}")
+        if missing:
+            shown = ", ".join(str(x) for x in missing[:10]) + (" ..." if len(missing) > 10 else "")
+            warnings.append(f"{len(missing)} of {len(expected_sets)} Set output(s) missing: {shown}")
+        return {'name': name, 'rc': rc, 'seconds': time.time() - t0, 'tree_checked': tree_checked,
+                'warnings': warnings, 'n_expected': len(expected_sets or []), 'n_found': n_found}
+
+    # _run_tfx_pool: gruplar havuzda çalışır (bkz. yukarıdaki açıklama). Dönüş: (başlatılan grup sayısı, toplam).
+    def _run_tfx_pool(self, group_folders, exe_path, exe_dir, exe_name, maneuver_bdf, thermal_bdf,
+                      pickle_path, max_memory, max_parallel, t_start):
+        n = len(group_folders)
+        self.log(f"  Pool mode: up to {max_parallel} group(s) at the same time, a new one starts as soon as "
+                  f"one finishes (starts at least {self._LE_START_STAGGER}s apart)")
+        group_sets = getattr(self, '_le_group_sets', {})
+        jobs = []
+        for i, dest_folder in enumerate(group_folders):
+            name = os.path.basename(dest_folder)
+            tfx_path = self._find_tfx_workbook_path(dest_folder)
+            if not tfx_path:
+                self.log(f"  ERROR: {name}: no '...Load_Extraction....xls*' file found - skipping.")
+                continue
+            cmd_line = (
+                f'{exe_name} --mode "Joint" --bdf "{maneuver_bdf}" --sprung-bdf "{thermal_bdf}" '
+                f'--xls "{tfx_path}" --cid "Material" --nsigma "1.28" --pickle "{pickle_path}" '
+                f'--preproc "HM" --stress_output "NO" --output_coord "Buckling" --skin-angle-limit "30" '
+                f'--max-memory {max_memory} --machine "Local"'
+            )
+            bat_path = os.path.join(dest_folder, "loadext.bat")
+            with open(bat_path, 'w', encoding='latin-1') as f:
+                f.write(f'cd /d "{exe_dir}"\n{cmd_line}\n')
+            jobs.append({'idx': i + 1, 'name': name, 'dest': dest_folder, 'bat': bat_path,
+                         'log': os.path.join(dest_folder, "loadext_log.txt"),
+                         'expected': group_sets.get(dest_folder)})
+        if not jobs:
+            return 0, n
+        if not group_sets:
+            self.log("  NOTE: the Set list of each group is unknown here - the output (H5) check is skipped.")
+
+        import queue
+        msgs = queue.Queue()               # worker'lar log YAZMAZ, mesajı kuyruğa koyar; sadece orkestratör thread'i yazar
+        start_lock = threading.Lock()
+        last_start = [None]
+        started = []
+
+        def _work(job):
+            with start_lock:                                       # başlatmalar arası en az _LE_START_STAGGER sn
+                if last_start[0] is not None:
+                    wait = self._LE_START_STAGGER - (time.time() - last_start[0])
+                    if wait > 0:
+                        time.sleep(wait)
+                try:
+                    log_file = open(job['log'], 'w')
+                    proc = subprocess.Popen(["cmd", "/c", job['bat']], cwd=exe_dir, stdout=log_file,
+                                            stderr=subprocess.STDOUT)
+                except Exception as e:
+                    return {'name': job['name'], 'rc': None, 'seconds': 0.0, 'tree_checked': True,
+                            'warnings': [f"could not start: {e}"], 'n_expected': 0, 'n_found': 0, 'failed_start': True}
+                last_start[0] = time.time()
+                started.append(job['name'])
+            msgs.put(f"    [start] {job['name']}  ({len(started)}/{len(jobs)} started)")
+            try:
+                return self._le_wait_group(job['name'], job['dest'], proc, job['expected'])
+            finally:
+                log_file.close()
+
+        def _flush():
+            while True:
+                try:
+                    self.log(msgs.get_nowait())
+                except queue.Empty:
+                    return
+
+        results = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            pending = {executor.submit(_work, j) for j in jobs}
+            while pending:
+                done_set, pending = concurrent.futures.wait(pending, timeout=0.5,
+                                                            return_when=concurrent.futures.FIRST_COMPLETED)
+                _flush()
+                for fut in done_set:
+                    res = fut.result()
+                    results.append(res)
+                    status = "finished" if not res['warnings'] else "finished WITH WARNINGS"
+                    if res.get('failed_start'):
+                        status = "NOT STARTED"
+                    self.log(f"    [{len(results)}/{len(jobs)}] {res['name']}: {status} (took {res['seconds']:.0f}s"
+                              + (f", {res['n_found']}/{res['n_expected']} Set output(s)" if res['n_expected'] else "") + ")")
+                    for w in res['warnings']:
+                        self.log(f"      WARNING: {w}")
+                    self.root.after(0, lambda p=66 + (len(results) / len(jobs)) * 34: self.progress_var.set(p))
+            _flush()
+
+        n_warn = sum(1 for r in results if r['warnings'])
+        n_started = sum(1 for r in results if not r.get('failed_start'))
+        if any(not r['tree_checked'] for r in results):
+            self.log("  NOTE: the process table could not be read (PowerShell / wmic) - the child-process "
+                      "check was skipped; completion rests on the bat process and the output files.")
+        self.log(f"\n  LOAD EXTRACTION: {len(results)}/{len(jobs)} group(s) finished, {n_warn} with warnings "
+                  f"(took {time.time() - t_start:.1f}s)")
+        return n_started, n
+
     # ==================== RUN (FULL PIPELINE) ====================
     # start_run: "RUN" butonunun komutu. Her iki aşamanın (OP2->H5 ve Load
     # Extraction hazırlığı) TÜM girdilerini önceden doğrular - gerçek
@@ -4653,6 +4886,14 @@ class PostProcessingTab:
         except (ValueError, TypeError):
             messagebox.showerror("Error", "Max Memory (GB) must be a positive number")
             return
+        if self.le_max_parallel.get().strip():
+            try:
+                if int(float(self.le_max_parallel.get())) < 0:
+                    raise ValueError
+            except (ValueError, TypeError):
+                messagebox.showerror("Error", "Load Extraction Max Parallel Runs must be a whole number "
+                                              "(blank / 0 = start all groups at once)")
+                return
 
         self.is_running = True
         self.btn_run.config(state=tk.DISABLED)
@@ -5802,6 +6043,7 @@ class FullRunTab:
         self.le_split_count = tk.StringVar(value="10")
         self.le_exe_path = tk.StringVar()
         self.le_max_memory = tk.StringVar(value="50")
+        self.le_max_parallel = tk.StringVar(value="")   # boş/0 = tüm LE grupları birden; N = en fazla N grup aynı anda
 
         # ---- Section 3: Joint Run ----
         self.jr_main_input_excel_path = self.master_input_excel_path
@@ -5948,6 +6190,13 @@ class FullRunTab:
         mem2_frame.pack(fill=tk.X, pady=2)
         ttk.Label(mem2_frame, text="Max Memory (GB):", width=18).pack(side=tk.LEFT)
         ttk.Entry(mem2_frame, textvariable=self.le_max_memory, width=10).pack(side=tk.LEFT, padx=5)
+
+        par_le_frame = ttk.Frame(f2)
+        par_le_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(par_le_frame, text="Max Parallel Runs:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(par_le_frame, textvariable=self.le_max_parallel, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(par_le_frame, text="(Load Extraction: at most this many groups run at the same time, a new one starts as soon as one finishes - blank / 0 = start all groups at once, 20 s apart)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         ttk.Label(f2, text="(Input Excel, OP2 Folder, Output Folder H5, BDF Maneuver/Thermal and "
                             "the LE split Output Folder are all auto-wired from stage 1's results)",
@@ -6223,6 +6472,14 @@ class FullRunTab:
         except (ValueError, TypeError):
             messagebox.showerror("Error", "Post Processing Max Memory must be a positive number")
             return
+        if self.le_max_parallel.get().strip():
+            try:
+                if int(float(self.le_max_parallel.get())) < 0:
+                    raise ValueError
+            except (ValueError, TypeError):
+                messagebox.showerror("Error", "Load Extraction Max Parallel Runs must be a whole number "
+                                              "(blank / 0 = start all groups at once)")
+                return
         try:
             if int(float(self.jr_max_parallel_runs.get())) <= 0:
                 raise ValueError
@@ -6371,6 +6628,7 @@ class FullRunTab:
             t4.le_output_folder.set(le_results_dir)
             t4.le_exe_path.set(self.le_exe_path.get())
             t4.le_max_memory.set(self.le_max_memory.get())
+            t4.le_max_parallel.set(self.le_max_parallel.get())
 
             self.root.after(0, lambda: self.progress_var.set(40))
             t4._run_pipeline()
@@ -6521,6 +6779,7 @@ class IterativeFullRunTab:
         self.le_split_count = tk.StringVar(value="10")
         self.le_exe_path = tk.StringVar()
         self.le_max_memory = tk.StringVar(value="50")
+        self.le_max_parallel = tk.StringVar(value="")   # boş/0 = tüm LE grupları birden; N = en fazla N grup aynı anda
 
         # ---- Section 3: Joint Run ----
         self.jr_example_joint_excel_path = tk.StringVar()
@@ -6674,6 +6933,13 @@ class IterativeFullRunTab:
         mem2_frame.pack(fill=tk.X, pady=2)
         ttk.Label(mem2_frame, text="Max Memory (GB):", width=18).pack(side=tk.LEFT)
         ttk.Entry(mem2_frame, textvariable=self.le_max_memory, width=10).pack(side=tk.LEFT, padx=5)
+
+        par_le_frame = ttk.Frame(f2)
+        par_le_frame.pack(fill=tk.X, pady=2)
+        ttk.Label(par_le_frame, text="Max Parallel Runs:", width=18).pack(side=tk.LEFT)
+        ttk.Entry(par_le_frame, textvariable=self.le_max_parallel, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Label(par_le_frame, text="(Load Extraction: at most this many groups run at the same time, a new one starts as soon as one finishes - blank / 0 = start all groups at once, 20 s apart)",
+                 font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
 
         ttk.Label(f2, text="(Input Excel, OP2 Folder, Output Folder H5, BDF Maneuver/Thermal and "
                             "the LE split Output Folder are all auto-wired every iteration)",
@@ -7532,6 +7798,14 @@ class IterativeFullRunTab:
         except (ValueError, TypeError):
             messagebox.showerror("Error", "Post Processing Max Memory must be a positive number")
             return
+        if self.le_max_parallel.get().strip():
+            try:
+                if int(float(self.le_max_parallel.get())) < 0:
+                    raise ValueError
+            except (ValueError, TypeError):
+                messagebox.showerror("Error", "Load Extraction Max Parallel Runs must be a whole number "
+                                              "(blank / 0 = start all groups at once)")
+                return
         try:
             if int(float(self.jr_max_parallel_runs.get())) <= 0:
                 raise ValueError
@@ -7743,6 +8017,7 @@ class IterativeFullRunTab:
                 t4.le_output_folder.set(le_results_dir)
                 t4.le_exe_path.set(self.le_exe_path.get())
                 t4.le_max_memory.set(self.le_max_memory.get())
+                t4.le_max_parallel.set(self.le_max_parallel.get())
 
                 t4._run_pipeline()
 
@@ -9124,6 +9399,7 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
                 t4.le_output_folder.set(le_results_dir)
                 t4.le_exe_path.set(self.le_exe_path.get())
                 t4.le_max_memory.set(self.le_max_memory.get())
+                t4.le_max_parallel.set(self.le_max_parallel.get())
 
                 t4._run_pipeline()
 

@@ -254,6 +254,15 @@ class IntegratedBDFRFTool:
         self._tab_color_icons.append(icon)  # GC'ye karşı referansı sakla
         return icon
 
+    # _add_sub_tab: verilen iç sekme grubuna (inner notebook) renkli ikonlu bir sekme çerçevesi ekler ve
+    # çerçeveyi döndürür. Sekme sınıfları (BarPropertySolverTab, PostProcessingTab, ...) bu çerçeveyi
+    # "parent_frame" olarak alır - kendi kodları gruplamadan habersizdir, hiç değişmedi.
+    def _add_sub_tab(self, inner_notebook, text, color):
+        frame = ttk.Frame(inner_notebook)
+        inner_notebook.add(frame, text=text)
+        inner_notebook.tab(frame, image=self._make_tab_icon(color), compound='left')
+        return frame
+
     def setup_ui(self):
         # ---- Üst başlık şeridi (banner) ----
         # Pencerenin en üstünde görünen "🔧 DaDT Joint Optimization Tool"
@@ -268,8 +277,29 @@ class IntegratedBDFRFTool:
         # ---- Sekme (Notebook) çubuğu ----
         # Notebook: üstte tıklanabilir sekme kulakçıkları (tabs) gösteren,
         # her sekmenin kendi içeriğini barındıran Tkinter widget'ı.
-        self.notebook = ttk.Notebook(self.root)
+        # Sekmeler iki seviyeli: üstte ANA SEKMELER (süreç grupları), her birinin içinde o gruba ait
+        # sekmeler. self.notebook = ana sekme çubuğu; her grubun kendi iç notebook'u var.
+        _style = ttk.Style()
+        _style.configure('Main.TNotebook.Tab', font=('Segoe UI', 10, 'bold'), padding=(18, 9))
+        _style.configure('Sub.TNotebook.Tab', font=('Segoe UI', 9, 'bold'), padding=(12, 6))
+        self.notebook = ttk.Notebook(self.root, style='Main.TNotebook')
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        def _make_group(title, color):
+            outer = ttk.Frame(self.notebook)
+            self.notebook.add(outer, text=title)
+            self.notebook.tab(outer, image=self._make_tab_icon(color), compound='left')
+            inner = ttk.Notebook(outer, style='Sub.TNotebook')
+            inner.pack(fill=tk.BOTH, expand=True, padx=4, pady=(6, 4))
+            return inner
+
+        # Ana sekmeler, görünme sırasıyla. İç sekmeler aşağıda (bağımlılık sırasına göre) oluşturulur.
+        g_bdf = _make_group("BDF PREPARATION STAGE", '#2563eb')
+        g_nastran = _make_group("NASTRAN SOLVER", '#166534')
+        g_joint = _make_group("JOINT PROCESS", '#16a34a')
+        g_web = _make_group("WEB FLAW PROCESS", '#0d9488')
+        g_iter = _make_group("ITERATIVE RUN", '#800000')
+        g_vis = _make_group("VISUALIZATION", '#9333ea')
 
         # ---- Sekme renk grupları ----
         # BDF Merge Preparation: mavi (tek başına kendi rengi).
@@ -286,9 +316,7 @@ class IntegratedBDFRFTool:
         # ---- Sekme 1: BDF Merge Preparation (mavi) ----
         # Bu sekmenin içeriği ayrı bir sınıfa çıkarılmamış; setup_tab1()
         # metodu doğrudan bu notebook'un ilk sekmesinin (self.tab1) içini dolduruyor.
-        self.tab1 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab1, text="\U0001F4C4  BDF Merge Preparation")
-        self.notebook.tab(self.tab1, image=self._make_tab_icon(_TAB_COLOR_BLUE), compound='left')
+        self.tab1 = self._add_sub_tab(g_bdf, "\U0001F4C4  BDF Merge Preparation", _TAB_COLOR_BLUE)
         self.setup_tab1()
 
         # ---- Sekme 2: Nastran Solver (yeşil) ----
@@ -296,24 +324,18 @@ class IntegratedBDFRFTool:
         # self.tab3 çerçevesinin içine yerleştiriliyor. Bu örnek referansı daha
         # sonra Full Run / Iterative Full Run sekmeleri tarafından da (dışarıdan,
         # bu sınıfın kodu hiç değiştirilmeden) kullanılacak.
-        self.tab3 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab3, text="\U0001F9EE  Nastran Solver")
-        self.notebook.tab(self.tab3, image=self._make_tab_icon(_TAB_COLOR_GREEN), compound='left')
+        self.tab3 = self._add_sub_tab(g_nastran, "\U0001F9EE  Nastran Solver", _TAB_COLOR_GREEN)
         self.tab3_tool = BarPropertySolverTab(self.tab3, self.root)
 
         # ---- Sekme 3: Post Processing (yeşil) ----
         # OP2 -> H5 dönüşümü ve Load Extraction klasör hazırlığını yapan sekme.
-        self.tab4 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab4, text="\U0001F4E6  Post Processing")
-        self.notebook.tab(self.tab4, image=self._make_tab_icon(_TAB_COLOR_GREEN), compound='left')
+        self.tab4 = self._add_sub_tab(g_joint, "\U0001F4E6  Post Processing", _TAB_COLOR_GREEN)
         self.tab4_tool = PostProcessingTab(self.tab4, self.root)
 
         # ---- Sekme 4: Joint Run (yeşil) ----
         # Joint Load H5'lerini Set bazında gruplayıp RSS Case Finding / Load
         # Modifying / Joint Run exe'lerini çalıştıran sekme.
-        self.tab5 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab5, text="\U0001F517  Joint Run")
-        self.notebook.tab(self.tab5, image=self._make_tab_icon(_TAB_COLOR_GREEN), compound='left')
+        self.tab5 = self._add_sub_tab(g_joint, "\U0001F517  Joint Run", _TAB_COLOR_GREEN)
         self.tab5_tool = JointRunTab(self.tab5, self.root)
 
         # ---- Sekme 5: Full Run (sarı) ----
@@ -323,33 +345,32 @@ class IntegratedBDFRFTool:
         # kendi kopyasını oluşturmuyor, doğrudan yukarıdaki aynı 3 sekme
         # nesnesini (onların StringVar'larını set edip metodlarını çağırarak)
         # dışarıdan yönetiyor.
-        self.tab6 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab6, text="⚡  Full Run")
-        self.notebook.tab(self.tab6, image=self._make_tab_icon(_TAB_COLOR_YELLOW), compound='left')
+        self.tab6 = self._add_sub_tab(g_joint, "⚡  Full Run", _TAB_COLOR_YELLOW)
         self.tab6_tool = FullRunTab(self.tab6, self.root, self.tab3_tool, self.tab4_tool, self.tab5_tool)
 
         # ---- Sekme 6: Iterative Full Run (bordo) ----
         # Full Run'ın aynı mantığının N kez döngüye alınmış hali (her
         # iterasyonun sonucu bir sonraki iterasyonun girdisine besleniyor).
         # Aynı şekilde tab3_tool/tab4_tool/tab5_tool referansları paylaşılıyor.
-        self.tab7 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab7, text="\U0001F501  Iterative Full Run")
-        self.notebook.tab(self.tab7, image=self._make_tab_icon(_TAB_COLOR_MAROON), compound='left')
+        self.tab7 = self._add_sub_tab(g_iter, "\U0001F501  Iterative Joint Run", _TAB_COLOR_MAROON)
         self.tab7_tool = IterativeFullRunTab(self.tab7, self.root, self.tab3_tool, self.tab4_tool, self.tab5_tool)
+        try:        # sayfanın başlığı da yeni sekme adıyla uyumlu olsun (sadece etiket metni)
+            _w = self.tab7_tool.log_text
+            while not isinstance(_w, ttk.LabelFrame):
+                _w = _w.master
+            _w.master.winfo_children()[0].config(text="Iterative Joint Run")
+        except Exception:
+            pass
 
         # ---- Sekme: Web Flaw Run (turkuaz) ----
         # Web flaw load extraction + All_Loads_Sta.h5 + Web Flaw exe. Bağımsız
         # çalışır; aşağıdaki Improved Iterative Full Run da bu nesneyi dışarıdan sürer.
-        self.tab9 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab9, text="\U0001F9E9  Web Flaw Run")
-        self.notebook.tab(self.tab9, image=self._make_tab_icon(_TAB_COLOR_TEAL), compound='left')
+        self.tab9 = self._add_sub_tab(g_web, "\U0001F9E9  Web Flaw Run", _TAB_COLOR_TEAL)
         self.tab9_tool = WebFlawRunTab(self.tab9, self.root)
 
         # ---- Sekme: Improved Iterative Full Run (turuncu) ----
         # Iterative Full Run + her iterasyonda Joint Run'dan sonra Web Flaw Run.
-        self.tab10 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab10, text="\U0001F680  Improved Iterative Full Run")
-        self.notebook.tab(self.tab10, image=self._make_tab_icon(_TAB_COLOR_ORANGE), compound='left')
+        self.tab10 = self._add_sub_tab(g_iter, "\U0001F680  Improved Iterative Full Run", _TAB_COLOR_ORANGE)
         self.tab10_tool = ImprovedIterativeFullRunTab(self.tab10, self.root, self.tab3_tool, self.tab4_tool,
                                                       self.tab5_tool, self.tab9_tool)
 
@@ -359,9 +380,7 @@ class IntegratedBDFRFTool:
         # Run'ın ürettiği DT_SIZING_BAR_SUMMARY.csv / DT_SIZING_PROP_SUMMARY.csv
         # sonuçlarını (t, d, Material, Life) bar elemanlarının üzerine
         # renk kodlayarak gösterir.
-        self.tab8 = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab8, text="\U0001F4CA  Visualization Results")
-        self.notebook.tab(self.tab8, image=self._make_tab_icon(_TAB_COLOR_PURPLE), compound='left')
+        self.tab8 = self._add_sub_tab(g_vis, "\U0001F4CA  Visualization Results", _TAB_COLOR_PURPLE)
         self.tab8_tool = VisualizationResultsTab(self.tab8, self.root)
 
 

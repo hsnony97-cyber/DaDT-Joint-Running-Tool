@@ -197,7 +197,7 @@ class IntegratedBDFRFTool:
         # oluşturulup buraya parametre olarak geçiriliyor).
         self.root = root
         # Pencere başlığı (Windows'ta pencerenin üst çubuğunda görünen yazı).
-        self.root.title("DaDT Joint Optimization Tool")
+        self.root.title("DaDT Optimization Tool")
         # Pencerenin açılış boyutu (genişlik x yükseklik, piksel).
         # Arayüz büyüdü (yeni Web Flaw sekmeleri): ekrana sığdığı sürece 1500x1000, daha
         # küçük ekranlarda ekran boyutunun biraz altı.
@@ -263,14 +263,30 @@ class IntegratedBDFRFTool:
         inner_notebook.tab(frame, image=self._make_tab_icon(color), compound='left')
         return frame
 
+    # _stretch_scrollable_content: kaydırılabilir sekmelerde (Canvas + içine create_window ile konmuş çerçeve)
+    # içerik çerçevesi kendi istediği genişlikte kalıyor, sağ taraf boş görünüyordu. Burada, sekme sınıflarına
+    # dokunmadan, tuvalin genişliği değiştikçe çerçeve genişliği tuvale uydurulur (içeriğin istediği genişlikten
+    # DAHA DAR yapılmaz - küçük pencerede içerik sıkışmasın).
+    @staticmethod
+    def _stretch_scrollable_content(tab_frame):
+        for canvas in [w for w in tab_frame.winfo_children() if isinstance(w, tk.Canvas)]:
+            items = [i for i in canvas.find_all() if canvas.type(i) == 'window']
+            if not items:
+                continue
+            item = items[0]
+            inner = canvas.nametowidget(canvas.itemcget(item, 'window'))
+
+            def _fit(event, c=canvas, i=item, f=inner):
+                c.itemconfigure(i, width=max(event.width, f.winfo_reqwidth()))
+            canvas.bind('<Configure>', _fit, add='+')
+
     def setup_ui(self):
         # ---- Üst başlık şeridi (banner) ----
-        # Pencerenin en üstünde görünen "🔧 DaDT Joint Optimization Tool"
+        # Pencerenin en üstünde görünen "🔧 DaDT Optimization Tool"
         # yazısını içeren çerçeve.
         banner = ttk.Frame(self.root, padding=(16, 12))
         banner.pack(fill=tk.X)
-        ttk.Label(banner, text="\U0001F527 DaDT Joint Optimization Tool", style='Header.TLabel').pack(side=tk.LEFT)
-        ttk.Label(banner, text="  v16.0", style='Subtitle.TLabel').pack(side=tk.LEFT, pady=(6, 0))
+        ttk.Label(banner, text="\U0001F527 DaDT Optimization Tool", style='Header.TLabel').pack(side=tk.LEFT)
         # Banner ile sekme çubuğu arasına yatay bir ayraç (ince çizgi) çiz.
         ttk.Separator(self.root, orient='horizontal').pack(fill=tk.X)
 
@@ -383,6 +399,10 @@ class IntegratedBDFRFTool:
         self.tab8 = self._add_sub_tab(g_vis, "\U0001F4CA  Visualization Results", _TAB_COLOR_PURPLE)
         self.tab8_tool = VisualizationResultsTab(self.tab8, self.root)
 
+        # Tüm kaydırılabilir sekmelerin içeriği pencerenin tam genişliğini kullansın.
+        for _tab in (self.tab3, self.tab4, self.tab5, self.tab6, self.tab7, self.tab9, self.tab10):
+            self._stretch_scrollable_content(_tab)
+
 
     # setup_tab1: "BDF Merge Preparation" sekmesinin tüm arayüzünü (Thermal
     # ve Maneuver BDF listeleri, ayarlar, PROCESS butonu, Log paneli) kurar.
@@ -394,7 +414,7 @@ class IntegratedBDFRFTool:
         main.pack(fill=tk.BOTH, expand=True)
 
         # Sekme başlığı.
-        ttk.Label(main, text="BDF Merge Preparation v8", style='Header.TLabel').pack(pady=(0,10))
+        ttk.Label(main, text="BDF Merge Preparation", style='Header.TLabel').pack(pady=(0,10))
 
         # === THERMAL BÖLÜMÜ ===
         # "Thermal" tipi master BDF dosyalarının eklenip listelendiği kutu.

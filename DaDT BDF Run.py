@@ -9863,9 +9863,11 @@ def _fem_enable_software_opengl(log=None):
 
 
 def _fem_parse_id_list(text):
-    """'1001, 1005-1010 2000' -> {1001, 1005, ..., 1010, 2000}."""
+    """'1001, 1005-1010 2000' -> {1001, 1005, ..., 1010, 2000}. Ayraç: virgül, boşluk, tab, satır sonu
+    veya noktalı virgül; aralık: 1005-1010, '1005 - 1010', 1005:1010 ya da 1005..1010."""
     ids = set()
-    for tok in re.split(r'[,\s;]+', text.strip()):
+    text = re.sub(r'\s*(?:\.\.|:|-)\s*', '-', text.strip())     # aralık işaretinin etrafındaki boşlukları kaldır
+    for tok in re.split(r'[,\s;]+', text):
         if not tok:
             continue
         if '-' in tok[1:]:
@@ -9985,6 +9987,7 @@ def _run_fem_viewer(argv):
             self.color_mode = None   # None | 'numeric' | 'categorical'
             self.actors = {}
             self.last_pick_eid = None
+            self.last_pick_idx = None     # highlight edilen hücre indeksleri (eleman: 1, property: hepsi)
             self._tree_update_pending = False
             self._worker = None
 
@@ -10060,22 +10063,41 @@ def _run_fem_viewer(argv):
             if args.group in group_options:
                 self.group_combo.setCurrentText(args.group)
             self.group_combo.currentTextChanged.connect(self._on_group_changed)
-            gl.addWidget(QtWidgets.QLabel("Group by:"), 5, 0)
-            gl.addWidget(self.group_combo, 5, 1, 1, 3)
+            # Property / Element görünümü: aynı "Group by" ailesinin (Bar / Web) iki seviyesi arasında geçiş.
+            # Property görünümünde tıklanan eleman değil, ait olduğu TÜM property highlight edilir.
+            self.view_prop_rb = QtWidgets.QRadioButton("Property view")
+            self.view_elem_rb = QtWidgets.QRadioButton("Element view")
+            view_row = QtWidgets.QHBoxLayout()
+            view_row.addWidget(self.view_prop_rb)
+            view_row.addWidget(self.view_elem_rb)
+            view_row.addStretch(1)
+            gl.addWidget(QtWidgets.QLabel("View:"), 5, 0)
+            gl.addLayout(view_row, 5, 1, 1, 3)
+            self.view_prop_rb.toggled.connect(lambda on: on and self._on_view_radio(True))
+            self.view_elem_rb.toggled.connect(lambda on: on and self._on_view_radio(False))
+            gl.addWidget(QtWidgets.QLabel("Group by:"), 6, 0)
+            gl.addWidget(self.group_combo, 6, 1, 1, 3)
+            self._sync_view_radios()
             self.metric_combo = QtWidgets.QComboBox()
             self.metric_combo.currentTextChanged.connect(self._on_metric_changed)
-            gl.addWidget(QtWidgets.QLabel("Color by:"), 6, 0)
-            gl.addWidget(self.metric_combo, 6, 1, 1, 3)
+            gl.addWidget(QtWidgets.QLabel("Color by:"), 7, 0)
+            gl.addWidget(self.metric_combo, 7, 1, 1, 3)
             self.only_results_chk = QtWidgets.QCheckBox("Show only bars that have results")
             self.only_results_chk.toggled.connect(lambda _: self.refresh_scene())
-            gl.addWidget(self.only_results_chk, 7, 0, 1, 4)
+            gl.addWidget(self.only_results_chk, 8, 0, 1, 4)
             # Web tarafı için aynı seçenek: sadece Web Flaw sonucu olan shell'leri (web FEM'ini) göster.
             self.only_web_chk = QtWidgets.QCheckBox("Show only web elements that have results")
             self.only_web_chk.toggled.connect(lambda _: self.refresh_scene())
-            gl.addWidget(self.only_web_chk, 8, 0, 1, 4)
+            gl.addWidget(self.only_web_chk, 9, 0, 1, 4)
             self.stats_label = QtWidgets.QLabel("")
             self.stats_label.setWordWrap(True)
-            gl.addWidget(self.stats_label, 9, 0, 1, 4)
+            gl.addWidget(self.stats_label, 10, 0, 1, 4)
+            # Çift tıklanan property / elemanın ID'si ve ekrandaki plot değeri (yan paneli kaydırmadan görünsün diye burada).
+            self.pick_label = QtWidgets.QLabel("Double-click a bar / web element in the 3D view: its property "
+                                               "ID and the plotted value show here")
+            self.pick_label.setWordWrap(True)
+            self.pick_label.setStyleSheet("font-weight: bold; color: #8e24aa;")
+            gl.addWidget(self.pick_label, 11, 0, 1, 4)
             lay.addWidget(g)
 
             # ---- Contour ----
@@ -10138,7 +10160,7 @@ def _run_fem_viewer(argv):
                 b.clicked.connect(fn)
                 gl.addWidget(b, 1 + col // 2, (col % 2) * 2, 1, 2)
             self.ids_edit = QtWidgets.QLineEdit()
-            self.ids_edit.setPlaceholderText("Element IDs, e.g. 1001, 1005-1010")
+            self.ids_edit.setPlaceholderText("Element IDs - comma or space separated, e.g. 1001, 1005-1010 2000")
             gl.addWidget(self.ids_edit, 3, 0, 1, 4)
             for col, (text, fn) in enumerate([("Hide IDs", self._hide_ids), ("Show Only IDs", self._show_only_ids),
                                                ("Hide Picked", self._hide_picked),
@@ -10312,6 +10334,7 @@ def _run_fem_viewer(argv):
                 self.group_combo.blockSignals(True)
                 self.group_combo.setCurrentText(available[0])
                 self.group_combo.blockSignals(False)
+            self._sync_view_radios()
             self._compute_any_masks()
             self._refresh_metric_options(preferred=args.metric)
             self.apply_contour()
@@ -10359,7 +10382,32 @@ def _run_fem_viewer(argv):
                 self.metric_combo.setCurrentText(next((c for c in cols if 'life' in c.lower()), cols[0]))
             self.metric_combo.blockSignals(False)
 
+        def _is_property_view(self):
+            return self.group_combo.currentText().endswith('Property ID')
+
+        def _sync_view_radios(self):
+            if not hasattr(self, 'view_prop_rb'):
+                return
+            prop = self._is_property_view()
+            for rb, on in ((self.view_prop_rb, prop), (self.view_elem_rb, not prop)):
+                rb.blockSignals(True)
+                rb.setChecked(on)
+                rb.blockSignals(False)
+
+        # _on_view_radio: radyo düğmesi "Group by"ı aynı ailenin (Bar / Web) Property <-> Element seviyesine çevirir.
+        def _on_view_radio(self, property_view):
+            family = 'Web' if self._target_is_web() else 'Bar'
+            new = f"{family} {'Property' if property_view else 'Element'} ID"
+            if self._df_for_group(new) is None:
+                self.statusBar().showMessage(f"No {new} results loaded - load the matching CSV / Excel first", 7000)
+                self._sync_view_radios()
+                return
+            if self.group_combo.currentText() != new:
+                self.group_combo.setCurrentText(new)       # -> _on_group_changed
+
         def _on_group_changed(self, _):
+            self._sync_view_radios()
+            self._clear_pick()
             self._refresh_metric_options()
             self.auto_chk.setChecked(True)
             self.apply_contour()
@@ -10551,8 +10599,8 @@ def _run_fem_viewer(argv):
                     else:
                         self.actors['webs'] = self.plotter.add_mesh(webs, color='#c9ced6', **common)
 
-            if self.last_pick_eid is not None:
-                self._highlight(self.last_pick_eid)
+            if self.last_pick_idx is not None and self.last_pick_idx.size:
+                self._highlight_idx(self.last_pick_idx)
             self.plotter.render()
             self.status_label.setText(f"Visible: {int(vis.sum())} / {self.grid.n_cells} elements   ")
 
@@ -10702,10 +10750,9 @@ def _run_fem_viewer(argv):
                 self.refresh_scene()
 
         def _hide_picked(self):
-            if self.last_pick_eid is not None and self.grid is not None:
-                self.id_hidden |= np.asarray(self.grid.cell_data['EID']) == self.last_pick_eid
-                self.last_pick_eid = None
-                self.plotter.remove_actor('__pick', render=False)
+            if self.last_pick_idx is not None and self.last_pick_idx.size and self.grid is not None:
+                self.id_hidden[self.last_pick_idx] = True       # property görünümünde TÜM property gizlenir
+                self._clear_pick()
                 self.refresh_scene()
 
         def _unhide_ids(self):
@@ -10729,39 +10776,99 @@ def _run_fem_viewer(argv):
             if 'EID' not in ds.cell_data:
                 return
             eid = int(ds.cell_data['EID'][cell_id])
-            self.last_pick_eid = eid
-            self._highlight(eid)
-            self._show_info(eid)
-            self.plotter.render()
-
-        def _highlight(self, eid):
             idx = np.nonzero(np.asarray(self.grid.cell_data['EID']) == eid)[0]
             if not idx.size:
                 return
+            i = int(idx[0])
+            pid = int(self.grid.cell_data['PID'][i])
+            family = self.is_shell if self._target_is_web() else self.is_bar    # o an sonucu boyanan hücre ailesi
+            if self._is_property_view() and family[i] and pid >= 0:
+                # Property görünümü: tıklanan elemanın property'sine ait TÜM hücreler highlight edilir.
+                sel = np.nonzero((np.asarray(self.grid.cell_data['PID']) == pid) & family)[0]
+                mode = 'property'
+            else:
+                sel, mode = idx[:1], 'element'
+            self.last_pick_eid = eid
+            self.last_pick_idx = sel
+            self._highlight_idx(sel)
+            self._show_pick_info(i, eid, pid, sel, mode)
+            self.plotter.render()
+
+        def _highlight_idx(self, idx):
+            if idx is None or not len(idx):
+                return
+            # Shell'lerde kalın çizgi küçük hücreleri tamamen kapatır - orada ince çizgi kullan.
+            lw = 3 if np.asarray(self.is_shell)[np.asarray(idx)].any() else self.width_spin.value() + 4
             self.plotter.add_mesh(self.grid.extract_cells(idx), name='__pick', color='magenta',
-                                  style='wireframe', line_width=self.width_spin.value() + 4,
+                                  style='wireframe', line_width=lw,
                                   reset_camera=False, pickable=False, render=False)
 
-        def _show_info(self, eid):
-            i = int(np.nonzero(np.asarray(self.grid.cell_data['EID']) == eid)[0][0])
-            pid = int(self.grid.cell_data['PID'][i])
+        def _clear_pick(self):
+            self.last_pick_eid = None
+            self.last_pick_idx = None
+            if hasattr(self, 'pick_label'):
+                self.pick_label.setText("Double-click a bar / web element in the 3D view: its property "
+                                        "ID and the plotted value show here")
+            if hasattr(self, 'plotter'):
+                self.plotter.remove_actor('__pick', render=False)
+                self.plotter.remove_actor('__pick_text', render=False)
+
+        # _pick_value: o an ekranda çizilen metriğin (Color by) tıklanan öğe için değeri. Property görünümünde
+        # property satırından, element görünümünde eleman satırından okunur. Dönüş: (metrik adı, değer metni | None).
+        def _pick_value(self, pid, eid):
+            df, metric = self._current_df(), self.metric_combo.currentText()
+            if df is None or not metric or metric not in df.columns or not self.color_mode:
+                return metric, None
+            key = pid if self._is_property_view() else eid
+            if key not in df.index:
+                return metric, None
+            val = df.at[key, metric]
+            if pd.isna(val):
+                return metric, None
+            if isinstance(val, (int, float, np.number)):
+                return metric, (str(int(val)) if float(val).is_integer() else fmt(val))
+            return metric, str(val)
+
+        def _show_pick_info(self, i, eid, pid, sel, mode):
             etype = self.type_names[int(self.grid.cell_data['TypeCode'][i])]
-            lines = [f"EID: {eid}", f"Type: {etype}", f"PID: {pid if pid >= 0 else '-'}"]
+            metric, vtxt = self._pick_value(pid, eid)
+            value_line = f"Plot value ({metric}): {vtxt if vtxt is not None else 'no result in the file'}" \
+                if metric and self.color_mode else "Plot value: (no results plotted)"
             if self.is_bar[i]:
-                rows = (("Bar Element ID row", self.bar_df, eid), ("Bar Property ID row", self.prop_df, pid))
+                family = 'Bar'
+                rows = [("Bar Property ID row", self.prop_df, pid), ("Bar Element ID row", self.bar_df, eid)]
             elif self.is_shell[i]:
-                rows = (("Web Element ID row", self.web_elem_df, eid), ("Web Property ID row", self.web_prop_df, pid))
+                family = 'Web'
+                rows = [("Web Property ID row", self.web_prop_df, pid), ("Web Element ID row", self.web_elem_df, eid)]
             else:
-                rows = ()
-            for label, df, key in rows:
+                family, rows = '', []
+            if mode == 'property':
+                counts = {}
+                for t in np.asarray(self.grid.cell_data['TypeCode'])[sel]:
+                    counts[self.type_names[int(t)]] = counts.get(self.type_names[int(t)], 0) + 1
+                lines = [f"PROPERTY {pid}   ({family})", value_line,
+                         f"Elements: {len(sel)}  (" + ", ".join(f"{k} x{v}" for k, v in sorted(counts.items())) + ")",
+                         f"Picked element: EID {eid} ({etype})"]
+                label = f"Property {pid}  |  {metric}: {vtxt if vtxt is not None else 'no result'}  |  {len(sel)} element(s)"
+            else:
+                lines = [f"ELEMENT {eid}   ({etype})", f"PID: {pid if pid >= 0 else '-'}", value_line]
+                label = f"Element {eid} (PID {pid if pid >= 0 else '-'})"
+                if metric and self.color_mode:
+                    label += f"  |  {metric}: {vtxt if vtxt is not None else 'no result'}"
+                rows.reverse()                 # element görünümünde önce eleman satırı
+            for title, df, key in rows:
                 if df is not None and key in df.index:
-                    lines.append(f"\n{label}:")
+                    lines.append(f"\n{title}:")
                     for col, val in df.loc[key].items():
                         if isinstance(val, (int, float, np.number)) and not pd.isna(val):
                             val = str(int(val)) if float(val).is_integer() else fmt(val)
                         lines.append(f"  {col}: {val}")
             self.info_text.setPlainText("\n".join(lines))
-            self.statusBar().showMessage(f"Picked EID {eid} ({etype}, PID {pid})", 8000)
+            self.pick_label.setText(label)
+            self.statusBar().showMessage(label, 10000)
+            # 3B görünümün sol üstünde de göster - yan panel kaydırılmadan okunabilsin.
+            self.plotter.add_text(label, position='upper_left', font_size=11, color='black',
+                                  name='__pick_text', render=False)
 
         def closeEvent(self, event):
             self.plotter.close()

@@ -8051,7 +8051,7 @@ def _wf_scale_h5(src_h5, dst_h5, scale, group_name='ELFORCE_SHELL_COMBINED',
 # klasörüne taşır, (3) ELFORCE_SHELL_COMBINED içindeki MX/MY/MXY'yi kullanıcının
 # scale değeriyle çarpıp aynı ağaç yapısında All_Loads_Sta.h5 üretir, (4) Example
 # Web Flaw Excel'i 'Web_Flaw_Input_Excel_Data' sayfasıyla doldurur ('DaDT/Static
-# Load Extraction .csv Folder Path' = All_Loads*.h5'in klasörü), (5) Web Flaw
+# Load Extraction .csv Folder Path' = All_Loads.h5 / All_Loads_Sta.h5 DOSYALARININ tam yolu), (5) Web Flaw
 # exe'sini o klasörde çalıştırıp bitmesini bekler ve '*_Prop_Results.xlsx'i okur.
 # Iterative sekmesi bu nesneyi (Full Run'ın tab3/4/5 nesnelerini kullandığı gibi)
 # dışarıdan sürer: StringVar'ları doldurup run_web_flaw()'u çağırır.
@@ -8454,16 +8454,16 @@ class WebFlawRunTab:
         for r_off, (_, row) in enumerate(input_df.iterrows()):
             r = header_row + 1 + r_off
             for norm, col_idx in xl_header.items():
-                if 'dadtloadextraction' in norm:             # DaDT Load Extraction .csv Folder Path
-                    target_ws.cell(row=r, column=col_idx).value = out_dir
-                elif 'staticloadextraction' in norm:         # Static Load Extraction .csv Folder Path
-                    target_ws.cell(row=r, column=col_idx).value = out_dir
+                if 'dadtloadextraction' in norm:             # DaDT Load Extraction (.csv) Folder Path -> All_Loads.h5 DOSYASI
+                    target_ws.cell(row=r, column=col_idx).value = all_loads
+                elif 'staticloadextraction' in norm:         # Static Load Extraction (.csv) Folder Path -> All_Loads_Sta.h5 DOSYASI
+                    target_ws.cell(row=r, column=col_idx).value = sta
                 elif norm in data_by_norm:
                     val = row[data_by_norm[norm]]
                     target_ws.cell(row=r, column=col_idx).value = None if pd.isna(val) else val
         wb.save(wf_xl)
         self.log(f"  Wrote {len(input_df)} row(s) into '{target_ws.title}' ({os.path.basename(wf_xl)}); "
-                  f"both Load Extraction paths = {out_dir}")
+                  f"Load Extraction paths = {all_loads} / {sta}")
         self._set_progress(70)
 
         # ---- 5. Web Flaw exe'sini klasörde çalıştır, bitmesini bekle, sonucu oku ----
@@ -8879,6 +8879,63 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
             except OSError as e:
                 self.log(f"  WARNING: could not write WEB_FLAW_DECISIONS.csv: {e}")
 
+    # ==================== İTERASYON SONU TEMİZLİK ====================
+    # _delete_joint_run_exes: Joint Run'ın her Set klasörüne kopyaladığı Joint Run exe'sini (örn.
+    # DaDT_Joint_Run.exe) siler. Sadece Set klasörlerinin HEMEN içindeki, adı Joint Run Exe'siyle aynı olan dosya.
+    def _delete_joint_run_exes(self, joint_run_dir):
+        src = self.jr_joint_run_exe_path.get().strip()
+        name = os.path.basename(src).lower()
+        if not name or not os.path.isdir(joint_run_dir):
+            return 0
+        src_real = os.path.realpath(src) if src else None
+        n = 0
+        for set_name in os.listdir(joint_run_dir):
+            set_dir = os.path.join(joint_run_dir, set_name)
+            if not os.path.isdir(set_dir):
+                continue
+            for fn in os.listdir(set_dir):
+                full = os.path.join(set_dir, fn)
+                if fn.lower() == name and os.path.isfile(full) and os.path.realpath(full) != src_real:
+                    try:
+                        os.remove(full)
+                        n += 1
+                    except OSError:
+                        pass
+        return n
+
+    # _delete_exe_files: klasör altındaki (rekürsif) TÜM .exe dosyalarını siler (Web Flaw exe kopyası, Load
+    # Extraction kopyasındaki exe vb.). Sadece iterasyonun kendi Web_Flaw_Run klasörüne uygulanır.
+    @staticmethod
+    def _delete_exe_files(folder):
+        n = 0
+        for dirpath, _, filenames in os.walk(folder):
+            for fn in filenames:
+                if fn.lower().endswith('.exe'):
+                    try:
+                        os.remove(os.path.join(dirpath, fn))
+                        n += 1
+                    except OSError:
+                        pass
+        return n
+
+    # _delete_web_flaw_util_folders: Web Flaw klasörü altında (rekürsif) adı 'Util' ya da Joint Util Folder'ının
+    # adı olan klasörleri siler (exe'nin koşu klasörlerine kopyaladığı Util'ler). Kaynak Util Folder'a dokunulmaz.
+    def _delete_web_flaw_util_folders(self, web_flaw_dir):
+        util_src = self.jr_util_folder.get().strip()
+        names = {'util'}
+        if util_src:
+            names.add(os.path.basename(os.path.normpath(util_src)).lower())
+        src_real = os.path.realpath(util_src) if util_src else None
+        n = 0
+        for dirpath, dirnames, _ in os.walk(web_flaw_dir):
+            for d in list(dirnames):
+                full = os.path.join(dirpath, d)
+                if d.lower() in names and os.path.realpath(full) != src_real:
+                    shutil.rmtree(full, ignore_errors=True)
+                    dirnames.remove(d)
+                    n += 1
+        return n
+
     # ==================== RUN (IMPROVED ITERATIVE FULL PIPELINE) ====================
     # _run_pipeline: Iterative'in _run_pipeline kaynağından türetildi; farklar
     # '# ---- STAGE C2', web_* değişkenleri ve _prepare_web_bdfs/_update_web_* çağrılarıdır.
@@ -9159,12 +9216,18 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
                     n_del_wf = self._delete_h5_files(web_flaw_dir)
                     self.log(f"  Deleted {n_del_le} H5 file(s) from Load Extraction Results, "
                               f"{n_del_jr} from Joint Run and {n_del_wf} from Web Flaw Run (not the last iteration)")
+                    n_exe_jr = self._delete_joint_run_exes(joint_run_dir)
+                    n_exe_wf = self._delete_exe_files(web_flaw_dir)
+                    self.log(f"  Deleted {n_exe_jr} Joint Run exe cop(y/ies) from the Set folders and "
+                              f"{n_exe_wf} exe file(s) from Web Flaw Run (not the last iteration)")
 
                 # Her iterasyonun sonunda (son dahil, sizing özeti zaten
                 # üretildikten SONRA) Set klasörlerine kopyalanan Util Folder
                 # kopyalarını sil - sadece yardımcı dosyaların kopyası, sonuç değil.
                 n_del_util = self._delete_util_folders(joint_run_dir, self.jr_util_folder.get().strip())
                 self.log(f"  Deleted {n_del_util} copied Util Folder(s) from the Joint Run Set folders")
+                n_wutil = self._delete_web_flaw_util_folders(web_flaw_dir)
+                self.log(f"  Deleted {n_wutil} Util Folder(s) from the Web Flaw Run folder")
 
                 self.log(f"\nIteration {iteration}/{n_iterations} complete "
                           f"({time.time() - iter_t_start:.1f}s)")

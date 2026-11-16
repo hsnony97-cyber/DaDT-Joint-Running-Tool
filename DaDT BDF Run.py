@@ -8899,8 +8899,9 @@ class WebFlawRunTab:
 # ============================================================================
 # Iterative Full Run'ın (Upper Bound / % azaltma / erken yakınsama dahil) aynı
 # mantığı + her iterasyonda Joint Run'dan SONRA bir Web Flaw aşaması:
-#   - her iterasyonun başında 'Web Property' kalınlıkları, BDF'lerin çalışma
-#     kopyalarındaki PSHELL kartlarına yazılır (offset yok),
+#   - her iterasyonun başında 'Web Property' kalınlıkları, Nastran Solver'a SKIN
+#     kalınlıklarıyla AYNI yoldan verilir (skin tablosuna eklenir; Solver PSHELL
+#     T'yi kendi _apply_excel_properties'iyle yazar - BDF'ler ayrıca kopyalanmaz),
 #   - çözümden sonra gerçekten çözülen web kalınlığı 'Web_Flaw_Input_Excel_Data'
 #     sayfasının 'Min Thick' sütununa yazılır (Joint'teki t1/tfem mantığı),
 #   - Joint Run bitince Web Flaw Run çalışır (WebFlawRunTab nesnesi sürülür),
@@ -9060,52 +9061,28 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
         self.log(f"  Updated Thickness for {n} Web Property row(s) from the previous iteration's web flaw sizing")
         return n
 
-    # _prepare_web_bdfs: kullanıcının BDF'lerinin (All BDF Files + Maneuver) çalışma
-    # kopyalarını <output>/_WebPSHELL_Iteration_N altına yazar; 'Web Property'deki
-    # PID'lerin PSHELL kalınlığı (T) güncellenir. Dönüş: {orijinal yol: kopya yolu}.
-    def _prepare_web_bdfs(self, working_excel, output_base, iteration):
+    # _inject_web_thickness: 'Web Property' kalınlıklarını Nastran Solver'ın SKIN kalınlık tablosuna
+    # (t3.skin_properties) ekler. Böylece web PSHELL'leri, skin PSHELL'leriyle AYNI mekanizmadan
+    # (Solver'ın _apply_excel_properties'i) geçer: BDF'ler ayrıca kopyalanıp yeniden yazılmaz,
+    # kullanıcının BDF'lerine dokunulmaz. Skin Property sayfasında zaten olan bir PID'de SKIN kazanır.
+    # t3.load_properties() ÇAĞRILDIKTAN SONRA çağrılmalıdır (o çağrı skin tablosunu sıfırlar).
+    # Dönüş: Solver'a eklenen {PID: kalınlık}.
+    def _inject_web_thickness(self, t3, working_excel):
         web_thk = self._read_web_property(working_excel)
         if not web_thk:
             self.log("  WARNING: 'Web Property' sheet has no usable rows - PSHELL thicknesses left as in the BDFs.")
             return {}
-        # Skin Property sayfasıyla çakışma: Nastran Solver skin kalınlığını sonradan ezer.
-        try:
-            skin_df = WebFlawRunTab._read_master_sheet(working_excel, 'skinproperty')
-            skin_pids = set()
-            for v in skin_df.iloc[:, 0].tolist():
-                try:
-                    skin_pids.add(int(v))
-                except (TypeError, ValueError):
-                    pass
-            overlap = sorted(skin_pids & set(web_thk))
-            if overlap:
-                self.log(f"  WARNING: Web Property ID(s) {overlap[:10]} are ALSO in 'Skin Property' - "
-                          f"the Skin Property thickness will win in the solve.")
-        except ValueError:
-            pass
-        prev_dir = os.path.join(output_base, f"_WebPSHELL_Iteration_{iteration - 1}")
-        if iteration > 1 and os.path.isdir(prev_dir):
-            shutil.rmtree(prev_dir, ignore_errors=True)       # önceki iterasyonun kopyaları artık gerekmiyor
-        dest_root = os.path.join(output_base, f"_WebPSHELL_Iteration_{iteration}")
-        os.makedirs(dest_root, exist_ok=True)
-        mapping = {}
-        found_all = set()
-        originals = []
-        for p in list(self.bdf_paths) + list(self.maneuver_bdfs):
-            if p not in originals:
-                originals.append(p)
-        for idx, p in enumerate(originals):
-            dst = os.path.join(dest_root, f"{idx:02d}", os.path.basename(p))
-            n_cards, found = _wf_update_pshell_file(p, dst, web_thk)
-            mapping[p] = dst
-            found_all |= found
-            self.log(f"    {os.path.basename(p)}: {n_cards} PSHELL card(s) set to the Web Property thickness")
-        missing = sorted(set(web_thk) - found_all)
-        if missing:
-            self.log(f"  WARNING: Web Property ID(s) {missing[:15]} have no PSHELL card in any BDF.")
-        self.log(f"  Web Property thicknesses applied to {len(found_all)}/{len(web_thk)} propert(ies) "
-                  f"(BDF working copies in {dest_root})")
-        return mapping
+        overlap = sorted(set(web_thk) & set(t3.skin_properties))
+        if overlap:
+            self.log(f"  WARNING: Web Property ID(s) {overlap[:10]} are ALSO in 'Skin Property' - "
+                      f"the Skin Property thickness will win in the solve.")
+        injected = {pid: t for pid, t in web_thk.items() if pid not in t3.skin_properties}
+        for pid, t in injected.items():
+            t3.skin_properties[pid] = {'thickness': t}
+        t3._refresh_effective_skin_thicknesses()           # offset hesabı da güncel kalınlığı görsün
+        self.log(f"  Web Property thicknesses handed to the Nastran Solver like Skin Property "
+                  f"({len(injected)}/{len(web_thk)} propert(ies))")
+        return injected
 
     # _read_solved_web_thickness: çözülmüş '..._stru.bdf' dosyalarından web PID'lerinin PSHELL T değeri.
     def _read_solved_web_thickness(self, stru_bdfs, working_excel):
@@ -9331,7 +9308,7 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
 
     # ==================== RUN (IMPROVED ITERATIVE FULL PIPELINE) ====================
     # _run_pipeline: Iterative'in _run_pipeline kaynağından türetildi; farklar
-    # '# ---- STAGE C2', web_* değişkenleri ve _prepare_web_bdfs/_update_web_* çağrılarıdır.
+    # '# ---- STAGE C2', web_* değişkenleri ve _inject_web_thickness/_update_web_* çağrılarıdır.
     def _run_pipeline(self):
         t_start = time.time()
         try:
@@ -9392,15 +9369,13 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
                 t3 = self.tab3_tool
                 # Web Property kalınlıkları PSHELL'lere, BDF'lerin ÇALIŞMA KOPYALARINDA yazılır
                 # (kullanıcının BDF'lerine dokunulmaz); Nastran Solver bu kopyaları kullanır.
-                web_bdf_map = self._prepare_web_bdfs(working_excel, output_base, iteration)
-                t3.bdf_paths = [web_bdf_map.get(p, p) for p in self.bdf_paths]
-                t3.maneuver_bdfs = [web_bdf_map.get(p, p) for p in self.maneuver_bdfs]
-                # Web kopyaları HER iterasyonda yeni klasörde oluşur (bir öncekinin kopyaları silinir).
-                # Nastran Solver BDF'leri yalnızca 'bdf_model' boşsa yükler ve yüklerken dosya
-                # yollarını hatırlar; sıfırlamazsak 2. iterasyondan itibaren silinmiş kopyalara
-                # ([Errno 2] No such file) - ya da önceden yüklenmiş eski BDF'lere - bakar.
-                t3.bdf_model = None
-                t3.bdf_models = []
+                t3.bdf_paths = list(self.bdf_paths)
+                t3.maneuver_bdfs = list(self.maneuver_bdfs)
+                # Nastran Solver BDF'leri yalnızca 'bdf_model' boşsa yükler ve dosya yollarını
+                # hatırlar. Yollar (önceki bir çalıştırmadan) farklıysa eski modeller atılır.
+                if [b['path'] for b in t3.bdf_models] != t3.bdf_paths:
+                    t3.bdf_model = None
+                    t3.bdf_models = []
                 t3.property_excel_path.set(working_excel)
                 t3.element_excel_path.set(working_excel)
                 t3.nastran_path.set(self.nastran_path.get())
@@ -9416,6 +9391,7 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
                     self.log("\nSTOPPED: Property Excel failed to load - see the Understanding "
                               "Structure Type log/tab above for details.")
                     return
+                self._inject_web_thickness(t3, working_excel)   # skin ile aynı mekanizma (load_properties'ten SONRA)
                 t3.load_element_ids()
 
                 before_folders = self._list_base_model_folders(output_base)

@@ -9395,6 +9395,12 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
                 web_bdf_map = self._prepare_web_bdfs(working_excel, output_base, iteration)
                 t3.bdf_paths = [web_bdf_map.get(p, p) for p in self.bdf_paths]
                 t3.maneuver_bdfs = [web_bdf_map.get(p, p) for p in self.maneuver_bdfs]
+                # Web kopyaları HER iterasyonda yeni klasörde oluşur (bir öncekinin kopyaları silinir).
+                # Nastran Solver BDF'leri yalnızca 'bdf_model' boşsa yükler ve yüklerken dosya
+                # yollarını hatırlar; sıfırlamazsak 2. iterasyondan itibaren silinmiş kopyalara
+                # ([Errno 2] No such file) - ya da önceden yüklenmiş eski BDF'lere - bakar.
+                t3.bdf_model = None
+                t3.bdf_models = []
                 t3.property_excel_path.set(working_excel)
                 t3.element_excel_path.set(working_excel)
                 t3.nastran_path.set(self.nastran_path.get())

@@ -32,6 +32,9 @@ import shutil
 # tempfile: geçici dosya/klasör oluşturma (bu dosyada şu an aktif kullanılmıyor,
 # ileride geçici dosya ihtiyacı olursa hazır dursun diye import edilmiş olabilir).
 import tempfile
+import json
+import queue
+import traceback
 # subprocess: harici programları (Nastran, dönüştürücü exe'ler, .bat dosyaları vb.)
 # başlatıp çalıştırmak için. subprocess.run (bekleyerek) ve subprocess.Popen
 # (beklemeden, arka planda başlatmak için) ikisi de kullanılıyor.
@@ -489,9 +492,18 @@ def _polish_ui(app):
         try:
             now = time.time()
             # -- log renklendirme (yalnızca yeni satırlar) --
+            hooks = getattr(app, '_run_hooks', None) or {}
             for w, st in logs:
                 try:
                     end_line = int(w.index('end-1c').split('.')[0])
+                    if hooks.get('sink'):                        # tamamlanmış yeni satırları dosyaya yaz (log kutusuna dokunmaz)
+                        wl = st.get('wline', 1)
+                        if end_line < wl:                        # log temizlendi
+                            wl = 1
+                        if end_line > wl:
+                            hooks['sink'](w, w.get(f'{wl}.0', f'{end_line}.0'))
+                            wl = end_line
+                        st['wline'] = wl
                     if end_line < st['next']:                    # log temizlendi
                         st['next'], st['end'], st['counted'] = 1, 1, 0
                     if end_line > st['end'] or (end_line == st['end'] and end_line >= st['next']):
@@ -515,6 +527,8 @@ def _polish_ui(app):
                 working = threading.active_count() > status['baseline']
                 if working and not status['working']:
                     status['start'], status['err_base'] = now, status['err_total']
+                    if hooks.get('start'):
+                        hooks['start']()                         # yeni çalıştırma = yeni log dosyası
                 if working:
                     who = status['active_tab'] or 'a task'
                     lbl_state.configure(text=f"Running — {who}")
@@ -534,6 +548,11 @@ def _polish_ui(app):
                             pass
                 elif status['working']:                         # az önce bitti
                     errs = status['err_total'] - status['err_base']
+                    if hooks.get('end'):
+                        try:
+                            hooks['end'](now - status['start'], errs)   # log dosyasını kapat + bildirim
+                        except Exception:
+                            pass
                     msg = f"Ready — last run finished in {fmt(now - status['start'])}"
                     if errs:
                         msg += f" ({errs} error line(s) in log)"
@@ -550,7 +569,724 @@ def _polish_ui(app):
         root.after(400, tick)
 
     app._log_widgets = [w for w, _ in logs]
+    app._baseline_threads = status['baseline']
     root.after(400, tick)
+
+
+# ============================================================================
+# _polish_ui_features: 4 yardımcı özellik - HİÇBİRİ mevcut iş akışına/sekme sınıflarına dokunmaz:
+#   1) Çalışma bitince bildirim (görev çubuğunda yanıp sönme / pencereyi öne getirme),
+#   2) Log'ların otomatik dosyaya yazılması (+ yakalanmamış hataların güvenlik ağı),
+#   3) "Check inputs" - başlamadan önce SALT-OKUNUR ön kontrol penceresi,
+#   4) Ayarları dosyaya kaydet / yükle (JSON).
+# Log dosyaları sonuç klasörlerinin İÇİNE yazılmaz (bazı aşamalar çıktı klasörünün alt klasörlerini tarar);
+# uygulamanın yanındaki 'DaDT_logs' klasörüne (ortam değişkeni DADT_LOG_DIR ile değiştirilebilir) yazılır.
+# ============================================================================
+def _dadt_log_dir():
+    cands = []
+    env = os.environ.get('DADT_LOG_DIR')
+    if env:
+        cands.append(env)
+    try:
+        cands.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'DaDT_logs'))
+    except NameError:
+        pass
+    cands.append(os.path.join(os.path.expanduser('~'), 'DaDT_logs'))
+    cands.append(os.path.join(tempfile.gettempdir(), 'DaDT_logs'))
+    for d in cands:
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, '.write_test')
+            with open(probe, 'w') as f:
+                f.write('x')
+            os.remove(probe)
+            return d
+        except OSError:
+            continue
+    return None
+
+
+class _RunLogger:
+    """Log kutularına yazılan yeni satırları zaman damgalı dosyalara yazar (sekme başına, çalıştırma başına)."""
+    def __init__(self, app, tab_of_widget):
+        self.app, self.tab_of_widget = app, tab_of_widget
+        self.dir = _dadt_log_dir()
+        self.files = {}
+        self._cleanup_old()
+
+    def _cleanup_old(self, days=60):
+        try:
+            limit = time.time() - days * 86400
+            for fn in os.listdir(self.dir or '.'):
+                p = os.path.join(self.dir, fn)
+                if fn.lower().endswith('.log') and os.path.getmtime(p) < limit:
+                    os.remove(p)
+        except Exception:
+            pass
+
+    def _open(self, w):
+        key, name, outdir = self.tab_of_widget(w)
+        safe = re.sub(r'[^A-Za-z0-9_-]+', '_', name).strip('_') or 'log'
+        path = os.path.join(self.dir, f"{safe}_{time.strftime('%Y%m%d_%H%M%S')}.log")
+        f = open(path, 'a', encoding='utf-8', buffering=1)
+        f.write(f"# DaDT Optimization Tool - {name} - {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"# output folder: {outdir or '(not set)'}\n\n")
+        self.files[w] = (f, path)
+        return f
+
+    def write(self, w, text):
+        if not self.dir or not text:
+            return
+        try:
+            f = self.files.get(w, (None,))[0] or self._open(w)
+            f.write(text)
+        except Exception:
+            pass
+
+    def write_crash(self, title, text):
+        if not self.dir:
+            return
+        try:
+            with open(os.path.join(self.dir, f"crash_{time.strftime('%Y%m%d')}.log"), 'a', encoding='utf-8') as f:
+                f.write(f"\n=== {title} - {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n{text}\n")
+        except Exception:
+            pass
+        for w in list(self.files):                              # çalışan log dosyasına da düş
+            self.write(w, f"\n[UNCAUGHT ERROR] {title}\n{text}\n")
+
+    def rotate(self):
+        for f, _p in list(self.files.values()):
+            try:
+                f.close()
+            except Exception:
+                pass
+        self.files = {}
+
+    def paths(self):
+        return [p for _f, p in self.files.values()]
+
+
+def _flash_taskbar(root):
+    try:
+        import ctypes
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [('cbSize', ctypes.c_uint), ('hwnd', ctypes.c_void_p), ('dwFlags', ctypes.c_uint),
+                        ('uCount', ctypes.c_uint), ('dwTimeout', ctypes.c_uint)]
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id()) or root.winfo_id()
+        info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, 0x0F, 6, 0)      # FLASHW_ALL | FLASHW_TIMERNOFG
+        ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+        return True
+    except Exception:
+        return False
+
+
+def _notify_finished(app, elapsed, errs, force=False):
+    """Çalışma bitti bildirimi. Dönüş: yapılan eylemlerin listesi."""
+    done = []
+    root = app.root
+    try:
+        if not force and elapsed < 15:                          # çok kısa işlerde rahatsız etme
+            return done
+        focused = root.focus_displayof() is not None and root.state() != 'iconic'
+        if not force and focused:
+            return done
+        if app._notify_flash.get():
+            if _flash_taskbar(root):
+                done.append('flash')
+            else:
+                root.bell()
+                done.append('bell')
+        if app._notify_front.get():
+            if root.state() == 'iconic':
+                root.deiconify()
+            root.lift()
+            root.attributes('-topmost', True)
+            root.after(1500, lambda: root.attributes('-topmost', False))
+            done.append('front')
+    except Exception:
+        pass
+    return done
+
+
+# ---- Ön kontrol (pre-flight) ----------------------------------------------------------------
+_PF_SHEETS = {
+    'nastran_solver': ({'barproperty', 'skinproperty'}, True),
+    'post_processing': ({'loadextraction'}, False),
+    'joint_run': ({'dtcginputexceldata', 'loadmodify'}, False),
+    'full_run': ({'barproperty', 'skinproperty', 'loadextraction', 'dtcginputexceldata', 'loadmodify'}, True),
+    'iterative_run': ({'barproperty', 'skinproperty', 'loadextraction', 'dtcginputexceldata', 'loadmodify'}, True),
+    'improved_iterative': ({'barproperty', 'skinproperty', 'loadextraction', 'dtcginputexceldata', 'loadmodify',
+                            'webproperty', 'webflawloadextraction', 'webflawinputexceldata'}, True),
+    'web_flaw_run': ({'webflawloadextraction', 'webflawinputexceldata'}, False),
+}
+_PF_SHEET_LABEL = {'barproperty': 'Bar Property', 'skinproperty': 'Skin Property', 'loadextraction': 'Load_Extraction',
+                   'dtcginputexceldata': 'DTCG_Input_Excel_Data', 'loadmodify': 'Load_Modify', 'webproperty': 'Web Property',
+                   'webflawloadextraction': 'Web_Flaw_Load_Extraction', 'webflawinputexceldata': 'Web_Flaw_Input_Excel_Data'}
+_PF_PATHS = {
+    'bdf_merge': [('excel_path', 'Excel', 'file'), ('output_folder', 'Output', 'dir_out')],
+    'nastran_solver': [('property_excel_path', 'Master Input Excel', 'file'), ('nastran_path', 'Nastran Exe', 'exe'),
+                       ('scratch_folder', 'Scratch Folder', 'opt_dir'), ('output_folder', 'Output Folder', 'dir_out')],
+    'post_processing': [('op2_folder', 'OP2 Folder', 'dir'), ('converter_exe_path', 'Converter Exe', 'exe'),
+                        ('le_input_excel_path', 'Load Extraction Excel', 'file'), ('le_example_folder', 'Example LE Folder', 'dir'),
+                        ('le_maneuver_bdf_path', 'BDF (Maneuver)', 'file'), ('le_thermal_bdf_path', 'BDF (Thermal)', 'file'),
+                        ('le_pickle_path', 'Pickle File', 'file'), ('le_exe_path', 'Load Extraction Exe', 'exe'),
+                        ('output_folder', 'Output Folder', 'dir_out')],
+    'joint_run': [('h5_folder', 'H5 Folder', 'dir'), ('main_input_excel_path', 'Main Input Excel', 'file'),
+                  ('example_joint_excel_path', 'Example Joint Excel', 'file'), ('util_folder', 'Util Folder', 'dir'),
+                  ('license_checker_exe_path', 'License Checker Exe', 'exe'), ('load_modifying_exe_path', 'Load Modifying Exe', 'exe'),
+                  ('rss_exe_path', 'RSS Exe', 'exe'), ('joint_run_exe_path', 'Joint Run Exe', 'exe'),
+                  ('output_folder', 'Output Folder', 'dir_out')],
+    'web_flaw_run': [('master_input_excel_path', 'Master Input Excel', 'file'), ('output_folder', 'Web Flaw Run Folder', 'dir_out'),
+                     ('h5_folder', 'H5 Folder', 'dir'), ('maneuver_bdf_path', 'BDF (Maneuver)', 'file'),
+                     ('thermal_bdf_path', 'BDF (Thermal)', 'file'), ('pickle_path', 'Pickle File', 'file'),
+                     ('le_example_folder', 'Example LE Folder', 'dir'), ('le_exe_path', 'Load Extraction Exe', 'exe'),
+                     ('example_excel_path', 'Example Web Flaw Excel', 'file'), ('wf_exe_path', 'Web Flaw Exe', 'exe')],
+    'visualization': [('bdf_path', 'BDF', 'file')],
+}
+_chain = [('master_input_excel_path', 'Master Input Excel', 'file'), ('nastran_path', 'Nastran Exe', 'exe'),
+          ('scratch_folder', 'Scratch Folder', 'opt_dir'), ('isu_output_folder', 'Output Folder', 'dir_out'),
+          ('converter_exe_path', 'Converter Exe', 'exe'), ('le_example_folder', 'Example LE Folder', 'dir'),
+          ('le_pickle_path', 'Pickle File', 'file'), ('le_exe_path', 'Load Extraction Exe', 'exe'),
+          ('jr_example_joint_excel_path', 'Example Joint Excel', 'file'), ('jr_util_folder', 'Util Folder', 'dir'),
+          ('jr_license_checker_exe_path', 'License Checker Exe', 'exe'), ('jr_load_modifying_exe_path', 'Load Modifying Exe', 'exe'),
+          ('jr_rss_exe_path', 'RSS Exe', 'exe'), ('jr_joint_run_exe_path', 'Joint Run Exe', 'exe')]
+_PF_PATHS['full_run'] = list(_chain)
+_PF_PATHS['iterative_run'] = list(_chain)
+_PF_PATHS['improved_iterative'] = list(_chain) + [
+    ('wf_le_example_folder', 'Web Flaw Example LE Folder', 'dir'), ('wf_example_excel_path', 'Example Web Flaw Excel', 'file'),
+    ('wf_exe_path', 'Web Flaw Exe', 'exe')]
+_PF_LISTS = {'bdf_merge': [('thermal_bdfs', 'Thermal BDF'), ('maneuver_bdfs', 'Maneuver BDF')],
+             'nastran_solver': [('bdf_paths', 'All BDF Files'), ('maneuver_bdfs', 'Maneuver BDF')],
+             'full_run': [('bdf_paths', 'All BDF Files'), ('maneuver_bdfs', 'Maneuver BDF')],
+             'iterative_run': [('bdf_paths', 'All BDF Files'), ('maneuver_bdfs', 'Maneuver BDF')],
+             'improved_iterative': [('bdf_paths', 'All BDF Files'), ('maneuver_bdfs', 'Maneuver BDF')]}
+
+
+def _pf_scan_bdfs(paths, log):
+    """BDF'leri metin olarak tarar: {PSHELL PID: T}, PBARL PID kümesi (INCLUDE'lanan dosyalar taranmaz)."""
+    pshell, pbarl = {}, set()
+    for p in paths:
+        log(f"scanning {os.path.basename(p)} ...")
+        try:
+            with open(p, 'r', encoding='latin-1', newline='') as f:
+                for line in f:
+                    h = line[:6]
+                    if h == 'PSHELL':
+                        parsed = _wf_parse_pshell(line)
+                        if parsed and parsed[2] is not None:
+                            pshell[parsed[1]] = parsed[2]
+                    elif h == 'PBARL' and line[5:6] in ' \t,*\r\n':
+                        try:
+                            if line[5:6] == ',':
+                                pbarl.add(int(line.split(',')[1]))
+                            elif line[5:6] == '*':
+                                pbarl.add(int(line[8:24]))
+                            else:
+                                pbarl.add(int(line[8:16]))
+                        except (ValueError, IndexError):
+                            pass
+        except OSError:
+            pass
+    return pshell, pbarl
+
+
+def _pf_sheet_pids(excel, sheet_norm_key):
+    """Excel'de (adı normalleştirilerek bulunan) sayfanın ilk sütunundaki tamsayı PID'ler."""
+    out = set()
+    with pd.ExcelFile(excel) as xl:
+        for name in xl.sheet_names:
+            if _wf_norm(name) == sheet_norm_key:
+                df = pd.read_excel(xl, sheet_name=name)
+                for v in df.iloc[:, 0].tolist():
+                    try:
+                        out.add(int(v))
+                    except (TypeError, ValueError):
+                        pass
+    return out
+
+
+def _pf_snapshot(key, tool):
+    """Kontrol için gereken Tk değişkenlerini/listeleri ANA iş parçacığında okuyup düz sözlüğe koyar
+    (iş parçacığından StringVar.get() çağırmak, ana döngünün sıradaki turunu beklemek demektir)."""
+    snap = {}
+    for attr, _l, _k in _PF_PATHS.get(key, []):
+        v = getattr(tool, attr, None)
+        try:
+            snap[attr] = str(v.get()).strip().strip('"') if hasattr(v, 'get') else str(v or '').strip()
+        except Exception:
+            snap[attr] = ''
+    for attr, _l in _PF_LISTS.get(key, []):
+        snap[attr] = [str(x) for x in (getattr(tool, attr, None) or [])]
+    return snap
+
+
+def _preflight_collect(app, key, tool, log=lambda m: None, snapshot=None):
+    """Salt-okunur ön kontrol. Dönüş: [(seviye, metin)], seviye: ok / warn / err / info."""
+    res = []
+    add = lambda lv, t: res.append((lv, t))
+    snap = snapshot if snapshot is not None else _pf_snapshot(key, tool)
+
+    def val(attr):
+        return snap.get(attr, '')
+
+    out_dirs, example_dirs, excel_path = [], [], None
+    for attr, label, kind in _PF_PATHS.get(key, []):
+        p = val(attr)
+        if not p:
+            if kind == 'opt_dir':
+                add('info', f"{label}: not set (optional)")
+            else:
+                add('err', f"{label}: not set")
+            continue
+        if len(p) > 240:
+            add('warn', f"{label}: path is {len(p)} characters long - Windows/Nastran may fail above ~260")
+        if kind in ('file', 'exe'):
+            if not os.path.isfile(p):
+                add('err', f"{label}: file not found - {p}")
+                continue
+            if kind == 'exe' and not p.lower().endswith(('.exe', '.bat', '.cmd')):
+                add('warn', f"{label}: does not look like an executable - {p}")
+            else:
+                add('ok', f"{label}: {os.path.basename(p)}")
+            if 'excel' in label.lower() and attr in ('master_input_excel_path', 'property_excel_path', 'main_input_excel_path',
+                                                    'le_input_excel_path', 'excel_path'):
+                excel_path = excel_path or p
+                if os.path.basename(p).startswith('~$'):
+                    add('warn', f"{label}: looks like an Excel temp/lock file")
+        elif kind in ('dir', 'opt_dir'):
+            if not os.path.isdir(p):
+                add('err' if kind == 'dir' else 'warn', f"{label}: folder not found - {p}")
+            else:
+                add('ok', f"{label}: {p}")
+                if 'example' in label.lower():
+                    example_dirs.append((label, p))
+        elif kind == 'dir_out':
+            if os.path.isdir(p):
+                if not os.access(p, os.W_OK):
+                    add('err', f"{label}: folder is not writable - {p}")
+                else:
+                    add('ok', f"{label}: {p}")
+                out_dirs.append((label, p))
+            else:
+                parent = os.path.dirname(os.path.abspath(p))
+                if os.path.isdir(parent):
+                    add('warn', f"{label}: folder does not exist yet (will be created) - {p}")
+                    out_dirs.append((label, parent))
+                else:
+                    add('err', f"{label}: neither the folder nor its parent exists - {p}")
+
+    # çıktı klasörü örnek klasörün İÇİNDE olmamalı; boş disk alanı
+    for lab, d in out_dirs:
+        for elab, ed in example_dirs:
+            try:
+                if os.path.commonpath([os.path.abspath(d), os.path.abspath(ed)]) == os.path.abspath(ed):
+                    add('err', f"{lab} is inside {elab} - the run would copy/scan its own output")
+            except ValueError:
+                pass
+        try:
+            free_gb = shutil.disk_usage(d).free / 1024 ** 3
+            lv = 'err' if free_gb < 2 else ('warn' if free_gb < 20 else 'info')
+            add(lv, f"Free disk space for {lab}: {free_gb:.1f} GB")
+        except OSError:
+            pass
+
+    # BDF listeleri
+    bdf_lists = {}
+    for attr, label in _PF_LISTS.get(key, []):
+        lst = list(snap.get(attr, []))
+        bdf_lists[attr] = lst
+        if not lst:
+            add('err' if attr == 'bdf_paths' or key == 'bdf_merge' and attr == 'thermal_bdfs' else 'warn',
+                f"{label}: list is empty" + (" - no offsets will be computed" if attr == 'maneuver_bdfs' and key != 'bdf_merge' else ''))
+        for p in lst:
+            if not os.path.isfile(p):
+                add('err', f"{label}: file not found - {p}")
+        if lst and all(os.path.isfile(p) for p in lst):
+            add('ok', f"{label}: {len(lst)} file(s)")
+    if key in ('full_run', 'iterative_run', 'improved_iterative', 'nastran_solver'):
+        allb = bdf_lists.get('bdf_paths', [])
+        if allb and not any('thermal' in os.path.basename(p).lower() for p in allb):
+            add('warn', "'All BDF Files' has no file with 'thermal' in its name - Post Processing auto-find may miss the thermal BDF")
+        man = bdf_lists.get('maneuver_bdfs', [])
+        if man and allb and man[0] not in allb:
+            add('warn', "the Maneuver BDF is not in 'All BDF Files' - add it there too so its solved copy is produced")
+
+    # Excel sayfaları
+    need, _soft = _PF_SHEETS.get(key, (set(), False))
+    pshell_t, pbarl = {}, set()
+    if excel_path and os.path.isfile(excel_path):
+        try:
+            log("reading Excel sheet names ...")
+            with pd.ExcelFile(excel_path) as xl:
+                names = {_wf_norm(n): n for n in xl.sheet_names}
+            miss = sorted(n for n in need if n not in names)
+            if miss:
+                add('err', f"Excel is missing sheet(s): {', '.join(_PF_SHEET_LABEL.get(m, m) for m in miss)} "
+                           f"(found: {', '.join(names.values())})")
+            else:
+                add('ok', f"Excel sheets present ({len(need)} required)")
+            if key in ('nastran_solver', 'full_run', 'iterative_run', 'improved_iterative') and \
+                    not any(('landing' in n or 'offset' in n) for n in names):
+                add('warn', "Excel has no Landing/Bar offset sheet - no offsets will be applied")
+        except Exception as e:
+            add('err', f"Excel could not be read: {e}")
+            names = {}
+        # BDF <-> Excel tutarlılığı (bar / skin / web)
+        if key in ('nastran_solver', 'full_run', 'iterative_run', 'improved_iterative'):
+            bdfs = list(dict.fromkeys(bdf_lists.get('bdf_paths', []) + bdf_lists.get('maneuver_bdfs', [])))
+            bdfs = [b for b in bdfs if os.path.isfile(b)]
+            if bdfs:
+                pshell_t, pbarl = _pf_scan_bdfs(bdfs, log)
+                add('info', f"BDF scan: {len(pshell_t)} PSHELL and {len(pbarl)} PBARL card(s) in the BDF files themselves "
+                            f"(INCLUDE'd files are not scanned)")
+                try:
+                    bar = _pf_sheet_pids(excel_path, 'barproperty')
+                    miss = sorted(bar - pbarl)
+                    if bar and miss:
+                        add('warn', f"Bar Property: {len(miss)} PID(s) have no PBARL card in the BDFs, e.g. {miss[:8]}")
+                    elif bar:
+                        add('ok', f"Bar Property: all {len(bar)} PID(s) found as PBARL")
+                    skin = _pf_sheet_pids(excel_path, 'skinproperty')
+                    miss = sorted(skin - set(pshell_t))
+                    if skin and miss:
+                        add('warn', f"Skin Property: {len(miss)} PID(s) have no PSHELL card in the BDFs, e.g. {miss[:8]}")
+                    elif skin:
+                        add('ok', f"Skin Property: all {len(skin)} PID(s) found as PSHELL")
+                except Exception as e:
+                    add('warn', f"Bar/Skin Property check skipped: {e}")
+                if key == 'improved_iterative':
+                    try:
+                        web = tool._read_web_property(excel_path)
+                        if not web:
+                            add('err', "Web Property sheet has no usable rows")
+                        else:
+                            add('ok', f"Web Property: {len(web)} PID(s) with a thickness")
+                            miss = sorted(p for p in web if p not in pshell_t)
+                            if miss:
+                                add('warn', f"Web Property: {len(miss)} PID(s) have no PSHELL card in the BDFs, e.g. {miss[:8]}")
+                            skin = _pf_sheet_pids(excel_path, 'skinproperty')
+                            both = sorted(set(web) & skin)
+                            if both:
+                                add('warn', f"{len(both)} PID(s) are in BOTH Web Property and Skin Property - skin wins, e.g. {both[:8]}")
+                            big = sorted(((max(t / pshell_t[p], pshell_t[p] / t), p, pshell_t[p], t)
+                                          for p, t in web.items() if pshell_t.get(p)), reverse=True)
+                            big = [b for b in big if b[0] > 5]
+                            if big:
+                                ex = '; '.join(f"PID {p}: BDF {o:g} -> Excel {t:g}" for _r, p, o, t in big[:4])
+                                add('warn', f"{len(big)} Web Property thickness(es) differ from the BDF's PSHELL T by more than 5x "
+                                            f"(units/column?) - {ex}")
+                    except Exception as e:
+                        add('warn', f"Web Property check skipped: {e}")
+
+    # Python paketleri
+    for mod_name in ('h5py', 'openpyxl'):
+        try:
+            __import__(mod_name)
+        except ImportError:
+            add('err' if mod_name == 'openpyxl' or key in ('web_flaw_run', 'improved_iterative') else 'warn',
+                f"Python package '{mod_name}' is not installed")
+    return res
+
+
+class _PreflightWindow:
+    def __init__(self, app, key, tool, title):
+        self.app, self.key, self.tool = app, key, tool
+        root = app.root
+        self.win = tk.Toplevel(root)
+        self.win.title(f"Check inputs - {title}")
+        self.win.geometry(f"860x560+{root.winfo_rootx() + 90}+{root.winfo_rooty() + 90}")
+        self.win.transient(root)
+        self.header = ttk.Label(self.win, text='Checking ...', font=('Segoe UI', 11, 'bold'))
+        self.header.pack(anchor='w', padx=14, pady=(12, 4))
+        frame = ttk.Frame(self.win)
+        frame.pack(fill=tk.BOTH, expand=True, padx=14, pady=4)
+        self.text = tk.Text(frame, wrap='word', font=('Segoe UI', 10), relief='flat', bg=app.colors['surface'],
+                            highlightthickness=1, highlightbackground=app.colors['border'], padx=8, pady=6)
+        sb = ttk.Scrollbar(frame, command=self.text.yview)
+        self.text.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.text.pack(fill=tk.BOTH, expand=True)
+        for tag, col in (('err', '#b91c1c'), ('warn', '#b45309'), ('ok', '#15803d'), ('info', '#475569')):
+            self.text.tag_configure(tag, foreground=col)
+        self.text.tag_configure('hdr', font=('Segoe UI', 10, 'bold'))
+        btns = ttk.Frame(self.win)
+        btns.pack(fill=tk.X, padx=14, pady=(4, 12))
+        ttk.Button(btns, text='Close', style='Secondary.TButton', command=self.win.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btns, text='Copy report', style='Secondary.TButton', command=self.copy).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(btns, text='Check again', style='Secondary.TButton', command=self.start).pack(side=tk.RIGHT)
+        self.results = []
+        self.start()
+
+    def start(self):
+        self.text.configure(state='normal')
+        self.text.delete('1.0', 'end')
+        self.text.insert('end', 'Reading files ... this can take a few seconds for large BDFs.\n', 'info')
+        self.text.configure(state='disabled')
+        self.header.configure(text='Checking ...')
+        self.q = queue.Queue()
+        self.progress_msg = ''
+        snap = _pf_snapshot(self.key, self.tool)          # Tk değişkenleri burada (ana iş parçacığı), iş parçacığında değil
+
+        def work():
+            try:
+                self.q.put(('done', _preflight_collect(self.app, self.key, self.tool,
+                                                       lambda m: self.q.put(('msg', m)), snapshot=snap)))
+            except Exception as e:
+                self.q.put(('done', [('err', f"Check failed: {e}")]))
+        threading.Thread(target=work, daemon=True).start()
+        self.win.after(150, self.poll)
+
+    def poll(self):
+        try:
+            while True:
+                kind, payload = self.q.get_nowait()
+                if kind == 'msg':
+                    self.header.configure(text=f"Checking ... {payload}")
+                else:
+                    self.show(payload)
+                    return
+        except queue.Empty:
+            pass
+        try:
+            self.win.after(150, self.poll)
+        except tk.TclError:
+            pass
+
+    def show(self, results):
+        self.results = results
+        n_err = sum(1 for l, _ in results if l == 'err')
+        n_warn = sum(1 for l, _ in results if l == 'warn')
+        self.header.configure(text=("\u2714  No problems found" if not n_err and not n_warn else
+                                    f"{n_err} error(s), {n_warn} warning(s)"),
+                              foreground=('#15803d' if not n_err and not n_warn else ('#b91c1c' if n_err else '#b45309')))
+        self.text.configure(state='normal')
+        self.text.delete('1.0', 'end')
+        icons = {'err': '\u2716', 'warn': '\u26A0', 'ok': '\u2714', 'info': '\u2022'}
+        for lv in ('err', 'warn', 'ok', 'info'):
+            for l, t in results:
+                if l == lv:
+                    self.text.insert('end', f"{icons[l]}  {t}\n", l)
+        self.text.configure(state='disabled')
+
+    def copy(self):
+        icons = {'err': 'ERROR', 'warn': 'WARNING', 'ok': 'OK', 'info': 'INFO'}
+        txt = '\n'.join(f"[{icons[l]}] {t}" for l, t in self.results)
+        self.win.clipboard_clear()
+        self.win.clipboard_append(txt)
+
+
+def _polish_ui_features(app):
+    root = app.root
+    feats = {}
+
+    # ---- sekme eşlemesi ----
+    tools = {'bdf_merge': app, 'nastran_solver': getattr(app, 'tab3_tool', None), 'post_processing': getattr(app, 'tab4_tool', None),
+             'joint_run': getattr(app, 'tab5_tool', None), 'full_run': getattr(app, 'tab6_tool', None),
+             'iterative_run': getattr(app, 'tab7_tool', None), 'web_flaw_run': getattr(app, 'tab9_tool', None),
+             'improved_iterative': getattr(app, 'tab10_tool', None), 'visualization': getattr(app, 'tab8_tool', None)}
+    frames = {'bdf_merge': getattr(app, 'tab1', None), 'nastran_solver': getattr(app, 'tab3', None),
+              'post_processing': getattr(app, 'tab4', None), 'joint_run': getattr(app, 'tab5', None),
+              'full_run': getattr(app, 'tab6', None), 'iterative_run': getattr(app, 'tab7', None),
+              'web_flaw_run': getattr(app, 'tab9', None), 'improved_iterative': getattr(app, 'tab10', None),
+              'visualization': getattr(app, 'tab8', None)}
+    tools = {k: v for k, v in tools.items() if v is not None}
+    frame_key = {f: k for k, f in frames.items() if f is not None}
+    app._notify_flash = tk.BooleanVar(master=root, value=True)
+    app._notify_front = tk.BooleanVar(master=root, value=True)
+    feats['notify_vars'] = (app._notify_flash, app._notify_front)
+
+    def current_key():
+        try:
+            outer = app.notebook.nametowidget(app.notebook.select())
+            inner = next(c for c in outer.winfo_children() if isinstance(c, ttk.Notebook))
+            return frame_key.get(inner.nametowidget(inner.select()))
+        except Exception:
+            return None
+
+    def key_of_widget(w):
+        p = w
+        while p is not None:
+            if p in frame_key:
+                return frame_key[p]
+            p = getattr(p, 'master', None)
+        return None
+
+    # ---- 2) log dosyaları + güvenlik ağı ----
+    def tab_of_widget(w):
+        key = key_of_widget(w)
+        tool = tools.get(key)
+        outdir = ''
+        for attr in ('output_folder', 'isu_output_folder'):
+            v = getattr(tool, attr, None)
+            if hasattr(v, 'get'):
+                try:
+                    outdir = str(v.get()).strip()
+                except Exception:
+                    outdir = ''
+                if outdir:
+                    break
+        return key, (key or 'app'), outdir
+
+    logger = _RunLogger(app, tab_of_widget)
+    app._run_logger = logger
+    app._run_hooks = {
+        'sink': logger.write,
+        'start': logger.rotate,
+        'end': lambda elapsed, errs: (logger.rotate(), _notify_finished(app, elapsed, errs)),
+    }
+
+    def tb_text(et, ev, tb):
+        return ''.join(traceback.format_exception(et, ev, tb))
+    try:
+        orig_sys, orig_thr, orig_cb = sys.excepthook, threading.excepthook, root.report_callback_exception
+
+        def sys_hook(et, ev, tb):
+            logger.write_crash('Uncaught exception', tb_text(et, ev, tb))
+            orig_sys(et, ev, tb)
+
+        def thr_hook(args):
+            logger.write_crash(f"Uncaught exception in thread {getattr(args.thread, 'name', '?')}",
+                               tb_text(args.exc_type, args.exc_value, args.exc_traceback))
+            orig_thr(args)
+
+        def cb_hook(et, ev, tb):
+            logger.write_crash('Uncaught exception in a Tk callback', tb_text(et, ev, tb))
+            orig_cb(et, ev, tb)
+        sys.excepthook, threading.excepthook, root.report_callback_exception = sys_hook, thr_hook, cb_hook
+    except Exception as e:
+        print(f"UI features (crash hooks) skipped: {e}")
+
+    def open_logs():
+        d = logger.dir
+        if not d:
+            messagebox.showinfo('Logs', 'No writable log folder is available.', parent=root)
+            return
+        try:
+            if hasattr(os, 'startfile'):
+                os.startfile(d)
+            else:
+                subprocess.Popen(['xdg-open', d])
+        except Exception:
+            messagebox.showinfo('Logs', f"Log folder:\n{d}", parent=root)
+    feats['open_logs'] = open_logs
+
+    # ---- 3) Check inputs ----
+    def check_inputs():
+        key = current_key()
+        tool = tools.get(key)
+        if key is None or key not in (set(_PF_PATHS) | set(_PF_LISTS)) or tool is None:
+            messagebox.showinfo('Check inputs', 'This tab has no inputs to check.', parent=root)
+            return
+        title = str(app.notebook.tab(app.notebook.select(), 'text')).strip()
+        try:
+            outer = app.notebook.nametowidget(app.notebook.select())
+            inner = next(c for c in outer.winfo_children() if isinstance(c, ttk.Notebook))
+            title = str(inner.tab(inner.select(), 'text')).strip()
+        except Exception:
+            pass
+        _PreflightWindow(app, key, tool, title)
+    feats['check_inputs'] = check_inputs
+
+    # ---- 4) Ayarlar ----
+    skip_vars = {'progress_var', 'thermal_count', 'maneuver_count'}
+    list_attrs = ('thermal_bdfs', 'maneuver_bdfs', 'bdf_paths')
+
+    def collect():
+        data = {'format': 1, 'saved': time.strftime('%Y-%m-%d %H:%M:%S'), 'tabs': {}}
+        for key, obj in tools.items():
+            vars_, seen = {}, set()
+            for name, v in vars(obj).items():
+                if isinstance(v, tk.Variable) and name not in skip_vars and str(v) not in seen:
+                    seen.add(str(v))
+                    try:
+                        vars_[name] = v.get()
+                    except Exception:
+                        pass
+            lists = {a: [str(x) for x in getattr(obj, a)] for a in list_attrs
+                     if isinstance(getattr(obj, a, None), list) and (key == 'bdf_merge' or a != 'maneuver_bdfs' or True)}
+            data['tabs'][key] = {'vars': vars_, 'lists': lists}
+        return data
+
+    def refresh_lists(obj, key):
+        if key == 'bdf_merge':
+            for lst, lb, cnt in (('thermal_bdfs', 'thermal_listbox', 'thermal_count'), ('maneuver_bdfs', 'maneuver_listbox', 'maneuver_count')):
+                box = getattr(obj, lb, None)
+                if box is not None:
+                    box.delete(0, tk.END)
+                    for f in getattr(obj, lst):
+                        box.insert(tk.END, f)
+                getattr(obj, cnt).set(f"{len(getattr(obj, lst))} files")
+            return
+        for lst, lb in (('bdf_paths', 'bdf_listbox'), ('maneuver_bdfs', 'maneuver_listbox')):
+            box = getattr(obj, lb, None)
+            if box is not None and isinstance(getattr(obj, lst, None), list):
+                box.delete(0, tk.END)
+                for p in getattr(obj, lst):
+                    box.insert(tk.END, os.path.basename(p))
+        st = getattr(obj, 'bdf_status', None)
+        if st is not None and getattr(obj, 'bdf_paths', None):
+            try:
+                st.config(text=f"{len(obj.bdf_paths)} BDF files selected", foreground='blue')
+            except tk.TclError:
+                pass
+
+    def apply(data):
+        n = 0
+        for key, tdata in (data.get('tabs') or {}).items():
+            obj = tools.get(key)
+            if obj is None or not isinstance(tdata, dict):
+                continue
+            for name, value in (tdata.get('vars') or {}).items():
+                var = getattr(obj, name, None)
+                if isinstance(var, tk.Variable) and name not in skip_vars:
+                    try:
+                        var.set(value)
+                        n += 1
+                    except (tk.TclError, ValueError, TypeError):
+                        pass
+            for name, value in (tdata.get('lists') or {}).items():
+                if name in list_attrs and isinstance(getattr(obj, name, None), list) and isinstance(value, list):
+                    setattr(obj, name, [str(x) for x in value])
+                    n += 1
+            refresh_lists(obj, key)
+        return n
+
+    def running():
+        return threading.active_count() > getattr(app, '_baseline_threads', 10 ** 6)
+
+    def save_settings():
+        path = filedialog.asksaveasfilename(parent=root, defaultextension='.json', initialfile='DaDT_settings.json',
+                                            title='Save settings', filetypes=[('Settings (JSON)', '*.json'), ('All files', '*.*')])
+        if not path:
+            return
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(collect(), f, indent=2, ensure_ascii=False)
+            messagebox.showinfo('Save settings', f"Settings saved:\n{path}", parent=root)
+        except Exception as e:
+            messagebox.showerror('Save settings', f"Could not save: {e}", parent=root)
+
+    def load_settings():
+        if running():
+            messagebox.showwarning('Load settings', 'A run is in progress - load settings after it finishes.', parent=root)
+            return
+        path = filedialog.askopenfilename(parent=root, title='Load settings',
+                                          filetypes=[('Settings (JSON)', '*.json'), ('All files', '*.*')])
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            n = apply(data)
+            messagebox.showinfo('Load settings',
+                                f"{n} setting(s) restored from:\n{path}\n\nNote: Excel files are not re-read automatically - "
+                                f"press 'Load' on the Nastran Solver tab if you use it on its own.", parent=root)
+        except Exception as e:
+            messagebox.showerror('Load settings', f"Could not load: {e}", parent=root)
+    feats.update(save_settings=save_settings, load_settings=load_settings, collect=collect, apply=apply)
+    app._features = feats
+    return feats
 
 
 # ============================================================================
@@ -618,6 +1354,12 @@ def _polish_ui_pro(app):
         for c in w.winfo_children():
             yield from walk(c)
 
+    try:
+        feats = _polish_ui_features(app)
+    except Exception as e:
+        print(f"UI features skipped: {e}")
+        feats = {}
+
     # ---- 1) Başlık bandı + simge ----
     try:
         banner = next(c for c in root.winfo_children() if isinstance(c, ttk.Frame))
@@ -627,6 +1369,9 @@ def _polish_ui_pro(app):
                 lbl.configure(style='BannerTitle.TLabel')
         ttk.Label(banner, text='BDF   \u2192   Nastran   \u2192   Joint Run   \u2192   Web Flaw', style='BannerSub.TLabel'
                   ).pack(side=tk.LEFT, padx=(22, 0), pady=(5, 0))
+        if feats.get('check_inputs'):
+            ttk.Button(banner, text='\u2714  Check inputs', style='Secondary.TButton', cursor='hand2',
+                       command=feats['check_inputs']).pack(side=tk.RIGHT)
     except Exception as e:
         print(f"UI polish (banner) skipped: {e}")
     try:
@@ -676,6 +1421,7 @@ def _polish_ui_pro(app):
                             'Ctrl + / Ctrl -\tLog text larger / smaller\n'
                             'Ctrl+0\t\tReset log text size\n'
                             'Ctrl+F\t\tFind in the log (click the log first)\n'
+                            'Ctrl+K\t\tCheck inputs of the current tab\n'
                             'Right-click log\tCopy / Select all / Find / Save log / Scroll to end', parent=root)
 
     def show_about():
@@ -693,6 +1439,13 @@ def _polish_ui_pro(app):
     try:
         menubar = tk.Menu(root, tearoff=0)
         m_file = tk.Menu(menubar, tearoff=0)
+        if feats.get('save_settings'):
+            m_file.add_command(label='Save settings...', command=feats['save_settings'])
+            m_file.add_command(label='Load settings...', command=feats['load_settings'])
+            m_file.add_separator()
+        if feats.get('open_logs'):
+            m_file.add_command(label='Open logs folder', command=feats['open_logs'])
+            m_file.add_separator()
         m_file.add_command(label='Exit', command=root.destroy)
         menubar.add_cascade(label='File', menu=m_file)
         m_view = tk.Menu(menubar, tearoff=0)
@@ -701,7 +1454,16 @@ def _polish_ui_pro(app):
         m_view.add_command(label='Log text larger', accelerator='Ctrl +', command=lambda: set_log_size(+1))
         m_view.add_command(label='Log text smaller', accelerator='Ctrl -', command=lambda: set_log_size(-1))
         m_view.add_command(label='Reset log text size', accelerator='Ctrl 0', command=lambda: set_log_size(absolute=10))
+        if feats.get('notify_vars'):
+            m_view.add_separator()
+            m_view.add_checkbutton(label='Flash the taskbar when a run finishes', variable=feats['notify_vars'][0])
+            m_view.add_checkbutton(label='Bring the window to front when a run finishes', variable=feats['notify_vars'][1])
         menubar.add_cascade(label='View', menu=m_view)
+        if feats.get('check_inputs'):
+            m_tools = tk.Menu(menubar, tearoff=0)
+            m_tools.add_command(label='Check inputs for the current tab...', accelerator='Ctrl+K', command=feats['check_inputs'])
+            menubar.add_cascade(label='Tools', menu=m_tools)
+            root.bind_all('<Control-k>', lambda e: feats['check_inputs']())
         m_go = tk.Menu(menubar, tearoff=0)
         for gi, tab_id in enumerate(app.notebook.tabs()):
             outer = app.notebook.nametowidget(tab_id)

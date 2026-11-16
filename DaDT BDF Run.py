@@ -2156,6 +2156,66 @@ class IntegratedBDFRFTool:
 
 
 # ============================================================================
+# _read_bdf_without_includes: pyNastran'ı INCLUDE kartları olmayan bir geçici
+# kopya üzerinden çalıştırır.
+# ----------------------------------------------------------------------------
+# NEDEN: pyNastran 1.3.4, read_includes=False olsa bile her INCLUDE satırı için
+# tüm satır listesini (ve numpy 'ilines' dizisini) baştan kopyalıyor
+# (lines = lines[:i] + lines[j:]). Maliyet ~ INCLUDE sayısı x dosya satır sayısı:
+# 12000 INCLUDE'lı, milyonlarca satırlık bir manevra BDF'inde parse süresi
+# ~22 sn yerine ~440 sn oluyor. Bu okumalarda INCLUDE içeriği zaten
+# kullanılmıyor (read_includes=False), bu yüzden INCLUDE kartlarını önceden
+# atıp geri kalan kısmı okumak AYNI modeli çok daha hızlı üretir.
+# GÜVENLİK: Orijinal dosya hiç değiştirilmez; çözülen BDF'ler (Nastran'a giden)
+# bu fonksiyondan bağımsız olarak orijinal dosyadan üretilir, yani INCLUDE'lar
+# oralarda aynen korunur. Geçici kopya okuma biter bitmez silinir.
+# Çok satırlı INCLUDE: yol 72 karakteri aşınca 2+ satıra bölünür
+#   INCLUDE 'D:/.../TAXI/VT/
+#   VT_CASE_110xx.BDF'
+# Bu yüzden başlangıç satırında tırnak açık kalıyorsa, kapanış tırnağını içeren
+# satıra kadar olan TÜM satırlar atılır.
+# Dönüş: (model, atılan_include_sayısı, kopya_yazma_süresi_sn)
+def _read_bdf_without_includes(bdf_obj, bdf_path, **read_kwargs):
+    t0 = time.time()
+    with open(bdf_path, 'r', encoding='latin-1', newline='') as f:
+        lines = f.readlines()
+
+    kept = []
+    n_inc = 0
+    close_quote = None            # çok satırlı INCLUDE içindeysek aranan kapanış tırnağı
+    for line in lines:
+        if close_quote is not None:
+            if close_quote in line:
+                close_quote = None
+            continue
+        if line.lstrip()[:7].upper() == 'INCLUDE':
+            n_inc += 1
+            # İlk tırnaktan sonra aynı satırda kapanış tırnağı yoksa kart devam ediyor.
+            for q in ("'", '"'):
+                first = line.find(q)
+                if first != -1 and line.find(q, first + 1) == -1:
+                    close_quote = q
+                    break
+            continue
+        kept.append(line)
+
+    if n_inc == 0:                # INCLUDE yok: kopya yazmaya gerek yok, doğrudan oku
+        bdf_obj.read_bdf(bdf_path, **read_kwargs)
+        return bdf_obj, 0, time.time() - t0
+
+    tmp_dir = tempfile.mkdtemp(prefix='dadt_noinc_')
+    try:
+        tmp_path = os.path.join(tmp_dir, os.path.basename(bdf_path))
+        with open(tmp_path, 'w', encoding='latin-1', newline='') as f:
+            f.writelines(kept)
+        t_copy = time.time() - t0
+        bdf_obj.read_bdf(tmp_path, **read_kwargs)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    return bdf_obj, n_inc, t_copy
+
+
+# ============================================================================
 # BarPropertySolverTab  --  "Understanding Structure Type" sekmesi (Tab 3)
 # ============================================================================
 # Bu sınıf kullanıcıdan BDF dosyalarını ve Property/Element Excel'lerini alır,
@@ -2510,7 +2570,13 @@ class BarPropertySolverTab:
                 self.log(f"\n  Loading: {os.path.basename(bdf_path)}")
                 t_file_start = time.time()
                 model = BDF(debug=False)
-                model.read_bdf(bdf_path, validate=False, xref=False, read_includes=False, encoding='latin-1')
+                # INCLUDE kartları atılmış geçici kopyadan oku (bkz. _read_bdf_without_includes):
+                # pyNastran her INCLUDE için tüm satır listesini kopyaladığından çok
+                # sayıda INCLUDE'lı büyük BDF'lerde parse dakikalar sürüyordu.
+                model, n_inc, t_copy = _read_bdf_without_includes(
+                    model, bdf_path, validate=False, xref=False, read_includes=False, encoding='latin-1')
+                if n_inc:
+                    self.log(f"    ({n_inc} INCLUDE card(s) skipped for reading; copy prepared in {t_copy:.1f}s)")
                 self.log(f"    ...parsed in {time.time() - t_file_start:.1f}s "
                           f"({len(model.nodes)} nodes, {len(model.elements)} elements)")
                 self.bdf_models.append({'path': bdf_path, 'model': model, 'name': os.path.basename(bdf_path)})
@@ -3102,7 +3168,10 @@ class BarPropertySolverTab:
             bdf = BDF(debug=False)
             # xref=True burada GEREKLİ - aşağıda node.get_position() ve
             # elem.node_ids üzerinden gerçek 3B koordinatlar okunacak.
-            bdf.read_bdf(maneuver_path, validate=False, xref=True, read_includes=False, encoding='latin-1')
+            # INCLUDE'suz geçici kopyadan oku (hız için, bkz. _read_bdf_without_includes);
+            # maneuver_path dosyasının kendisi (INCLUDE'larıyla) olduğu gibi kalır.
+            _read_bdf_without_includes(bdf, maneuver_path, validate=False, xref=True,
+                                       read_includes=False, encoding='latin-1')
             self.log(f"    {label}Maneuver BDF parsed for offsets in {time.time() - t_parse_start:.1f}s")
         except Exception as e:
             self.log(f"    {label}Offset calc error reading maneuver BDF: {e}")

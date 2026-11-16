@@ -1290,6 +1290,173 @@ def _polish_ui_features(app):
 
 
 # ============================================================================
+# _fix_layout: SADECE GÖRÜNÜM - küçük/orta pencerelerde yazıların kesilmesini ve düğmelerin sağ kenardan taşmasını önler.
+#   1) Uzun (>= 60 karakter) ipucu/açıklama etiketleri, bulundukları kapsayıcının genişliğine göre OTOMATİK satır kırar.
+#      (Sarılmayan 1800 piksellik bir etiket, sayfanın genişliğini şişirip Browse/Add düğmelerini ekran dışına itiyordu.)
+#   2) Kaydırılabilir sekmelere, içerik hâlâ pencereden genişse kendiliğinden görünen YATAY kaydırma çubuğu eklenir.
+#   3) Kaydırılabilir olmayan sekmeler (BDF Merge, Visualization) dikey kaydırılabilir yapılır; böylece pencere kısaysa
+#      Log paneli tek çizgiye sıkışmaz, tüm alanlar kendi doğal boyunda kalır.
+# ============================================================================
+def _fix_layout(app):
+    root, colors = app.root, app.colors
+
+    def walk(w):
+        yield w
+        for c in w.winfo_children():
+            yield from walk(c)
+
+    # ---- 0) esnek (satırı dolduran) yol kutularının DOĞAL genişliğini küçült ----
+    # Bu kutular zaten satırın sonuna kadar uzanıyor (sticky 'ew' / fill X); 80-90 karakterlik sabit genişlik talebi ise
+    # dar pencerede sayfayı gereksiz yere genişletiyor. Esneme aynı kalır, yalnızca asgari genişlik düşer.
+    try:
+        for w in walk(root):
+            if isinstance(w, ttk.Entry) and int(w.cget('width')) > 24:
+                mgr = w.winfo_manager()
+                flex = False
+                if mgr == 'grid':
+                    flex = 'e' in str(w.grid_info().get('sticky', '')) and 'w' in str(w.grid_info().get('sticky', ''))
+                elif mgr == 'pack':
+                    flex = str(w.pack_info().get('fill')) in ('x', 'both') and bool(int(w.pack_info().get('expand', 0)))
+                if flex:
+                    w.configure(width=24)
+    except Exception as e:
+        print(f"UI layout (entry width) skipped: {e}")
+
+    # ---- 1) uzun etiketleri otomatik sar ----
+    def wrap_len(w):
+        try:
+            return int(float(str(w.cget('wraplength')) or 0))
+        except (ValueError, tk.TclError):
+            return 0
+
+    def viewport_of(w):
+        # görünen alan: en yakın tuval ya da sekme çerçevesi (içerik bundan geniş olsa da kırılma buna göre yapılır)
+        p = w.master
+        while p is not None:
+            if isinstance(p, tk.Canvas) or isinstance(getattr(p, 'master', None), ttk.Notebook):
+                return p
+            p = getattr(p, 'master', None)
+        return None
+
+    def fit(w):
+        try:
+            p = w.master
+            pw = p.winfo_width()
+            if pw <= 1 or not w.winfo_ismapped():
+                return
+            vp = viewport_of(w)
+            if vp is not None and vp.winfo_width() > 1:
+                pw = min(pw, vp.winfo_width() - 26 - max(0, p.winfo_rootx() - vp.winfo_rootx()))
+            x = w.winfo_x()
+            rights = 0
+            for sib in p.winfo_children():
+                if sib is w or not sib.winfo_ismapped() or sib.winfo_manager() not in ('grid', 'pack'):
+                    continue
+                overlap_y = min(sib.winfo_y() + sib.winfo_height(), w.winfo_y() + w.winfo_height()) - max(sib.winfo_y(), w.winfo_y())
+                if overlap_y > 2 and sib.winfo_x() >= x:
+                    rights += sib.winfo_reqwidth() + 8
+            avail = max(200, pw - x - rights - 30)
+            if abs(wrap_len(w) - avail) > 8:
+                w.configure(wraplength=avail)
+        except tk.TclError:
+            pass
+
+    labels = []
+    try:
+        for w in walk(root):
+            if isinstance(w, ttk.Label) and not str(w.cget('textvariable')) and wrap_len(w) == 0 \
+                    and len(str(w.cget('text'))) >= 60 and w.winfo_manager() in ('grid', 'pack'):
+                w.configure(wraplength=620)                      # ilk ölçümde şişirmesin
+                labels.append(w)
+                w.master.bind('<Configure>', lambda e, lab=w: fit(lab), add='+')
+                vp = viewport_of(w)
+                if vp is not None:
+                    vp.bind('<Configure>', lambda e, lab=w: fit(lab), add='+')
+        root.update_idletasks()
+        for w in labels:
+            fit(w)
+        root.update_idletasks()
+    except Exception as e:
+        print(f"UI layout (wrap) skipped: {e}")
+
+    # ---- 2) kaydırılabilir sekmelerde otomatik gizlenen yatay kaydırma çubuğu ----
+    def autohide(bar, side, fill, covered=1.0):
+        # covered: görünen oran bu değerin üstündeyse çubuk gizlenir (yatayda birkaç piksellik taşma için çubuk göstermeyelim)
+        def set_(lo, hi):
+            bar.set(lo, hi)
+            try:
+                if float(hi) - float(lo) >= covered - 1e-6:
+                    if bar.winfo_manager():
+                        bar.pack_forget()
+                elif not bar.winfo_manager():
+                    bar.pack(side=side, fill=fill, before=bar._before)
+            except tk.TclError:
+                pass
+        return set_
+
+    try:
+        for tab in (getattr(app, n, None) for n in ('tab3', 'tab4', 'tab5', 'tab6', 'tab7', 'tab9', 'tab10')):
+            if tab is None:
+                continue
+            for canvas in [c for c in tab.winfo_children() if isinstance(c, tk.Canvas)]:
+                hsb = ttk.Scrollbar(tab, orient='horizontal', command=canvas.xview)
+                hsb._before = tab.winfo_children()[0]
+                cmd = autohide(hsb, tk.BOTTOM, tk.X, covered=0.985)
+                canvas.configure(xscrollcommand=cmd)
+                canvas.bind('<Configure>', lambda e, c=canvas, f=cmd: c.after_idle(lambda: f(*c.xview())), add='+')   # boyut değişince yeniden değerlendir
+    except Exception as e:
+        print(f"UI layout (hscroll) skipped: {e}")
+
+    # ---- 3) kaydırılabilir olmayan sekmeleri dikey kaydırılabilir yap ----
+    def make_scrollable(tab):
+        kids = [c for c in tab.winfo_children()]
+        if len(kids) != 1 or isinstance(kids[0], tk.Canvas) or kids[0].winfo_manager() != 'pack':
+            return
+        main = kids[0]
+        canvas = tk.Canvas(tab, highlightthickness=0, bg=colors['bg'])
+        vsb = ttk.Scrollbar(tab, orient='vertical', command=canvas.yview)
+        hsb = ttk.Scrollbar(tab, orient='horizontal', command=canvas.xview)
+        vsb._before = hsb._before = canvas
+        vcmd, hcmd = autohide(vsb, tk.RIGHT, tk.Y), autohide(hsb, tk.BOTTOM, tk.X, covered=0.985)
+        canvas.configure(yscrollcommand=vcmd, xscrollcommand=hcmd)
+        main.pack_forget()
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        item = canvas.create_window(0, 0, window=main, anchor='nw')
+        main.lift(canvas)                                       # kardeş pencere tuvalin ÜSTÜNDE görünsün
+
+        def relayout(_e=None):
+            try:
+                w = max(canvas.winfo_width(), main.winfo_reqwidth())
+                h = max(canvas.winfo_height(), main.winfo_reqheight())
+                canvas.itemconfigure(item, width=w, height=h)
+                canvas.configure(scrollregion=(0, 0, w, h))
+            except tk.TclError:
+                pass
+        canvas.bind('<Configure>', relayout, add='+')
+        main.bind('<Configure>', relayout, add='+')
+        canvas.bind('<Configure>', lambda e: canvas.after_idle(lambda: (vcmd(*canvas.yview()), hcmd(*canvas.xview()))), add='+')
+
+        def wheel(e):
+            if e.num == 4 or getattr(e, 'delta', 0) > 0:
+                canvas.yview_scroll(-3, 'units')
+            else:
+                canvas.yview_scroll(3, 'units')
+        for ev in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
+            tab.bind(ev, wheel, add='+')
+            for c in walk(main):
+                if not isinstance(c, (tk.Text, tk.Listbox)):          # metin/liste kutuları kendi kaydırmasını kullanır
+                    c.bind(ev, wheel, add='+')
+        relayout()
+    try:
+        for tab in (getattr(app, n, None) for n in ('tab1', 'tab8')):
+            if tab is not None:
+                make_scrollable(tab)
+        root.update_idletasks()
+    except Exception as e:
+        print(f"UI layout (scrollable tabs) skipped: {e}")
+
+
+# ============================================================================
 # _Tooltip: bir widget'ın üzerinde fare bekleyince küçük koyu bir ipucu kutusu gösterir (yalnızca görünüm).
 # text_fn() her gösterimde çağrılır (dinamik metin için); boş/None dönerse ipucu çıkmaz.
 # ============================================================================
@@ -1780,6 +1947,10 @@ class IntegratedBDFRFTool:
             _polish_ui_pro(self)
         except Exception as _e:
             print(f"UI polish (pro) skipped: {_e}")
+        try:
+            _fix_layout(self)
+        except Exception as _e:
+            print(f"UI layout fix skipped: {_e}")
 
 
     # setup_tab1: "BDF Merge Preparation" sekmesinin tüm arayüzünü (Thermal

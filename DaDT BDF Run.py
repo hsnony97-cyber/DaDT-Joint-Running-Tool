@@ -168,9 +168,54 @@ def _configure_app_style(root):
               background=[('active', colors['danger_dark']), ('disabled', colors['border'])],
               foreground=[('disabled', colors['muted'])])
 
+    # ---- Düğme hiyerarşisi (yalnızca görünüm; _polish_ui düğmelere yazılarına göre atar) ----
+    # 'Secondary.TButton': Browse / Add / Load / List gibi ikincil işlemler - beyaz zemin, mavi yazı + mavi çerçeve.
+    style.configure('Secondary.TButton', font=base_font, padding=(10, 5), background=colors['surface'],
+                    foreground=colors['primary_dark'], bordercolor=colors['primary'],
+                    lightcolor=colors['surface'], darkcolor=colors['surface'])
+    style.map('Secondary.TButton',
+              background=[('active', '#dbeafe'), ('disabled', colors['bg'])],
+              foreground=[('disabled', colors['muted'])],
+              bordercolor=[('disabled', colors['border'])])
+    # 'DangerOutline.TButton': Remove / Clear gibi silici ama geri dönüşü olan işlemler - beyaz zemin, kırmızı yazı/çerçeve.
+    style.configure('DangerOutline.TButton', font=base_font, padding=(10, 5), background=colors['surface'],
+                    foreground=colors['danger_dark'], bordercolor='#fca5a5',
+                    lightcolor=colors['surface'], darkcolor=colors['surface'])
+    style.map('DangerOutline.TButton',
+              background=[('active', '#fee2e2'), ('disabled', colors['bg'])],
+              foreground=[('disabled', colors['muted'])])
+    # 'Subtle.TButton': Clear Log gibi önemsiz yardımcı işlemler - arka planla aynı, sönük yazı.
+    style.configure('Subtle.TButton', font=('Segoe UI', 9), padding=(8, 3), background=colors['bg'],
+                    foreground=colors['muted'], bordercolor=colors['border'],
+                    lightcolor=colors['bg'], darkcolor=colors['bg'])
+    style.map('Subtle.TButton', background=[('active', colors['border'])],
+              foreground=[('active', colors['text'])])
+
+    # Sekmeler: fareyle üzerine gelince açık vurgu; seçili ana sekme biraz daha yüksek görünür.
+    style.map('TNotebook.Tab', background=[('selected', colors['surface']), ('active', '#e2e8f0')],
+              foreground=[('selected', colors['primary_dark'])])
+    style.map('Main.TNotebook.Tab', padding=[('selected', (18, 12))])
+
+    # Kaydırma çubukları (ttk) - ince, sade.
+    for _orient in ('Vertical', 'Horizontal'):
+        style.configure(f'{_orient}.TScrollbar', background=colors['border'], troughcolor=colors['bg'],
+                        bordercolor=colors['bg'], arrowcolor=colors['muted'])
+        style.map(f'{_orient}.TScrollbar', background=[('active', '#94a3b8')])
+
+    # Tablolar (Treeview): okunaklı satır yüksekliği ve başlık.
+    style.configure('Treeview', rowheight=24, background=colors['surface'], fieldbackground=colors['surface'],
+                    bordercolor=colors['border'])
+    style.configure('Treeview.Heading', font=('Segoe UI', 9, 'bold'), background=colors['border'],
+                    foreground=colors['text'])
+    style.map('Treeview', background=[('selected', colors['primary'])], foreground=[('selected', 'white')])
+
     # Metin giriş kutuları (Entry) ve açılır liste kutuları (Combobox) görünümü.
     style.configure('TEntry', padding=4, fieldbackground=colors['surface'], bordercolor=colors['border'])
     style.configure('TCombobox', padding=4)
+    # Odaktaki alan mavi çerçeveyle belirgin olsun; pasif alan soluk.
+    style.map('TEntry', bordercolor=[('focus', colors['primary'])], lightcolor=[('focus', colors['primary'])],
+              fieldbackground=[('disabled', colors['bg'])])
+    style.map('TCombobox', bordercolor=[('focus', colors['primary'])], lightcolor=[('focus', colors['primary'])])
 
     # İlerleme çubuğu (Progressbar) görünümü - her sekmenin altındaki mavi
     # ilerleme çubuklarının rengi/kalınlığı burada ayarlanıyor.
@@ -182,6 +227,284 @@ def _configure_app_style(root):
     # bu renklere _APP_COLORS['...'] şeklinde erişebilsin.
     _APP_COLORS.update(colors)
     return colors
+
+
+# ============================================================================
+# _polish_ui: SADECE GÖRÜNÜM katmanı - hiçbir sekme sınıfına/iş mantığına dokunmaz.
+# ----------------------------------------------------------------------------
+# Tüm sekmeler kurulduktan SONRA bir kere çağrılır ve widget ağacını gezerek:
+#   1) düğmelere yazılarına göre hiyerarşik stil atar (RUN/▶ = vurgulu mavi, Browse/Add/Load = ikincil,
+#      Remove/Clear = kırmızı çerçeveli, Clear Log = sönük) - düğmelerin command'ı değişmez,
+#   2) uzun yol kutularını (Entry, width >= 30) satırın sonuna kadar genişletir,
+#   3) log kutularını renklendirir (ERROR kırmızı, WARNING sarı, tamamlandı yeşil, başlıklar mavi) ve
+#      sağ tık menüsü ekler (Copy / Select All / Find / Save log / Scroll to end). Log METNİ değişmez; renkleri
+#      ana döngüde (400 ms'de bir) yeni satırlara etiket ekleyerek verir - log'u yazan iş parçacıklarına karışmaz,
+#   4) pencerenin altına durum çubuğu ekler: durum (Ready/Running), aktif sekme, geçen süre, saat.
+# Her bölüm kendi try/except'i içindedir: bir hata olursa o süs atlanır, uygulama aynen çalışır.
+def _polish_ui(app):
+    import tkinter.font as tkfont
+    from tkinter import simpledialog
+    root, colors = app.root, app.colors
+
+    def walk(w):
+        yield w
+        for c in w.winfo_children():
+            yield from walk(c)
+
+    widgets = list(walk(root))
+
+    # ---- 1) Düğme hiyerarşisi ----
+    secondary = {'Browse', 'Add', 'Add...', 'Load', 'List', 'Find CSVs in Folder...'}
+    outline = {'Remove', 'Clear'}
+    subtle = {'Clear Log'}
+    try:
+        for w in widgets:
+            if isinstance(w, ttk.Button) and not str(w.cget('style')):
+                t = str(w.cget('text')).strip()
+                if t.startswith('▶'):
+                    new = 'Accent.TButton'
+                elif t in secondary:
+                    new = 'Secondary.TButton'
+                elif t in outline:
+                    new = 'DangerOutline.TButton'
+                elif t in subtle:
+                    new = 'Subtle.TButton'
+                else:
+                    continue
+                w.configure(style=new)
+    except Exception as e:
+        print(f"UI polish (buttons) skipped: {e}")
+
+    # ---- 2) Uzun yol kutuları satırı doldursun ----
+    try:
+        for w in widgets:
+            if isinstance(w, ttk.Entry) and int(w.cget('width')) >= 30:
+                mgr = w.winfo_manager()
+                if mgr == 'grid':
+                    info = w.grid_info()
+                    w.grid_configure(sticky='ew')
+                    w.master.columnconfigure(int(info['column']), weight=1)
+                elif mgr == 'pack':
+                    info = w.pack_info()
+                    if str(info.get('side')) in ('left', 'top') and str(info.get('fill')) in ('none', 'y'):
+                        w.pack_configure(fill=tk.X, expand=True)
+    except Exception as e:
+        print(f"UI polish (entries) skipped: {e}")
+
+    # ---- 3) Renkli log + sağ tık menüsü ----
+    logs = []              # [widget, durum sözlüğü]
+    fonts_keep = []
+    tag_colors = {'log_err': '#f87171', 'log_warn': '#fbbf24', 'log_ok': '#4ade80',
+                  'log_head': '#93c5fd', 'log_rule': '#475569'}
+    re_err = re.compile(r'\bERROR\b|Traceback \(most recent|\bFAILED\b|\bFATAL\b|\bSTOPPED\b|Exception\b', re.I)
+    re_warn = re.compile(r'\bWARNING\b|\bWARN\b', re.I)
+    re_ok = re.compile(r'\bCOMPLETE\b|\bCOMPLETED\b|\bSUCCESS(FULLY)?\b|\bPASSED\b|\bCONVERGED\b|\bDONE\b|\bfinished\b', re.I)
+
+    def classify(line):
+        s = line.strip()
+        if not s:
+            return None
+        if re.match(r'WARNING|WARN\b', s, re.I):          # 'WARNING: ... failed ...' kırmızı olmasın
+            return 'log_warn'
+        if re_err.search(s):
+            return 'log_err'
+        if re_warn.search(s):
+            return 'log_warn'
+        if re_ok.search(s):
+            return 'log_ok'
+        if len(s) >= 5 and set(s) <= set('=-_*#'):
+            return 'log_rule'
+        if (len(s) >= 6 and s[0].isalpha() and s.upper() == s and not line.startswith(' ')) or \
+                (s.startswith('---') and s.endswith('---')):
+            return 'log_head'
+        return None
+
+    def tab_name_of(w):
+        p = w
+        while p is not None:
+            m = getattr(p, 'master', None)
+            if isinstance(m, ttk.Notebook) and str(m.cget('style')) == 'Sub.TNotebook':
+                try:
+                    return str(m.tab(p, 'text')).strip()
+                except tk.TclError:
+                    return ''
+            p = m
+        return ''
+
+    def make_menu(w, st):
+        menu = tk.Menu(w, tearoff=0)
+
+        def copy_():
+            try:
+                txt = w.get('sel.first', 'sel.last')
+            except tk.TclError:
+                txt = w.get('1.0', 'end-1c')
+            root.clipboard_clear()
+            root.clipboard_append(txt)
+
+        def select_all():
+            w.tag_add('sel', '1.0', 'end-1c')
+
+        def find_():
+            term = simpledialog.askstring('Find in log', 'Text to find:', parent=root, initialvalue=st.get('term', ''))
+            if not term:
+                return
+            if term != st.get('term'):
+                st['term'], st['pos'] = term, '1.0'
+            w.tag_remove('log_find', '1.0', 'end')
+            idx = w.search(term, st['pos'], nocase=True, stopindex='end')
+            if not idx:
+                idx = w.search(term, '1.0', nocase=True, stopindex='end')      # başa sar
+            if not idx:
+                messagebox.showinfo('Find in log', f"'{term}' not found.", parent=root)
+                return
+            end = f"{idx}+{len(term)}c"
+            w.tag_add('log_find', idx, end)
+            w.see(idx)
+            st['pos'] = end
+
+        def save_():
+            path = filedialog.asksaveasfilename(parent=root, defaultextension='.txt', title='Save log as',
+                                                filetypes=[('Text files', '*.txt'), ('Log files', '*.log'),
+                                                           ('All files', '*.*')])
+            if path:
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(w.get('1.0', 'end-1c'))
+
+        menu.add_command(label='Copy', command=copy_)
+        menu.add_command(label='Select all', command=select_all)
+        menu.add_separator()
+        menu.add_command(label='Find...', command=find_)
+        menu.add_command(label='Save log as...', command=save_)
+        menu.add_command(label='Scroll to end', command=lambda: w.see('end'))
+
+        def popup(event):
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+        w.bind('<Button-3>', popup, add='+')
+
+    try:
+        for w in widgets:
+            if isinstance(w, scrolledtext.ScrolledText):
+                try:
+                    base = tkfont.Font(root=root, font=w.cget('font'))
+                    bold = base.copy()
+                    bold.configure(weight='bold')
+                    fonts_keep += [base, bold]
+                except tk.TclError:
+                    bold = None
+                for tag, col in tag_colors.items():
+                    kw = {'foreground': col}
+                    if tag == 'log_head' and bold is not None:
+                        kw['font'] = bold
+                    w.tag_configure(tag, **kw)
+                w.tag_configure('log_find', background='#facc15', foreground='#0f172a')
+                st = {'next': 1, 'end': 1, 'counted': 0, 'pos': '1.0', 'term': ''}
+                make_menu(w, st)
+                logs.append((w, st))
+    except Exception as e:
+        print(f"UI polish (logs) skipped: {e}")
+
+    # ---- 4) Durum çubuğu ----
+    status = {'baseline': threading.active_count(), 'start': None, 'working': False, 'err_total': 0,
+              'err_base': 0, 'active_tab': '', 'active_at': 0.0}
+    try:
+        app.notebook.pack_forget()
+        bar = ttk.Frame(root, padding=(14, 5))
+        bar.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Separator(root, orient='horizontal').pack(side=tk.BOTTOM, fill=tk.X)
+        app.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        dot = tk.Canvas(bar, width=12, height=12, highlightthickness=0, bg=colors['bg'])
+        dot_id = dot.create_oval(1, 1, 11, 11, fill='#16a34a', outline='')
+        dot.pack(side=tk.LEFT, padx=(0, 6))
+        lbl_state = ttk.Label(bar, text='Ready', font=('Segoe UI', 9, 'bold'))
+        lbl_state.pack(side=tk.LEFT)
+        ttk.Label(bar, text='  │  ', style='Subtitle.TLabel').pack(side=tk.LEFT)
+        lbl_tab = ttk.Label(bar, text='', style='Subtitle.TLabel')
+        lbl_tab.pack(side=tk.LEFT)
+        lbl_clock = ttk.Label(bar, text='', style='Subtitle.TLabel')
+        lbl_clock.pack(side=tk.RIGHT)
+        lbl_elapsed = ttk.Label(bar, text='', style='Subtitle.TLabel')
+        lbl_elapsed.pack(side=tk.RIGHT, padx=(0, 16))
+    except Exception as e:
+        print(f"UI polish (status bar) skipped: {e}")
+        dot = None
+
+    def fmt(sec):
+        sec = int(sec)
+        return f"{sec // 3600:02d}:{sec % 3600 // 60:02d}:{sec % 60:02d}"
+
+    def current_path(_e=None):
+        try:
+            outer = app.notebook.nametowidget(app.notebook.select())
+            main_txt = str(app.notebook.tab(outer, 'text')).strip()
+            sub_txt = ''
+            for c in outer.winfo_children():
+                if isinstance(c, ttk.Notebook):
+                    sub_txt = str(c.tab(c.select(), 'text')).strip()
+            lbl_tab.configure(text=f"{main_txt}  ›  {sub_txt}" if sub_txt else main_txt)
+        except Exception:
+            pass
+
+    if dot is not None:
+        for w in widgets:
+            if isinstance(w, ttk.Notebook):
+                w.bind('<<NotebookTabChanged>>', current_path, add='+')
+        current_path()
+
+    def tick():
+        try:
+            now = time.time()
+            # -- log renklendirme (yalnızca yeni satırlar) --
+            for w, st in logs:
+                try:
+                    end_line = int(w.index('end-1c').split('.')[0])
+                    if end_line < st['next']:                    # log temizlendi
+                        st['next'], st['end'], st['counted'] = 1, 1, 0
+                    if end_line > st['end'] or (end_line == st['end'] and end_line >= st['next']):
+                        first, last = st['next'], min(end_line, st['next'] + 3000)
+                        chunk = w.get(f'{first}.0', f'{last}.end')
+                        for i, line in enumerate(chunk.split('\n')):
+                            n = first + i
+                            tag = classify(line)
+                            if tag:
+                                w.tag_add(tag, f'{n}.0', f'{n}.end')
+                                if tag == 'log_err' and st['counted'] < n < end_line:   # tamamlanmış satırları bir kez say
+                                    status['err_total'] += 1
+                        st['counted'] = max(st['counted'], min(last, end_line - 1))
+                        if end_line > st['end']:
+                            status['active_tab'], status['active_at'] = tab_name_of(w), now
+                        st['next'], st['end'] = last, end_line
+                except tk.TclError:
+                    continue
+            # -- durum çubuğu --
+            if dot is not None:
+                working = threading.active_count() > status['baseline']
+                if working and not status['working']:
+                    status['start'], status['err_base'] = now, status['err_total']
+                if working:
+                    who = status['active_tab'] or 'a task'
+                    lbl_state.configure(text=f"Running — {who}")
+                    dot.itemconfigure(dot_id, fill='#f59e0b')
+                    lbl_elapsed.configure(text=f"Elapsed {fmt(now - status['start'])}")
+                elif status['working']:                         # az önce bitti
+                    errs = status['err_total'] - status['err_base']
+                    msg = f"Ready — last run finished in {fmt(now - status['start'])}"
+                    if errs:
+                        msg += f" ({errs} error line(s) in log)"
+                    lbl_state.configure(text=msg)
+                    dot.itemconfigure(dot_id, fill='#dc2626' if errs else '#16a34a')
+                    lbl_elapsed.configure(text='')
+                status['working'] = working
+                lbl_clock.configure(text=time.strftime('%H:%M'))
+        except Exception:
+            pass
+        root.after(400, tick)
+
+    root.after(400, tick)
 
 
 # ==================== ANA UYGULAMA SINIFI ====================
@@ -402,6 +725,13 @@ class IntegratedBDFRFTool:
         # Tüm kaydırılabilir sekmelerin içeriği pencerenin tam genişliğini kullansın.
         for _tab in (self.tab3, self.tab4, self.tab5, self.tab6, self.tab7, self.tab9, self.tab10):
             self._stretch_scrollable_content(_tab)
+
+        # Görünüm cilası (düğme hiyerarşisi, renkli log, durum çubuğu). İş mantığına dokunmaz;
+        # herhangi bir hata olursa süs atlanır, uygulama aynen çalışır.
+        try:
+            _polish_ui(self)
+        except Exception as _e:
+            print(f"UI polish skipped: {_e}")
 
 
     # setup_tab1: "BDF Merge Preparation" sekmesinin tüm arayüzünü (Thermal

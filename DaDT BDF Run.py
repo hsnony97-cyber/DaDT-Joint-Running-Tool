@@ -196,6 +196,13 @@ def _configure_app_style(root):
               foreground=[('selected', colors['primary_dark'])])
     style.map('Main.TNotebook.Tab', padding=[('selected', (18, 12))])
 
+    # Üst başlık bandı (koyu lacivert, beyaz başlık) ve geçersiz (bulunamayan dosya) yol kutusu.
+    style.configure('Banner.TFrame', background=colors['log_bg'])
+    style.configure('BannerTitle.TLabel', font=('Segoe UI', 15, 'bold'), foreground='white', background=colors['log_bg'])
+    style.configure('BannerSub.TLabel', font=('Segoe UI', 9), foreground='#94a3b8', background=colors['log_bg'])
+    style.configure('Invalid.TEntry', padding=4, fieldbackground='#fef2f2', bordercolor='#f87171')
+    style.map('Invalid.TEntry', bordercolor=[('focus', colors['danger'])], lightcolor=[('focus', colors['danger'])])
+
     # Kaydırma çubukları (ttk) - ince, sade.
     for _orient in ('Vertical', 'Horizontal'):
         style.configure(f'{_orient}.TScrollbar', background=colors['border'], troughcolor=colors['bg'],
@@ -384,6 +391,8 @@ def _polish_ui(app):
             finally:
                 menu.grab_release()
         w.bind('<Button-3>', popup, add='+')
+        w.bind('<Control-f>', lambda e: (find_(), 'break')[1], add='+')     # Ctrl+F: log içinde ara
+        w.bind('<Control-a>', lambda e: (select_all(), 'break')[1], add='+')
 
     try:
         for w in widgets:
@@ -409,7 +418,23 @@ def _polish_ui(app):
 
     # ---- 4) Durum çubuğu ----
     status = {'baseline': threading.active_count(), 'start': None, 'working': False, 'err_total': 0,
-              'err_base': 0, 'active_tab': '', 'active_at': 0.0}
+              'err_base': 0, 'active_tab': '', 'active_at': 0.0, 'active_w': None, 'pb_shown': False}
+    pb_cache = {}
+
+    def progressbar_of(w):
+        # log kutusunun bulunduğu sekmedeki ilk ttk.Progressbar
+        if w in pb_cache:
+            return pb_cache[w]
+        found = None
+        p = w
+        while p is not None and found is None:
+            m = getattr(p, 'master', None)
+            if isinstance(m, ttk.Notebook) and str(m.cget('style')) == 'Sub.TNotebook':
+                found = next((x for x in walk(p) if isinstance(x, ttk.Progressbar)), None)
+                break
+            p = m
+        pb_cache[w] = found
+        return found
     try:
         app.notebook.pack_forget()
         bar = ttk.Frame(root, padding=(14, 5))
@@ -429,6 +454,11 @@ def _polish_ui(app):
         lbl_clock.pack(side=tk.RIGHT)
         lbl_elapsed = ttk.Label(bar, text='', style='Subtitle.TLabel')
         lbl_elapsed.pack(side=tk.RIGHT, padx=(0, 16))
+        pb_frame = ttk.Frame(bar)                                   # aktif sekmenin ilerleme çubuğunun aynası (yalnızca okur)
+        pb_status = ttk.Progressbar(pb_frame, length=150, mode='determinate', maximum=100)
+        pb_status.pack(side=tk.LEFT)
+        lbl_pct = ttk.Label(pb_frame, text='0%', style='Subtitle.TLabel', width=5, anchor='e')
+        lbl_pct.pack(side=tk.LEFT, padx=(6, 0))
     except Exception as e:
         print(f"UI polish (status bar) skipped: {e}")
         dot = None
@@ -476,7 +506,7 @@ def _polish_ui(app):
                                     status['err_total'] += 1
                         st['counted'] = max(st['counted'], min(last, end_line - 1))
                         if end_line > st['end']:
-                            status['active_tab'], status['active_at'] = tab_name_of(w), now
+                            status['active_tab'], status['active_at'], status['active_w'] = tab_name_of(w), now, w
                         st['next'], st['end'] = last, end_line
                 except tk.TclError:
                     continue
@@ -490,6 +520,18 @@ def _polish_ui(app):
                     lbl_state.configure(text=f"Running — {who}")
                     dot.itemconfigure(dot_id, fill='#f59e0b')
                     lbl_elapsed.configure(text=f"Elapsed {fmt(now - status['start'])}")
+                    src = progressbar_of(status['active_w']) if status['active_w'] is not None else None
+                    if src is not None and str(src.cget('mode')) == 'determinate':
+                        try:
+                            mx = float(src.cget('maximum')) or 100.0
+                            pct = max(0.0, min(100.0, float(src.cget('value')) / mx * 100.0))
+                            pb_status.configure(value=pct)
+                            lbl_pct.configure(text=f"{pct:.0f}%")
+                            if not status['pb_shown']:
+                                pb_frame.pack(side=tk.RIGHT, padx=(0, 16))
+                                status['pb_shown'] = True
+                        except (tk.TclError, ValueError):
+                            pass
                 elif status['working']:                         # az önce bitti
                     errs = status['err_total'] - status['err_base']
                     msg = f"Ready — last run finished in {fmt(now - status['start'])}"
@@ -498,13 +540,253 @@ def _polish_ui(app):
                     lbl_state.configure(text=msg)
                     dot.itemconfigure(dot_id, fill='#dc2626' if errs else '#16a34a')
                     lbl_elapsed.configure(text='')
+                    if status['pb_shown']:
+                        pb_frame.pack_forget()
+                        status['pb_shown'] = False
                 status['working'] = working
                 lbl_clock.configure(text=time.strftime('%H:%M'))
         except Exception:
             pass
         root.after(400, tick)
 
+    app._log_widgets = [w for w, _ in logs]
     root.after(400, tick)
+
+
+# ============================================================================
+# _Tooltip: bir widget'ın üzerinde fare bekleyince küçük koyu bir ipucu kutusu gösterir (yalnızca görünüm).
+# text_fn() her gösterimde çağrılır (dinamik metin için); boş/None dönerse ipucu çıkmaz.
+# ============================================================================
+class _Tooltip:
+    def __init__(self, widget, text_fn, delay=550):
+        self.widget, self.text_fn, self.delay = widget, text_fn, delay
+        self._job = None
+        self._tip = None
+        widget.bind('<Enter>', self._schedule, add='+')
+        widget.bind('<Leave>', self._hide, add='+')
+        widget.bind('<ButtonPress>', self._hide, add='+')
+
+    def _schedule(self, _e=None):
+        self._hide()
+        self._job = self.widget.after(self.delay, self._show)
+
+    def _show(self):
+        self._job = None
+        try:
+            text = self.text_fn()
+            if not text:
+                return
+            tip = tk.Toplevel(self.widget)
+            tip.wm_overrideredirect(True)
+            x = self.widget.winfo_pointerx() + 14
+            y = self.widget.winfo_pointery() + 18
+            tip.wm_geometry(f"+{x}+{y}")
+            tk.Label(tip, text=text, justify='left', wraplength=620, bg='#0f172a', fg='#f8fafc',
+                     font=('Segoe UI', 9), padx=8, pady=5, relief='flat', bd=0).pack()
+            self._tip = tip
+        except tk.TclError:
+            self._tip = None
+
+    def _hide(self, _e=None):
+        if self._job is not None:
+            try:
+                self.widget.after_cancel(self._job)
+            except tk.TclError:
+                pass
+            self._job = None
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except tk.TclError:
+                pass
+            self._tip = None
+
+
+# ============================================================================
+# _polish_ui_pro: ikinci görünüm katmanı - yine iş mantığına dokunmaz, her bölüm kendi try/except'inde.
+#   1) koyu başlık bandı + pencere simgesi,
+#   2) menü çubuğu (File / View / Go / Help) ve klavye kısayolları (F11, Ctrl+1..N, Ctrl +/-/0),
+#   3) yol kutularında: bulunamayan DOSYA yolu kırmızı çerçeve + ipucu (klasörlere dokunmaz - çıktı klasörü
+#      daha var olmayabilir), uzun yolların tamamı ipucunda; düğmelere kısa ipuçları, el imleci.
+# ============================================================================
+def _polish_ui_pro(app):
+    import tkinter.font as tkfont
+    root, colors = app.root, app.colors
+
+    def walk(w):
+        yield w
+        for c in w.winfo_children():
+            yield from walk(c)
+
+    # ---- 1) Başlık bandı + simge ----
+    try:
+        banner = next(c for c in root.winfo_children() if isinstance(c, ttk.Frame))
+        banner.configure(style='Banner.TFrame')
+        for lbl in banner.winfo_children():
+            if isinstance(lbl, ttk.Label):
+                lbl.configure(style='BannerTitle.TLabel')
+        ttk.Label(banner, text='BDF   \u2192   Nastran   \u2192   Joint Run   \u2192   Web Flaw', style='BannerSub.TLabel'
+                  ).pack(side=tk.LEFT, padx=(22, 0), pady=(5, 0))
+    except Exception as e:
+        print(f"UI polish (banner) skipped: {e}")
+    try:
+        icon = tk.PhotoImage(width=64, height=64)
+        icon.put('#0f172a', to=(0, 0, 64, 64))
+        for box in ((14, 12, 24, 52), (14, 12, 42, 21), (14, 43, 42, 52), (42, 18, 51, 46), (38, 14, 46, 20), (38, 44, 46, 50)):
+            icon.put('#3b82f6', to=box)
+        app._app_icon = icon                      # referansı canlı tut
+        root.iconphoto(True, icon)
+    except Exception as e:
+        print(f"UI polish (icon) skipped: {e}")
+
+    # ---- 2) Menü çubuğu + kısayollar ----
+    def goto(g, s=None):
+        try:
+            app.notebook.select(g)
+            if s is not None:
+                outer = app.notebook.nametowidget(app.notebook.select())
+                inner = next(c for c in outer.winfo_children() if isinstance(c, ttk.Notebook))
+                inner.select(s)
+        except (tk.TclError, StopIteration):
+            pass
+
+    log_size = {'n': 10}
+
+    def set_log_size(delta=None, absolute=None):
+        n = absolute if absolute is not None else log_size['n'] + delta
+        log_size['n'] = max(7, min(20, n))
+        for w in getattr(app, '_log_widgets', []):
+            try:
+                w.configure(font=('Consolas', log_size['n']))
+                w.tag_configure('log_head', font=('Consolas', log_size['n'], 'bold'))
+            except tk.TclError:
+                pass
+
+    def toggle_fullscreen(_e=None):
+        try:
+            root.attributes('-fullscreen', not bool(root.attributes('-fullscreen')))
+        except tk.TclError:
+            pass
+
+    def show_shortcuts():
+        messagebox.showinfo('Keyboard shortcuts',
+                            'F11\t\tFull screen on/off\n'
+                            'Ctrl+1 ... Ctrl+6\tGo to the main tab (BDF / Nastran / Joint / Web Flaw / Iterative / Visualization)\n'
+                            'Ctrl+Tab\t\tNext tab\n'
+                            'Ctrl + / Ctrl -\tLog text larger / smaller\n'
+                            'Ctrl+0\t\tReset log text size\n'
+                            'Ctrl+F\t\tFind in the log (click the log first)\n'
+                            'Right-click log\tCopy / Select all / Find / Save log / Scroll to end', parent=root)
+
+    def show_about():
+        try:
+            import pyNastran
+            pn = f"pyNastran {pyNastran.__version__}"
+        except Exception:
+            pn = 'pyNastran: n/a'
+        messagebox.showinfo('About DaDT Optimization Tool',
+                            'DaDT Optimization Tool\n\n'
+                            'BDF preparation \u2192 Nastran Solver \u2192 Joint Run \u2192 Web Flaw,\n'
+                            'with iterative sizing runs and FEM result visualization.\n\n'
+                            f"Python {sys.version.split()[0]}  \u2022  {pn}", parent=root)
+
+    try:
+        menubar = tk.Menu(root, tearoff=0)
+        m_file = tk.Menu(menubar, tearoff=0)
+        m_file.add_command(label='Exit', command=root.destroy)
+        menubar.add_cascade(label='File', menu=m_file)
+        m_view = tk.Menu(menubar, tearoff=0)
+        m_view.add_command(label='Full screen', accelerator='F11', command=toggle_fullscreen)
+        m_view.add_separator()
+        m_view.add_command(label='Log text larger', accelerator='Ctrl +', command=lambda: set_log_size(+1))
+        m_view.add_command(label='Log text smaller', accelerator='Ctrl -', command=lambda: set_log_size(-1))
+        m_view.add_command(label='Reset log text size', accelerator='Ctrl 0', command=lambda: set_log_size(absolute=10))
+        menubar.add_cascade(label='View', menu=m_view)
+        m_go = tk.Menu(menubar, tearoff=0)
+        for gi, tab_id in enumerate(app.notebook.tabs()):
+            outer = app.notebook.nametowidget(tab_id)
+            sub = tk.Menu(m_go, tearoff=0)
+            inner = next((c for c in outer.winfo_children() if isinstance(c, ttk.Notebook)), None)
+            if inner is not None:
+                for si, sub_id in enumerate(inner.tabs()):
+                    sub.add_command(label=str(inner.tab(sub_id, 'text')).strip(),
+                                    command=lambda g=gi, s_=si: goto(g, s_))
+            m_go.add_cascade(label=f"{gi + 1}.  {str(app.notebook.tab(tab_id, 'text')).strip()}", menu=sub)
+        menubar.add_cascade(label='Go', menu=m_go)
+        m_help = tk.Menu(menubar, tearoff=0)
+        m_help.add_command(label='Keyboard shortcuts', command=show_shortcuts)
+        m_help.add_command(label='About', command=show_about)
+        menubar.add_cascade(label='Help', menu=m_help)
+        root.configure(menu=menubar)
+
+        root.bind_all('<F11>', toggle_fullscreen)
+        for i in range(min(9, len(app.notebook.tabs()))):
+            root.bind_all(f'<Control-Key-{i + 1}>', lambda e, g=i: goto(g))
+        root.bind_all('<Control-plus>', lambda e: set_log_size(+1))
+        root.bind_all('<Control-equal>', lambda e: set_log_size(+1))
+        root.bind_all('<Control-minus>', lambda e: set_log_size(-1))
+        root.bind_all('<Control-Key-0>', lambda e: set_log_size(absolute=10))
+        app.notebook.enable_traversal()                           # Ctrl+Tab / Ctrl+Shift+Tab
+    except Exception as e:
+        print(f"UI polish (menu) skipped: {e}")
+
+    # ---- 3) Yol doğrulama + ipuçları ----
+    file_ext = {'.xlsx', '.xlsm', '.xls', '.exe', '.bdf', '.dat', '.h5', '.pkl', '.pickle', '.csv', '.op2', '.bat', '.txt'}
+    by_var = {}
+    try:
+        for w in walk(root):
+            if isinstance(w, ttk.Entry) and int(w.cget('width')) >= 30 and str(w.cget('textvariable')):
+                by_var.setdefault(str(w.cget('textvariable')), []).append(w)
+    except Exception as e:
+        print(f"UI polish (entries) skipped: {e}")
+    bad_vars = set()
+
+    def check(name):
+        try:
+            val = str(root.getvar(name)).strip().strip('"')
+        except tk.TclError:
+            return
+        ext = os.path.splitext(val)[1].lower()
+        bad = bool(val) and ext in file_ext and not os.path.exists(val)
+        if bad:
+            bad_vars.add(name)
+        else:
+            bad_vars.discard(name)
+        for ent in by_var.get(name, []):
+            try:
+                ent.configure(style='Invalid.TEntry' if bad else 'TEntry')
+            except tk.TclError:
+                pass
+
+    try:
+        for name, ents in by_var.items():
+            root.tk.call('trace', 'add', 'variable', name, 'write', root.register(lambda *a, n=name: check(n)))
+            check(name)
+            for ent in ents:
+                def tip(n=name):
+                    try:
+                        val = str(root.getvar(n)).strip()
+                    except tk.TclError:
+                        return ''
+                    if not val:
+                        return ''
+                    return val + ("\n\u26A0  File not found" if n in bad_vars else '')
+                _Tooltip(ent, tip)
+    except Exception as e:
+        print(f"UI polish (path check) skipped: {e}")
+
+    hints = {'Browse': 'Browse for a file or folder', 'Clear Log': 'Clear this log panel',
+             'Remove': 'Remove the selected item(s) from the list', 'Clear': 'Clear the list',
+             'Load': 'Read the selected Excel file', 'Add': 'Add file(s) to the list', 'Add...': 'Add file(s) to the list'}
+    try:
+        for w in walk(root):
+            if isinstance(w, ttk.Button):
+                w.configure(cursor='hand2')
+                hint = hints.get(str(w.cget('text')).strip())
+                if hint:
+                    _Tooltip(w, lambda h=hint: h)
+    except Exception as e:
+        print(f"UI polish (tooltips) skipped: {e}")
 
 
 # ==================== ANA UYGULAMA SINIFI ====================
@@ -732,6 +1014,10 @@ class IntegratedBDFRFTool:
             _polish_ui(self)
         except Exception as _e:
             print(f"UI polish skipped: {_e}")
+        try:
+            _polish_ui_pro(self)
+        except Exception as _e:
+            print(f"UI polish (pro) skipped: {_e}")
 
 
     # setup_tab1: "BDF Merge Preparation" sekmesinin tüm arayüzünü (Thermal

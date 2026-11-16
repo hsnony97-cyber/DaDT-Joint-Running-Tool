@@ -8564,12 +8564,14 @@ class WebFlawRunTab:
     @staticmethod
     def _read_master_sheet(master_path, norm_name):
         """Master Excel'den normalize adı norm_name olan sayfayı DataFrame olarak oku."""
-        xl = pd.ExcelFile(master_path)
-        for sheet in xl.sheet_names:
-            if _wf_norm(sheet) == norm_name:
-                return pd.read_excel(xl, sheet_name=sheet)
-        raise ValueError(f"No '{norm_name}' sheet found in {os.path.basename(master_path)} "
-                         f"(sheets: {xl.sheet_names})")
+        # 'with': dosya bağlantısı okuma biter bitmez kapanır. Kapanmazsa (çöp toplayıcıya kalırsa) çalışma
+        # Excel'i, hemen ardından yapılan kaydetme / Excel yeniden hesaplaması sırasında kilitli kalabilir.
+        with pd.ExcelFile(master_path) as xl:
+            for sheet in xl.sheet_names:
+                if _wf_norm(sheet) == norm_name:
+                    return pd.read_excel(xl, sheet_name=sheet)
+            names = list(xl.sheet_names)
+        raise ValueError(f"No '{norm_name}' sheet found in {os.path.basename(master_path)} (sheets: {names})")
 
     @staticmethod
     def _find_file(folder, name_lower):
@@ -8936,6 +8938,14 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
         super().start_run()
 
     # ==================== WEB PROPERTY / WEB FLAW EXCEL YARDIMCILARI ====================
+    # _save_working_excel: Iterative'in kaydetme yardımcısını sarar - kaydetmeden ve Excel (COM) ile yeniden
+    # hesaplatmadan ÖNCE çöp toplayıcıyı çalıştırıp, başka okuyucuların (pandas vb.) açık bırakmış olabileceği
+    # dosya bağlantılarını kapatır; Excel'in dosyayı kaydederken kilitle karşılaşıp sonsuza dek beklemesini önler.
+    def _save_working_excel(self, wb, path):
+        import gc
+        gc.collect()
+        super()._save_working_excel(wb, path)
+
     # _read_web_property: 'Web Property' sayfasından {Web Property ID: Thickness}.
     def _read_web_property(self, excel_path):
         df = WebFlawRunTab._read_master_sheet(excel_path, 'webproperty')
@@ -9957,15 +9967,15 @@ class VisualizationResultsTab:
         if path.lower().endswith('.csv'):
             raw = pd.read_csv(path)
         else:
-            xl = pd.ExcelFile(path)
-            raw = None
-            for sheet in xl.sheet_names:
-                cand = xl.parse(sheet)
-                if any(V._normalize_web_id(c) == 'Web Property ID' for c in cand.columns):
-                    raw = cand
-                    break
-            if raw is None:
-                raw = xl.parse(xl.sheet_names[0])
+            with pd.ExcelFile(path) as xl:
+                raw = None
+                for sheet in xl.sheet_names:
+                    cand = xl.parse(sheet)
+                    if any(V._normalize_web_id(c) == 'Web Property ID' for c in cand.columns):
+                        raw = cand
+                        break
+                if raw is None:
+                    raw = xl.parse(xl.sheet_names[0])
         df = raw.rename(columns=lambda c: ' '.join(str(c).strip().replace('\n', ' ').split()))
         rename, used = {}, set()
         for c in df.columns:

@@ -9022,7 +9022,6 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
         norm = {_wf_norm(c): c for c in df.columns}
         pid_col = norm.get('webpropertyid', df.columns[0])
         t_col = norm.get('thickness', df.columns[1] if len(df.columns) > 1 else None)
-        self._web_cols = (pid_col, t_col)                   # tanı logu için: hangi sütunlar okundu
         out = {}
         for _, r in df.iterrows():
             try:
@@ -9082,39 +9081,7 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
             t3.skin_properties[pid] = {'thickness': t}
         t3._refresh_effective_skin_thicknesses()           # offset hesabı da güncel kalınlığı görsün
         self.log(f"  Web Property thicknesses handed to the Nastran Solver like Skin Property "
-                  f"({len(injected)}/{len(web_thk)} propert(ies)); sheet columns read: "
-                  f"{getattr(self, '_web_cols', ('?', '?'))}")
-        # ---- Tanı: BDF'teki ORİJİNAL PSHELL T ile uygulanan T karşılaştırması ----
-        # Kalınlık orijinalden çok farklıysa (birim/sütun hatası, aşırı ince web) Nastran'da
-        # 'excessive pivot ratio' (SEKRRS) gibi hatalar çıkar; bunu çalışırken görünür kılar.
-        try:
-            key = tuple(self.bdf_paths) + tuple(self.maneuver_bdfs)
-            if getattr(self, '_web_orig_key', None) != key:
-                orig_t = {}
-                for bp in dict.fromkeys(key):
-                    orig_t.update(_wf_extract_pshell_t(bp))
-                self._web_orig_t, self._web_orig_key = orig_t, key
-            orig_t = self._web_orig_t
-            missing = sorted(pid for pid in injected if pid not in orig_t)
-            if missing:
-                self.log(f"  WARNING: Web Property ID(s) {missing[:15]} have no PSHELL card (with a T value) in the BDF "
-                          f"files themselves (INCLUDE'd files are not scanned) - the Nastran Solver may leave them unchanged.")
-            rows = []
-            for pid, t in injected.items():
-                o = orig_t.get(pid)
-                if o and o > 0:
-                    rows.append((max(t / o, o / t), pid, o, t))
-            rows.sort(reverse=True)
-            for ratio, pid, o, t in rows[:8]:
-                flag = "   <-- BIG CHANGE" if ratio > 5 else ""
-                self.log(f"    Web PID {pid}: BDF T={o:g} -> applied T={t:g} (x{t / o:.3g}){flag}")
-            big = [r for r in rows if r[0] > 5]
-            if big:
-                self.log(f"  WARNING: {len(big)} Web Property thickness(es) differ from the BDF's PSHELL T by more than 5x "
-                          f"- check the units / the 'Thickness' column of the 'Web Property' sheet "
-                          f"(a much thinner web can make Nastran stop with 'excessive pivot ratios').")
-        except Exception as e:
-            self.log(f"  (web thickness diagnostic skipped: {e})")
+                  f"({len(injected)}/{len(web_thk)} propert(ies))")
         return injected
 
     # _read_solved_web_thickness: çözülmüş '..._stru.bdf' dosyalarından web PID'lerinin PSHELL T değeri.

@@ -1423,6 +1423,7 @@ def _fix_layout(app):
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         item = canvas.create_window(0, 0, window=main, anchor='nw')
         main.lift(canvas)                                       # kardeş pencere tuvalin ÜSTÜNDE görünsün
+        main._scroll_canvas = canvas                            # tekerlek yöneticisi: içerik tuvalin çocuğu değil kardeşi
 
         def relayout(_e=None):
             try:
@@ -1436,16 +1437,6 @@ def _fix_layout(app):
         main.bind('<Configure>', relayout, add='+')
         canvas.bind('<Configure>', lambda e: canvas.after_idle(lambda: (vcmd(*canvas.yview()), hcmd(*canvas.xview()))), add='+')
 
-        def wheel(e):
-            if e.num == 4 or getattr(e, 'delta', 0) > 0:
-                canvas.yview_scroll(-3, 'units')
-            else:
-                canvas.yview_scroll(3, 'units')
-        for ev in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
-            tab.bind(ev, wheel, add='+')
-            for c in walk(main):
-                if not isinstance(c, (tk.Text, tk.Listbox)):          # metin/liste kutuları kendi kaydırmasını kullanır
-                    c.bind(ev, wheel, add='+')
         relayout()
     try:
         for tab in (getattr(app, n, None) for n in ('tab1', 'tab8')):
@@ -1454,6 +1445,73 @@ def _fix_layout(app):
         root.update_idletasks()
     except Exception as e:
         print(f"UI layout (scrollable tabs) skipped: {e}")
+
+    # ---- 4) Fare tekerleği: imlecin altındaki widget'tan yukarı doğru en yakın kaydırılabilir alanı kaydırır ----
+    # Log/liste/tablo kutuları kendi içeriğini (Tk'nin kendi bağlamasıyla) kaydırır; içerikleri bitince (ya da
+    # kaydırılacak bir şey yoksa) tekerlek sayfayı kaydırmaya devredilir. Shift+tekerlek yatay kaydırır.
+    own_scroll = (tk.Text, tk.Listbox, ttk.Treeview)
+
+    def page_canvas(w):
+        p = w
+        while p is not None:
+            if isinstance(p, tk.Canvas) and str(p.cget('yscrollcommand')):
+                return p
+            sc = getattr(p, '_scroll_canvas', None)
+            if sc is not None:
+                return sc
+            p = getattr(p, 'master', None)
+        return None
+
+    def on_wheel(e):
+        try:
+            w = root.winfo_containing(e.x_root, e.y_root)
+        except (tk.TclError, KeyError):
+            return
+        if w is None:
+            return
+        if getattr(e, 'num', None) == 4:
+            delta = 120
+        elif getattr(e, 'num', None) == 5:
+            delta = -120
+        else:
+            delta = getattr(e, 'delta', 0)
+            if abs(delta) < 120:                                  # macOS: küçük değerler
+                delta = 120 if delta > 0 else -120 if delta < 0 else 0
+        if not delta:
+            return
+        up = delta > 0
+        horizontal = bool(e.state & 0x0001)                       # Shift basılı
+        steps = max(1, abs(delta) // 120)
+        if isinstance(w, own_scroll) and not horizontal:
+            try:
+                lo, hi = w.yview()
+                if (hi - lo) < 1.0 and not ((up and lo <= 0.0) or (not up and hi >= 1.0)):
+                    return                                        # kendi içeriğini kaydırıyor (Tk'nin bağlaması)
+            except tk.TclError:
+                pass
+        canvas = page_canvas(w)
+        if canvas is None:
+            return
+        try:
+            bbox = canvas.bbox('all')
+            if not bbox:
+                return
+            if horizontal:
+                lo, hi = canvas.xview()
+                total = max(bbox[2] - bbox[0], 1)
+                new = lo + (-steps * 90 if up else steps * 90) / total
+                canvas.xview_moveto(max(0.0, min(1.0 - (hi - lo), new)))
+            else:
+                lo, hi = canvas.yview()
+                if hi - lo >= 1.0:
+                    return
+                total = max(bbox[3] - bbox[1], 1)
+                new = lo + (-steps * 80 if up else steps * 80) / total
+                canvas.yview_moveto(max(0.0, min(1.0 - (hi - lo), new)))
+        except tk.TclError:
+            pass
+    for ev in ('<MouseWheel>', '<Button-4>', '<Button-5>'):
+        root.bind_all(ev, on_wheel, add='+')
 
 
 # ============================================================================

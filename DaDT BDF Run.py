@@ -6218,6 +6218,20 @@ class BarPropertySolverTab:
 
             # Komut satırını logla: sorun olursa aynısını cmd'de elle çalıştırıp farkı görebilirsin.
             self.log(f"    {label}Nastran command: " + " ".join(f'"{c}"' if ' ' in c else c for c in cmd) + f"   (cwd: {cwd_dir})")
+            # Aynı komutu çalıştırıp SONUNDA BEKLEYEN (pause) bir .bat yaz: Nastran penceresi anında kapanıyorsa, bu dosyaya çift
+            # tıklayınca Nastran'ın konsola yazdığı hata okunabilir. TEMP/TMP, aracın kullandığı Scratch Folder'a ayarlanır.
+            debug_bat = None
+            try:
+                bat_lines = ["@echo off", f'cd /d "{folder}"']
+                if scratch_base:
+                    bat_lines += [f'set "TEMP={scratch_base}"', f'set "TMP={scratch_base}"']
+                bat_lines.append(" ".join([f'"{cmd[0]}"', f'"{cmd[1]}"', f'out="{folder}"'] + cmd[3:]))
+                bat_lines += ["echo.", "echo Exit code: %ERRORLEVEL%", "pause"]
+                debug_bat = os.path.join(folder, "_run_nastran_debug.bat")
+                with open(debug_bat, 'w', encoding='latin-1', errors='replace') as bf:
+                    bf.write("\r\n".join(bat_lines) + "\r\n")
+            except Exception:
+                debug_bat = None
             result = subprocess.run(cmd, cwd=cwd_dir, env=env, capture_output=True, text=True)
             if result.returncode != 0:
                 self.log(f"    {label}WARNING: Nastran exited with code {result.returncode}")
@@ -6243,7 +6257,8 @@ class BarPropertySolverTab:
                         self.log(f"    {label}Nastran console output: {result.stdout.strip()[-800:]}")
                     self.log(f"    {label}Likely causes: license not available (too many parallel runs - try Max Parallel Runs = 1), "
                               f"unusable path (too long / special characters in the BDF or out= folder), unreadable/unwritable folder, "
-                              f"or a bad Nastran command option. Run the command above by hand in cmd to compare.")
+                              f"or a bad Nastran command option. Run the command above by hand in cmd to compare."
+                              + (f" Double-click this file to see Nastran's own console message: {debug_bat}" if debug_bat else ""))
                     return False
 
             if made_temp_scratch:

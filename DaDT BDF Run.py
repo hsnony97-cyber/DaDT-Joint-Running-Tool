@@ -9908,6 +9908,35 @@ def _wf_extract_pshell_t(bdf_path):
     return result
 
 
+# _wf_result_files: Web Flaw exe'sinin '*_Prop_Results.xlsx' sonucunu yazabildiği yerlerdeki dosyalar -> {yol: değişiklik zamanı}.
+# Güncel exe sonuçları koşu klasörünün içindeki 'Output' alt klasörüne yazar (ör. Web_Flaw_Run\Output\
+# Web_Flaw_Results_Prop_Results.xlsx); eski sürümler klasörün kendisine yazıyordu - ikisine de bakılır.
+# 'Output' içinde hiçbir şey SİLİNMEZ/oluşturulmaz; eski ve yeni sonuç, koşudan önce/sonra alınan bu
+# görüntülerin karşılaştırılmasıyla ayırt edilir (yol yeni ya da değişiklik zamanı arttı = yeni sonuç).
+def _wf_result_files(out_dir):
+    dirs = [out_dir]
+    try:
+        for name in os.listdir(out_dir):
+            full = os.path.join(out_dir, name)
+            if name.lower() == 'output' and os.path.isdir(full):
+                dirs.append(full)
+    except OSError:
+        pass
+    found = {}
+    for d in dirs:
+        try:
+            for fn in os.listdir(d):
+                if fn.lower().endswith('_prop_results.xlsx'):
+                    fp = os.path.join(d, fn)
+                    try:
+                        found[fp] = os.path.getmtime(fp)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return found
+
+
 # _wf_update_pshell_file: src BDF'ini dst'ye yazar; PID'i t_by_pid içinde olan
 # PSHELL kartlarının kalınlığını (T) değiştirir, geri kalan her satır aynen kalır
 # (satır sonları dahil). Dönüş: (güncellenen kart sayısı, bulunan PID kümesi).
@@ -10460,9 +10489,10 @@ class WebFlawRunTab:
 
         # ---- 5. Web Flaw exe'sini klasörde çalıştır, bitmesini bekle, sonucu oku ----
         self.log("\n--- Web Flaw exe ---")
-        for fn in os.listdir(out_dir):                        # eski sonuç dosyası yeni sanılmasın
+        for fn in os.listdir(out_dir):                        # eski sonuç dosyası yeni sanılmasın (eski konum: klasörün kendisi)
             if fn.lower().endswith('_prop_results.xlsx'):
                 os.remove(os.path.join(out_dir, fn))
+        results_before = _wf_result_files(out_dir)             # 'Output' içindekilere dokunulmaz; koşu sonrası karşılaştırılır
         wf_exe = self.wf_exe_path.get().strip()
         local_exe = os.path.join(out_dir, os.path.basename(wf_exe))
         shutil.copy2(wf_exe, local_exe)
@@ -10474,10 +10504,12 @@ class WebFlawRunTab:
         if result.returncode != 0:
             self.log(f"  WARNING: non-zero exit code - see {wf_log}")
 
-        candidates = [os.path.join(out_dir, fn) for fn in os.listdir(out_dir)
-                      if fn.lower().endswith('_prop_results.xlsx')]
+        results_after = _wf_result_files(out_dir)
+        candidates = [fp for fp, mt in results_after.items()
+                      if fp not in results_before or mt > results_before[fp] + 1e-6]
         if not candidates:
-            raise RuntimeError(f"No '*_Prop_Results.xlsx' appeared in {out_dir} - see {wf_log}")
+            raise RuntimeError(f"No new '*_Prop_Results.xlsx' appeared in {out_dir} (searched the folder and its "
+                               f"'Output' subfolder) - see {wf_log}")
         res_path = max(candidates, key=os.path.getmtime)
         raw = pd.read_excel(res_path)
         canon = {'element': 'Element', 'property': 'Property', 'material': 'Material',

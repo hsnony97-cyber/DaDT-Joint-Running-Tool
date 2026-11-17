@@ -6134,6 +6134,39 @@ class BarPropertySolverTab:
             return None
 
     # ==================== NASTRAN EXECUTION ====================
+    # _log_nastran_failure: bir Nastran run'ı başarısız olunca (FATAL ya da hiç çıktı yok) neden-sonuç için gereken her şeyi
+    # log'a yazar: .f06'daki FATAL mesajları, .log / .f04 dosyalarının sonu. Dosya yoksa söyler.
+    def _log_nastran_failure(self, folder, base, extra_dirs=(), label=""):
+        dirs = [folder] + [d for d in extra_dirs if d and d != folder]
+        for ext, what in (('.f06', 'FATAL'), ('.log', None), ('.f04', None)):
+            path = next((os.path.join(d, base + ext) for d in dirs if os.path.exists(os.path.join(d, base + ext))), None)
+            if path is None:
+                self.log(f"    {label}  {base}{ext}: does not exist")
+                continue
+            try:
+                if what:                                    # .f06: ilk birkaç 'FATAL MESSAGE' + sonraki satırlar
+                    found = []
+                    with open(path, 'r', errors='ignore') as f:
+                        prev = []
+                        for line in f:
+                            if 'FATAL' in line.upper() and len(found) < 4:
+                                found.append(line.rstrip())
+                                prev = [3]
+                            elif prev and prev[0] > 0 and found:
+                                found.append(line.rstrip())
+                                prev[0] -= 1
+                    self.log(f"    {label}  {os.path.basename(path)} ({os.path.getsize(path)} bytes) FATAL lines:")
+                    for ln in (found or ['(no FATAL line found)'])[:16]:
+                        self.log(f"    {label}    {ln.strip()[:200]}")
+                else:                                       # .log / .f04: son satırlar
+                    with open(path, 'r', errors='ignore') as f:
+                        tail = f.read()[-1500:]
+                    self.log(f"    {label}  {os.path.basename(path)} ({os.path.getsize(path)} bytes), last lines:")
+                    for ln in [l for l in tail.splitlines() if l.strip()][-8:]:
+                        self.log(f"    {label}    {ln.strip()[:200]}")
+            except OSError as e:
+                self.log(f"    {label}  could not read {path}: {e}")
+
     def _run_nastran(self, bdf_path, folder, label=""):
         nastran = self.nastran_path.get()
         if not nastran or not os.path.exists(nastran):
@@ -6183,11 +6216,35 @@ class BarPropertySolverTab:
             if mem:
                 cmd.append(f"mem={mem}")
 
+            # Komut satırını logla: sorun olursa aynısını cmd'de elle çalıştırıp farkı görebilirsin.
+            self.log(f"    {label}Nastran command: " + " ".join(f'"{c}"' if ' ' in c else c for c in cmd) + f"   (cwd: {cwd_dir})")
             result = subprocess.run(cmd, cwd=cwd_dir, env=env, capture_output=True, text=True)
             if result.returncode != 0:
                 self.log(f"    {label}WARNING: Nastran exited with code {result.returncode}")
                 if result.stderr:
                     self.log(f"    {label}stderr: {result.stderr.strip()[:500]}")
+                if result.stdout and result.stdout.strip():
+                    self.log(f"    {label}stdout: {result.stdout.strip()[-500:]}")
+
+            # Nastran hiçbir çıktı dosyası (.f06/.f04/.log/.op2) üretmeden çıktıysa beklemenin anlamı yok (eskiden .f06'yı
+            # bir saate kadar bekliyordu). nastranw gibi bir başlatıcı asıl işi ayrı bir süreçte sürdürebileceği için önce
+            # kısa bir süre (180 sn) çıktı dosyasının belirmesine izin ver; yine yoksa ayrıntıyla başarısız say.
+            _base = os.path.splitext(os.path.basename(bdf_path))[0]
+            _dirs = [folder] + ([run_scratch_dir] if run_scratch_dir else [])
+            _has_out = lambda: any(os.path.exists(os.path.join(d, _base + e)) for d in _dirs for e in ('.f06', '.f04', '.log', '.op2'))
+            if not _has_out():
+                t_g = time.time()
+                while time.time() - t_g < getattr(self, '_nastran_start_grace', 180) and not _has_out():
+                    time.sleep(3)
+                if not _has_out():
+                    self.log(f"    {label}WARNING: Nastran ended (exit code {result.returncode}) after {time.time() - t_run_start:.1f}s and wrote NO "
+                              f".f06/.f04/.log/.op2 for {_base} - it stopped before reading the input.")
+                    if result.stdout and result.stdout.strip():
+                        self.log(f"    {label}Nastran console output: {result.stdout.strip()[-800:]}")
+                    self.log(f"    {label}Likely causes: license not available (too many parallel runs - try Max Parallel Runs = 1), "
+                              f"unusable path (too long / special characters in the BDF or out= folder), unreadable/unwritable folder, "
+                              f"or a bad Nastran command option. Run the command above by hand in cmd to compare.")
+                    return False
 
             if made_temp_scratch:
                 # Nastran gerçekten bu özel scratch klasörünü mü kullandı,
@@ -6297,6 +6354,7 @@ class BarPropertySolverTab:
 
                 if 'FATAL' in tail:
                     self.log(f"    {label}Nastran reported a FATAL error - see {f06_path}")
+                    self._log_nastran_failure(folder, base, op2_search_dirs[1:], label)
                     return False
 
                 if 'END OF JOB' in tail:

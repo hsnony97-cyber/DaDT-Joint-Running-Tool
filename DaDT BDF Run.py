@@ -3990,6 +3990,108 @@ def _read_bdf_without_includes(bdf_obj, bdf_path, **read_kwargs):
 
 
 # ============================================================================
+# LL2 (yük include budama) yardımcıları
+# ----------------------------------------------------------------------------
+# Merged BDF'te yükler, adında SUBCASE'in 'LOAD = <id>' numarasının geçtiği INCLUDE dosyalarıyla gelir
+# (örn. SUBCASE ... LOAD = 41060304  <->  INCLUDE '.../_COMMON_/LOAD/LL1_DADT/LANDING/AF/AF_CASE_41060304.BDF').
+# 'Cases per Split' ile bölünen her run dosyasına tüm yük include'ları girerse Nastran gereksiz dosyaları okur.
+# LL2 seçiliyken her run yalnızca KENDİ subcase'lerinin yük include'larını tutar; diğer subcase'lerinkiler silinir.
+#  - 'Yük include'u' = yolunda LOAD klasörü geçen INCLUDE ('/LOAD/'; \ ve / fark etmez, büyük-küçük harf fark etmez).
+#  - Bir include, dosya ADINDAKİ sayılardan biri bir subcase'in LOAD/TEMPERATURE(LOAD) numarasıysa o subcase'e aittir.
+#  - Hiçbir subcase numarasıyla eşleşmeyen yük include'ları (örn. THRUST_BALANCE.BDF) GÜVENLİ taraf olarak HER run'da kalır.
+#  - Yol 72 karakteri aşınca birden çok satıra bölünür: kart tırnaktan tırnağa komple okunur/silinir (yetim satır kalmaz).
+# ============================================================================
+_LL_RE_LOAD = re.compile(r'^\s*(?:LOAD|DLOAD)\s*=\s*(\d+)', re.I)
+_LL_RE_TEMP = re.compile(r'^\s*TEMP(?:ERATURE)?\s*\(\s*(?:LOAD|BOTH)\s*\)\s*=\s*(\d+)', re.I)
+
+
+def _case_load_ids(case_lines):
+    """Bir SUBCASE bloğunun (ya da başlığın) satırlarındaki LOAD / DLOAD / TEMPERATURE(LOAD|BOTH) numaraları (str(int))."""
+    ids = set()
+    for l in case_lines:
+        m = _LL_RE_LOAD.match(l) or _LL_RE_TEMP.match(l)
+        if m:
+            ids.add(str(int(m.group(1))))
+    return ids
+
+
+def _parse_bulk_includes(lines):
+    """lines içindeki INCLUDE kartlarını bulur (tırnaktan tırnağa, çok satırlı olabilir).
+    Dönüş: [(i0, i1, path)]  - kart lines[i0:i1] satırlarıdır; path tırnak içindeki yol ('' = tırnaksız/okunamadı)."""
+    out, i, n = [], 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if line.lstrip()[:7].upper() == 'INCLUDE':
+            first = line.rstrip('\r\n')
+            quote, qpos = None, -1
+            for q in ("'", '"'):
+                k = first.find(q)
+                if k != -1 and (qpos == -1 or k < qpos):
+                    quote, qpos = q, k
+            j = i
+            joined = first
+            if quote is not None:
+                closed = first.find(quote, qpos + 1) != -1
+                while not closed and j + 1 < n:
+                    j += 1
+                    piece = lines[j].rstrip('\r\n')
+                    joined += piece.strip()
+                    closed = quote in piece
+                m = re.search(re.escape(quote) + r'(.*?)' + re.escape(quote), joined)
+                path = m.group(1).strip() if m else ''
+            else:
+                path = ''
+            out.append((i, j + 1, path))
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
+def _ll2_include_info(bulk_lines):
+    """Bulk satırlarındaki INCLUDE'lar için [(i0, i1, is_load, numara_kümesi, dosya_adı)]."""
+    info = []
+    for i0, i1, path in _parse_bulk_includes(bulk_lines):
+        norm = path.replace('\\', '/').upper()
+        is_load = '/LOAD/' in ('/' + norm.lstrip('/'))            # yolda LOAD klasörü
+        stem = os.path.splitext(os.path.basename(path.replace('\\', '/')))[0]
+        tokens = {str(int(t)) for t in re.findall(r'\d+', stem)}
+        info.append((i0, i1, is_load, tokens, os.path.basename(path.replace('\\', '/'))))
+    return info
+
+
+def _prune_load_includes(bulk_lines, info, split_ids, all_ids):
+    """Bu run'ın subcase numaralarına (split_ids) ait olmayan, ama başka bir subcase'e (all_ids) ait yük include'larını
+    tırnaktan tırnağa siler. Dönüş: (yeni_satırlar, tutulan_yük_include, silinen)."""
+    out, pos, kept, removed = [], 0, 0, 0
+    for i0, i1, is_load, tokens, _name in info:
+        if not is_load:
+            continue
+        if tokens & split_ids:
+            kept += 1
+        elif tokens & all_ids:                    # başka run'ın subcase'ine ait -> sil
+            out.extend(bulk_lines[pos:i0])
+            pos = i1
+            removed += 1
+        else:                                      # hiçbir subcase'e bağlanamıyor -> güvenli taraf: tut
+            kept += 1
+    out.extend(bulk_lines[pos:])
+    return out, kept, removed
+
+
+def _add_ll_row(parent, var):
+    """'Load Library: (o) LL1 ( ) LL2' satırı (Nastran Solver / Full / Iterative sekmeleri)."""
+    row = ttk.Frame(parent)
+    row.pack(fill=tk.X, pady=2)
+    ttk.Label(row, text="Load Library:", width=18).pack(side=tk.LEFT)
+    ttk.Radiobutton(row, text="LL1", variable=var, value="LL1").pack(side=tk.LEFT, padx=(5, 2))
+    ttk.Radiobutton(row, text="LL2", variable=var, value="LL2").pack(side=tk.LEFT, padx=(10, 2))
+    ttk.Label(row, text="(LL1 = every run keeps all load INCLUDEs, as before; LL2 = with Cases per Split, each run keeps only "
+                        "the load INCLUDE files of its own SUBCASEs)",
+              font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=8)
+
+
+# ============================================================================
 # BarPropertySolverTab  --  "Understanding Structure Type" sekmesi (Tab 3)
 # ============================================================================
 # Bu sınıf kullanıcıdan BDF dosyalarını ve Property/Element Excel'lerini alır,
@@ -4024,6 +4126,7 @@ class BarPropertySolverTab:
         self.scratch_folder = tk.StringVar(value="")  # optional; blank = each run's own output folder (still collision-free)
         self.output_folder = tk.StringVar()    # çözüm sonuçlarının yazılacağı klasör
         self.cases_per_split = tk.StringVar(value="")   # optional; blank/0 = solve as a single BDF (no split)
+        self.ll_mode = tk.StringVar(value="LL1")        # LL1 = eskisi gibi; LL2 = bölerken her run yalnızca kendi subcase'lerinin yük include'larını tutar
         self.max_parallel_runs = tk.StringVar(value="1")  # 1 = sequential
 
         # Hiçbir Excel/BDF değeri bulunamazsa kullanılacak varsayılan bar kalınlığı
@@ -4198,6 +4301,8 @@ class BarPropertySolverTab:
         ttk.Label(split_frame, text="(blank/0 = solve as one BDF; e.g. 100 with 500 SUBCASEs -> "
                                      "run1..run5, same header/bulk data, 100 cases each)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        _add_ll_row(f2, self.ll_mode)
 
         parallel_frame = ttk.Frame(f2)
         parallel_frame.pack(fill=tk.X, pady=2)
@@ -5549,7 +5654,14 @@ class BarPropertySolverTab:
         Returns [bdf_path] unchanged if cases_per_split is 0/blank, there are
         no SUBCASEs, or there are already <= cases_per_split of them (nothing
         to split)."""
+        try:
+            ll2 = str(self.ll_mode.get()).strip().upper() == 'LL2'
+        except Exception:
+            ll2 = False
         if not cases_per_split or cases_per_split <= 0:
+            if ll2:
+                self.log(f"    {label}NOTE: Load Library LL2 is selected but 'Cases per Split' is blank/0 - the BDF is not split, "
+                          f"so there is nothing to prune (all load INCLUDEs stay).")
             return [bdf_path]
 
         t_split_start = time.time()
@@ -5564,6 +5676,9 @@ class BarPropertySolverTab:
         # gerçekten cases_per_split'ten FAZLA SUBCASE varsa yapılır.
         subcase_idxs = [i for i, l in enumerate(lines) if l.strip().upper().startswith('SUBCASE')]
         if len(subcase_idxs) <= cases_per_split:
+            if ll2:
+                self.log(f"    {label}NOTE: Load Library LL2: {os.path.basename(bdf_path)} has {len(subcase_idxs)} SUBCASE(s) "
+                          f"(<= Cases per Split {cases_per_split}) - not split, all load INCLUDEs stay.")
             return [bdf_path]
 
         bulk_idx = next((i for i, l in enumerate(lines) if l.strip().upper().startswith('BEGIN BULK')), len(lines))
@@ -5574,6 +5689,15 @@ class BarPropertySolverTab:
         header_lines = lines[:subcase_idxs[0]]
         bulk_lines = lines[bulk_idx:]
         block_bounds = subcase_idxs + [bulk_idx]
+
+        # ---- LL2: her run yalnızca KENDİ subcase'lerinin yük include'larını tutar ----
+        ll2_info, ll2_all_ids, ll2_sc_ids, ll2_global_ids = None, set(), [], set()
+        ll2_kept_total = ll2_removed_total = 0
+        if ll2:
+            ll2_global_ids = _case_load_ids(header_lines)
+            ll2_sc_ids = [_case_load_ids(lines[block_bounds[k]:block_bounds[k + 1]]) for k in range(len(subcase_idxs))]
+            ll2_all_ids = set(ll2_global_ids).union(*ll2_sc_ids) if ll2_sc_ids else set(ll2_global_ids)
+            ll2_info = _ll2_include_info(bulk_lines)
 
         base, ext = os.path.splitext(bdf_path)
         n_subcases = len(subcase_idxs)
@@ -5590,16 +5714,39 @@ class BarPropertySolverTab:
             for sc_i in range(start_sc, end_sc):
                 chunk_lines.extend(lines[block_bounds[sc_i]:block_bounds[sc_i + 1]])
 
+            run_bulk = bulk_lines
+            if ll2_info is not None:
+                split_ids = set(ll2_global_ids)
+                for sc_i in range(start_sc, end_sc):
+                    split_ids |= ll2_sc_ids[sc_i]
+                run_bulk, k_n, r_n = _prune_load_includes(bulk_lines, ll2_info, split_ids, ll2_all_ids)
+                ll2_kept_total += k_n
+                ll2_removed_total += r_n
+
             out_path = f"{base}_run{run_idx + 1}{ext}"
             with open(out_path, 'w', encoding='latin-1') as f:
                 f.writelines(header_lines)
                 f.writelines(chunk_lines)
-                f.writelines(bulk_lines)
+                f.writelines(run_bulk)
             run_paths.append(out_path)
 
         self.log(f"    {label}Split {n_subcases} cases into {n_runs} run file(s) "
-                  f"of up to {cases_per_split} cases each (same header/bulk data in every run) "
+                  f"of up to {cases_per_split} cases each "
+                  f"({'LL2: each run keeps only its own load INCLUDEs' if ll2 else 'same header/bulk data in every run'}) "
                   f"in {time.time() - t_split_start:.1f}s")
+        if ll2_info is not None:
+            n_load = sum(1 for x in ll2_info if x[2])
+            noid = [x[4] for x in ll2_info if x[2] and not (x[3] & ll2_all_ids)]
+            if n_load == 0:
+                self.log(f"    {label}WARNING: LL2 selected but no load INCLUDE (a path with a '/LOAD/' folder) was found in "
+                          f"{os.path.basename(bdf_path)} - nothing was pruned.")
+            else:
+                self.log(f"    {label}LL2: {n_load} load INCLUDE(s) in {os.path.basename(bdf_path)}; "
+                          f"{ll2_removed_total} removed in total ({ll2_removed_total / n_runs:.0f} per run on average), "
+                          f"{ll2_kept_total / n_runs:.0f} kept per run on average")
+                if noid:
+                    self.log(f"    {label}WARNING: LL2: {len(noid)} load INCLUDE(s) match no SUBCASE LOAD/TEMPERATURE(LOAD) id and stay "
+                              f"in EVERY run (e.g. {', '.join(noid[:5])}{' ...' if len(noid) > 5 else ''})")
         return run_paths
 
     # ==================== STRUCTURE-ONLY BDF (NO INCLUDES) ====================
@@ -8084,6 +8231,7 @@ class FullRunTab:
         self.scratch_folder = tk.StringVar()
         self.isu_output_folder = tk.StringVar()
         self.cases_per_split = tk.StringVar()
+        self.ll_mode = tk.StringVar(value="LL1")          # LL1 / LL2 (bkz. _add_ll_row)
         self.isu_max_parallel_runs = tk.StringVar(value="1")
 
         # ---- Section 2: Post Processing ----
@@ -8210,6 +8358,8 @@ class FullRunTab:
         ttk.Entry(split_frame, textvariable=self.cases_per_split, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Label(split_frame, text="(blank/0 = solve as one BDF)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        _add_ll_row(f1, self.ll_mode)
 
         par1_frame = ttk.Frame(f1)
         par1_frame.pack(fill=tk.X, pady=2)
@@ -8573,6 +8723,7 @@ class FullRunTab:
             t3.scratch_folder.set(self.scratch_folder.get())
             t3.output_folder.set(self.isu_output_folder.get())
             t3.cases_per_split.set(self.cases_per_split.get())
+            t3.ll_mode.set(self.ll_mode.get())
             t3.max_parallel_runs.set(self.isu_max_parallel_runs.get())
             self.root.after(0, self._refresh_tab3_listboxes)
 
@@ -8821,6 +8972,7 @@ class IterativeFullRunTab:
         self.scratch_folder = tk.StringVar()
         self.isu_output_folder = tk.StringVar()
         self.cases_per_split = tk.StringVar()
+        self.ll_mode = tk.StringVar(value="LL1")          # LL1 / LL2 (bkz. _add_ll_row)
         self.isu_max_parallel_runs = tk.StringVar(value="1")
 
         # ---- Section 2: Post Processing ----
@@ -8953,6 +9105,8 @@ class IterativeFullRunTab:
         ttk.Entry(split_frame, textvariable=self.cases_per_split, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Label(split_frame, text="(blank/0 = solve as one BDF)",
                  font=('Helvetica', 8, 'italic'), foreground="gray").pack(side=tk.LEFT, padx=5)
+
+        _add_ll_row(f1, self.ll_mode)
 
         par1_frame = ttk.Frame(f1)
         par1_frame.pack(fill=tk.X, pady=2)
@@ -9962,6 +10116,7 @@ class IterativeFullRunTab:
                 t3.scratch_folder.set(self.scratch_folder.get())
                 t3.output_folder.set(output_base)
                 t3.cases_per_split.set(self.cases_per_split.get())
+                t3.ll_mode.set(self.ll_mode.get())
                 t3.max_parallel_runs.set(self.isu_max_parallel_runs.get())
                 self.root.after(0, self._refresh_tab3_listboxes)
 
@@ -11360,6 +11515,7 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
                 t3.scratch_folder.set(self.scratch_folder.get())
                 t3.output_folder.set(output_base)
                 t3.cases_per_split.set(self.cases_per_split.get())
+                t3.ll_mode.set(self.ll_mode.get())
                 t3.max_parallel_runs.set(self.isu_max_parallel_runs.get())
                 self.root.after(0, self._refresh_tab3_listboxes)
 

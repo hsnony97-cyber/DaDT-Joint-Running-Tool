@@ -39,6 +39,10 @@ import traceback
 # başlatıp çalıştırmak için. subprocess.run (bekleyerek) ve subprocess.Popen
 # (beklemeden, arka planda başlatmak için) ikisi de kullanılıyor.
 import subprocess
+
+# _NO_WINDOW: Windows'ta harici programlar (Load Extraction/Joint/RSS/Web Flaw exe'leri, bat'lar, tasklist...) için
+# konsol penceresi AÇILMASIN (çok sayıda paralel süreçte ekranı dolduruyordu). Nastran hariç tutulur. Windows dışında 0.
+_NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 # time: zaman ölçümü (time.time() ile süre hesaplama) ve bekleme (time.sleep()).
 import time
 # concurrent.futures: birden fazla işi (örn. birden fazla Nastran çalıştırması,
@@ -791,6 +795,19 @@ def _pf_scan_bdfs(paths, log):
     return pshell, pbarl
 
 
+# _parse_section_type: Excel'deki 'Section Type' metnini (şekil, strap_mı) ayırır.
+#   'C' / 'I'            -> ('C'|'I', False)        normal bar
+#   'C Strap' / 'I Strap' -> ('C'|'I', True)        kesit şekli korunur, ayrıca Strap
+#   'Strap'              -> ('I', True)             (eski yazım: şekil belirtilmemiş = I gibi)
+# Şekil yalnızca tam olarak 'C' ise C'dir; diğer her şey (I, ROD, BOX, ...) simetrik (I gibi) sayılır - eskisi gibi.
+# Boşluk/tire/alt çizgi ve büyük-küçük harf fark etmez ('c-strap', 'CSTRAP' da çalışır).
+def _parse_section_type(raw):
+    s = re.sub(r'[^A-Z0-9]', '', str(raw or 'I').upper())
+    strap = 'STRAP' in s
+    rest = s.replace('STRAP', '')
+    return ('C' if rest == 'C' else 'I'), strap
+
+
 def _pf_scan_bar_pairs(path):
     """BDF'teki CBAR/CBEAM kartlarının {eid: (GA, GB)} haritası (metin taraması; sabit/serbest/büyük alan;
     INCLUDE'lanan dosyalar taranmaz)."""
@@ -872,17 +889,17 @@ def _pf_duplicate_bar_checks(excel_path, maneuver_bdf, add, log=lambda m: None):
         if len(bars) >= 3:
             add('warn', f"{len(bars)} bars are stacked on the same two nodes {sorted(bars)} - check the stacking order/offsets of this group")
         if len(lb) >= 2:
-            straps = [b for b in lb if sec.get(b) == 'STRAP']
+            straps = [b for b in lb if _parse_section_type(sec.get(b))[1]]
             if not straps:
-                add('err', f"Bars {lb} share BOTH nodes and are all in Bar_Offset - set Section Type = Strap for exactly one of them "
-                           f"(the Strap bar is offset directly like an I section; the other goes under skin + strap)")
+                add('err', f"Bars {lb} share BOTH nodes and are all in Bar_Offset - add 'Strap' to the Section Type of exactly one of them "
+                           f"(Section Type 'C Strap' / 'I Strap': the Strap bar is offset normally by its own section; the other bar goes under skin + strap)")
             elif len(straps) > 1:
                 add('err', f"Bars {straps} share BOTH nodes and are all marked Strap - exactly one of them may be the Strap")
     if n_groups:
         add('info', f"{n_groups} duplicate-bar group(s) (bars sharing both nodes) among the Bar_Offset elements")
-    lonely = sorted(b for b in listed if sec.get(b) == 'STRAP' and b not in with_dup)
+    lonely = sorted(b for b in listed if _parse_section_type(sec.get(b))[1] and b not in with_dup)
     if lonely:
-        add('info', f"Strap bar(s) without a duplicate bar: {lonely[:8]} - they are offset like an I section")
+        add('info', f"Strap bar(s) without a duplicate bar: {lonely[:8]} - they are offset normally by their own section (C or I)")
 
 
 def _pf_sheet_pids(excel, sheet_norm_key):
@@ -4576,6 +4593,9 @@ class BarPropertySolverTab:
                     n = _harvest_section_types(df, positional_fallback=True)
                     self.log(f"  Section types: {n}")
 
+            n_strap = sum(1 for v in self.bar_section_types.values() if _parse_section_type(v)[1])
+            if n_strap:
+                self.log(f"  Strap bars (Section Type contains 'Strap'): {n_strap}")
             self.elem_status.config(
                 text=f"Landing: {len(self.landing_elem_ids)}, Bar offset: {len(self.bar_offset_elem_ids)}, "
                      f"Section types: {len(self.bar_section_types)}",
@@ -4986,7 +5006,9 @@ class BarPropertySolverTab:
                 if bar_nodes[0] in node_to_shells and bar_nodes[1] in node_to_shells:
                     common = set(node_to_shells[bar_nodes[0]]) & set(node_to_shells[bar_nodes[1]])
 
-                    sec_type = self.bar_section_types.get(eid, 'I')
+                    # Section Type: 'C' / 'I' / 'C Strap' / 'I Strap' -> sec_type = kesit şekli (C ya da I), my_strap = Strap mı.
+                    sec_raw = self.bar_section_types.get(eid, 'I')
+                    sec_type, my_strap = _parse_section_type(sec_raw)
 
                     # C-kesit (kanal) ise, eksantriklik yönünü (yhat - CBAR'ın
                     # kendi orientation vektöründen, GA/GB sırasından bağımsız)
@@ -5089,18 +5111,20 @@ class BarPropertySolverTab:
 
                     if best_normal is not None and max_t > 0:
                         # ---- Duplicate (aynı iki düğümü paylaşan) bar(lar) ----
-                        #  * Bu bar 'Strap' ise: I gibi DOĞRUDAN offsetlenir (skin'in hemen altına), eklenen bir şey yok.
-                        #  * Değilse (I/C): skin VE duplicate'in altına gidilir -> duplicate'in dim1'i offsete eklenir.
+                        #  Case 1 duplicate yok            -> eskisi gibi (aşağıdaki blok hiç çalışmaz).
+                        #  Case 3 bu bar 'C Strap'/'I Strap' -> kendi kesitine (C ya da I) göre NORMAL offset, eklenen bir şey yok.
+                        #  Case 2 bu bar I/C (Strap değil)  -> normal offsetin ÜSTÜNE duplicate'in dim1'i eklenir
+                        #                                      (skin VE duplicate'in altına gidilir).
+                        #  Case 4 ikisi de listede (biri I/C, biri Strap) -> her biri kendi kuralıyla: Strap normal, I/C strap'in dim1'ini ekler.
                         #    Duplicate de Bar_Offset'te ama Strap DEĞİLSE hangisinin altta olduğu belirsizdir: eklenmez,
                         #    uyarılır (Check inputs bunu hata olarak bildirir). 3+ bar üst üste ise ayrıca uyarılır.
                         add_dim = 0.0
                         dups = [d for d in pair_to_bars.get(frozenset(bar_nodes), []) if d != eid]
                         if dups:
-                            my_strap = (sec_type == 'STRAP')
                             added, skipped = [], []
                             if not my_strap:
                                 for d in dups:
-                                    d_strap = (self.bar_section_types.get(d, 'I') == 'STRAP')
+                                    d_strap = _parse_section_type(self.bar_section_types.get(d, 'I'))[1]
                                     if d in listed_bars and not d_strap:
                                         skipped.append(f"{d} (also in Bar_Offset but not Strap - which one is lower is undefined)")
                                         continue
@@ -5111,14 +5135,14 @@ class BarPropertySolverTab:
                                     add_dim += d_dim1
                                     added.append(f"{d} (dim1={d_dim1:g})")
                             if my_strap:
-                                note = "this bar is a Strap -> direct offset (no duplicate dim1 added)"
+                                note = f"this bar is a Strap -> normal offset as a {sec_type} section (no duplicate dim1 added)"
                             elif added:
                                 note = f"offset increased by duplicate dim1 = {add_dim:g}: " + ", ".join(added)
                             else:
                                 note = "no duplicate dim1 added"
                             if skipped:
                                 note += " | skipped: " + "; ".join(skipped)
-                            self.log(f"    WARNING: {label}Bar {eid} (Section Type={sec_type}) has duplicate bar(s) "
+                            self.log(f"    WARNING: {label}Bar {eid} (Section Type={sec_raw}) has duplicate bar(s) "
                                       f"{dups} sharing BOTH nodes - {note}")
                             if len(dups) >= 2:
                                 self.log(f"    WARNING: {label}{len(dups) + 1} bars are stacked on the same two nodes "
@@ -6179,7 +6203,8 @@ class PostProcessingTab:
         # Bat dosyasını cmd.exe üzerinden, converter exe'nin KENDİ klasöründen
         # (cwd=exe_dir) çalıştır - tam olarak kullanıcı o klasörde çift
         # tıklamış gibi davranır.
-        result = subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, capture_output=True, text=True)
+        result = subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, capture_output=True, text=True,
+                                creationflags=_NO_WINDOW)
         self.root.after(0, lambda: self.progress_var.set(30))
 
         if result.returncode != 0:
@@ -6487,7 +6512,8 @@ class PostProcessingTab:
             log_path = os.path.join(dest_folder, "loadext_log.txt")
             try:
                 log_file = open(log_path, 'w')
-                subprocess.Popen(["cmd", "/c", bat_path], cwd=exe_dir, stdout=log_file, stderr=subprocess.STDOUT)
+                subprocess.Popen(["cmd", "/c", bat_path], cwd=exe_dir, stdout=log_file, stderr=subprocess.STDOUT,
+                                 creationflags=_NO_WINDOW)
                 self.log(f"    Launched (output -> {log_path})")
                 n_started += 1
             except Exception as e:
@@ -6527,7 +6553,7 @@ class PostProcessingTab:
                 ["wmic", "process", "get", "ProcessId,ParentProcessId", "/format:csv"])
         for cmd in cmds:
             try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=90, creationflags=_NO_WINDOW)
             except Exception:
                 continue
             table, pid_i, ppid_i = {}, None, None
@@ -6672,7 +6698,8 @@ class PostProcessingTab:
                 try:
                     log_file = open(job['log'], 'w')
                     proc = subprocess.Popen(["cmd", "/c", job['bat']], cwd=exe_dir, stdout=log_file,
-                                            stderr=subprocess.STDOUT)
+                                            stderr=subprocess.STDOUT,
+                                            creationflags=_NO_WINDOW)
                 except Exception as e:
                     return {'name': job['name'], 'rc': None, 'seconds': 0.0, 'tree_checked': True,
                             'warnings': [f"could not start: {e}"], 'n_expected': 0, 'n_found': 0, 'failed_start': True}
@@ -7410,7 +7437,8 @@ class JointRunTab:
             try:
                 with open(log_path, 'w') as log_file:
                     result = subprocess.run([local_exe], cwd=dest_folder, stdout=log_file,
-                                             stderr=subprocess.STDOUT)
+                                             stderr=subprocess.STDOUT,
+                                             creationflags=_NO_WINDOW)
                 ok = result.returncode == 0
             except Exception as e:
                 return set_name, False, str(e)
@@ -7481,7 +7509,8 @@ class JointRunTab:
             try:
                 with open(log_path, 'w') as log_file:
                     result = subprocess.run([local_exe], cwd=dest_folder, stdout=log_file,
-                                             stderr=subprocess.STDOUT)
+                                             stderr=subprocess.STDOUT,
+                                             creationflags=_NO_WINDOW)
                 return set_name, result.returncode == 0, None
             except Exception as e:
                 return set_name, False, str(e)
@@ -7706,7 +7735,8 @@ class JointRunTab:
             try:
                 with open(log_path, 'w') as log_file:
                     result = subprocess.run([local_exe], cwd=dest_folder, stdout=log_file,
-                                             stderr=subprocess.STDOUT)
+                                             stderr=subprocess.STDOUT,
+                                             creationflags=_NO_WINDOW)
                 return set_name, result.returncode == 0, None
             except Exception as e:
                 return set_name, False, str(e)
@@ -8278,7 +8308,7 @@ class FullRunTab:
             try:
                 result = subprocess.run(
                     ["tasklist", "/FI", f"IMAGENAME eq {exe_name}"],
-                    capture_output=True, text=True
+                    capture_output=True, text=True, creationflags=_NO_WINDOW
                 )
                 running = exe_name.lower() in result.stdout.lower()
             except Exception as e:
@@ -9603,7 +9633,7 @@ class IterativeFullRunTab:
             try:
                 result = subprocess.run(
                     ["tasklist", "/FI", f"IMAGENAME eq {exe_name}"],
-                    capture_output=True, text=True
+                    capture_output=True, text=True, creationflags=_NO_WINDOW
                 )
                 running = exe_name.lower() in result.stdout.lower()
             except Exception as e:
@@ -10457,7 +10487,7 @@ class WebFlawRunTab:
         while waited < max_wait_seconds:
             try:
                 result = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {exe_name}"],
-                                         capture_output=True, text=True)
+                                         capture_output=True, text=True, creationflags=_NO_WINDOW)
                 if exe_name.lower() not in result.stdout.lower():
                     return
             except Exception:
@@ -10578,7 +10608,8 @@ class WebFlawRunTab:
         self.log(f"  Batch file written: {bat_path}")
         t_le = time.time()
         with open(log_path, 'w') as log_file:
-            subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, stdout=log_file, stderr=subprocess.STDOUT)
+            subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, stdout=log_file, stderr=subprocess.STDOUT,
+                           creationflags=_NO_WINDOW)
         self._wait_for_exe_to_finish(exe_name)
         self.log(f"  Load Extraction finished (took {time.time() - t_le:.1f}s)")
 
@@ -10662,7 +10693,8 @@ class WebFlawRunTab:
         wf_log = os.path.join(out_dir, "web_flaw_log.txt")
         t_wf = time.time()
         with open(wf_log, 'w') as log_file:
-            result = subprocess.run([local_exe], cwd=out_dir, stdout=log_file, stderr=subprocess.STDOUT)
+            result = subprocess.run([local_exe], cwd=out_dir, stdout=log_file, stderr=subprocess.STDOUT,
+                                    creationflags=_NO_WINDOW)
         self.log(f"  Web Flaw exe finished (exit code {result.returncode}, took {time.time() - t_wf:.1f}s)")
         if result.returncode != 0:
             self.log(f"  WARNING: non-zero exit code - see {wf_log}")

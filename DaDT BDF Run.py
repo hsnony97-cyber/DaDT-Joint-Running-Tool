@@ -7336,7 +7336,7 @@ class JointRunTab:
         exe_path = self.license_checker_exe_path.get().strip()
         exe_dir = os.path.dirname(exe_path) or None
         try:
-            subprocess.Popen([exe_path], cwd=exe_dir)
+            subprocess.Popen([exe_path], cwd=exe_dir, creationflags=_NO_WINDOW)
             self.log(f"  License Checker launched: {exe_path}")
             return True
         except Exception as e:

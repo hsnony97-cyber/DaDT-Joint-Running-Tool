@@ -1105,8 +1105,9 @@ def _preflight_collect(app, key, tool, log=lambda m: None, snapshot=None):
                     rest = [p for p in miss if p not in comp_set]
                     if comp:
                         add('info', f"Skin Property: {len(comp)} PID(s) are composite properties "
-                                    f"({'/'.join(sorted({scan['prop_types'][p] for p in comp}))}, e.g. {comp[:5]}) - their ply thicknesses "
-                                    f"are scaled proportionally so the total equals the Excel thickness (PCOMP/PCOMPG only)")
+                                    f"({'/'.join(sorted({scan['prop_types'][p] for p in comp}))}, e.g. {comp[:5]}) - only SINGLE-PLY "
+                                    f"PCOMP/PCOMPG are updated to the Excel thickness; multi-ply ones are NOT changed (the Excel "
+                                    f"thickness is only used by the offset calculation)")
                     if skin and rest:
                         add('warn', f"Skin Property: {len(rest)} of {len(skin)} PID(s) have neither a PSHELL nor a composite card in the "
                                     f"BDF files - {_pf_missing_text(rest, scan, 'PSHELL')}")
@@ -4026,17 +4027,18 @@ def _fmt_real_w(x, w):
     if x == 0:
         return "0.".rjust(w)
     cands = []
-    for p in range(0, 11):
-        cands.append(f"{x:.{p}f}" + ('.' if p == 0 else ''))
+    for p in range(1, 11):
+        cands.append(f"{x:.{p}f}")
     for p in range(0, 9):
         m, e = f"{x:.{p}E}".split('E')
         cands.append(f"{m}E{int(e)}" if p else f"{m}.E{int(e)}")
     cands.sort(key=len)                                   # kısa olan önce (sıralama kararlı)
+    cands.append(f"{x:.0f}.")                             # '4.0' varken '4.' tercih edilmez; sığmazsa son çare
     best, best_err = None, None
     for tol in (1e-7, 1e-5):
         for s in cands:
             if len(s) > w:
-                break
+                continue
             v = _nas_float(s)
             if v is None or v == 0:
                 continue
@@ -4046,6 +4048,20 @@ def _fmt_real_w(x, w):
             if best_err is None or err < best_err:
                 best, best_err = s, err
     return (best if best is not None else f"{x:.{max(w - 7, 1)}E}"[:w]).rjust(w)
+
+
+def _prop_total_thickness(prop):
+    """pyNastran property -> toplam kalınlık: PSHELL T; PCOMP/PCOMPG ply T toplamı (LAM=SYM ise 2x). Bilinmiyorsa None."""
+    try:
+        if prop.type == 'PSHELL':
+            t = prop.t
+        elif prop.type in ('PCOMP', 'PCOMPG'):
+            t = float(sum(prop.thicknesses)) * (2.0 if str(getattr(prop, 'lam', '') or '').upper() == 'SYM' else 1.0)
+        else:
+            return None
+        return float(t) if t is not None and float(t) > 0 else None
+    except Exception:
+        return None
 
 
 def _card_pid(line):
@@ -4076,8 +4092,9 @@ def _composite_card_extent(lines, i):
     return last
 
 
-def _scale_composite_card(card_lines, target_t):
+def _scale_composite_card(card_lines, target_t, single_ply_only=False):
     """PCOMP/PCOMPG kartının (ana + devam satırları) ply kalınlıklarını orantılı ölçekleyip toplamı target_t yapar.
+    single_ply_only=True ise 1'den fazla ply'lı kart DEĞİŞTİRİLMEZ: (None, None, "multi-ply (N plies)") döner.
     Dönüş: (yeni_satırlar, eski_toplam, yeni_toplam) ya da (None, None, sebep_metni)."""
     head = card_lines[0]
     name = head[:8].split(',')[0].strip().upper()
@@ -4144,6 +4161,8 @@ def _scale_composite_card(card_lines, target_t):
     plies, mult = scan(card_lines)
     if plies is None:
         return None, None, mult
+    if single_ply_only and len(plies) > 1:
+        return None, None, f"multi-ply ({len(plies)} plies)"
     old_total = mult * sum(t for _, t, _ in plies)
     if old_total <= 0:
         return None, None, "total ply thickness is zero"
@@ -4711,11 +4730,8 @@ class BarPropertySolverTab:
                         self.original_skin_thicknesses[pid] = t
                 elif prop.type in ('PCOMP', 'PCOMPG'):
                     # Kompozit: toplam laminat kalınlığı (ply T'lerinin toplamı; LAM=SYM'de 2x) offset için yedek değer.
-                    try:
-                        t = float(sum(prop.thicknesses)) * (2.0 if str(getattr(prop, 'lam', '') or '').upper() == 'SYM' else 1.0)
-                    except Exception:
-                        t = None
-                    if t is not None and t > 0:
+                    t = _prop_total_thickness(prop)
+                    if t is not None:
                         self.original_skin_thicknesses[pid] = t
             if self.original_skin_thicknesses:
                 self.log(f"  PSHELL/PCOMP thicknesses extracted: {len(self.original_skin_thicknesses)} properties "
@@ -5056,7 +5072,7 @@ class BarPropertySolverTab:
         bar_updated = 0
         skin_updated = 0
         upd_bar, upd_skin = set(), set()        # GERÇEKTEN güncellenen PID'ler (rapor için)
-        comp_scaled, comp_failed = {}, {}       # PCOMP/PCOMPG: {PID: (eski toplam, yeni toplam)} / {PID: sebep}
+        comp_scaled, comp_failed, comp_multi = {}, {}, {}   # PCOMP/PCOMPG: {PID: (eski, yeni toplam)} / {PID: sebep} / {PID: ply sayısı}
         seen_types, n_include = {}, 0           # BDF'te görülen {PID: property kart adı}, INCLUDE sayısı
         # _write_bdf_for_model'deki PBARL mantığıyla aynı sabit-genişlik
         # alan okuma/yazma yaklaşımı, ama burada TÜM self.bar_properties
@@ -5129,11 +5145,14 @@ class BarPropertySolverTab:
                     last = _composite_card_extent(lines, i)
                     try:
                         card = lines[i:last + 1]
-                        new_card, old_t, new_t = _scale_composite_card(card, self.skin_properties[pid]['thickness'])
+                        new_card, old_t, new_t = _scale_composite_card(card, self.skin_properties[pid]['thickness'], single_ply_only=True)
                     except Exception as e:                       # beklenmedik kart biçimi: kartı AYNEN bırak
                         new_card, old_t, new_t = None, None, f"{type(e).__name__}: {e}"
                     if new_card is None:
-                        comp_failed[pid] = new_t
+                        if isinstance(new_t, str) and new_t.startswith('multi-ply'):
+                            comp_multi[pid] = int(new_t.split('(')[1].split()[0])     # 1'den fazla ply: kart AYNEN kalır
+                        else:
+                            comp_failed[pid] = new_t
                         new_lines.extend(card)
                     else:
                         new_lines.extend(new_card)
@@ -5151,12 +5170,13 @@ class BarPropertySolverTab:
 
         self.log(f"    {os.path.basename(source_path)}: {bar_updated} bar props, "
                   f"{skin_updated} skin props set to Excel base values"
-                  + (f" (incl. {len(comp_scaled)} PCOMP/PCOMPG scaled)" if comp_scaled else ""))
+                  + (f" (incl. {len(comp_scaled)} single-ply PCOMP/PCOMPG)" if comp_scaled else "")
+                  + (f"; {len(comp_multi)} multi-ply PCOMP/PCOMPG left unchanged" if comp_multi else ""))
         reports = getattr(self, '_prop_update_reports', None)
         if reports is not None:                   # _build_base_model toplu rapor için biriktirir
             reports.append({'name': os.path.basename(source_path), 'upd_bar': upd_bar, 'upd_skin': upd_skin,
                             'types': seen_types, 'n_include': n_include,
-                            'comp': comp_scaled, 'comp_failed': comp_failed})
+                            'comp': comp_scaled, 'comp_failed': comp_failed, 'comp_multi': comp_multi})
         return output_bdf
 
     # _log_not_updated_properties: Excel'deki Bar/Skin Property PID'lerinden HİÇBİR BDF'te güncellenemeyenleri
@@ -5177,24 +5197,35 @@ class BarPropertySolverTab:
         miss_bar = sorted(set(self.bar_properties) - upd_bar)
         miss_skin = sorted(set(self.skin_properties) - upd_skin)
 
-        # Kompozit skin (PCOMP/PCOMPG): ply kalınlıkları orantılı ölçeklendi -> özet (+ okunamayan kartlar)
-        comp, comp_failed = {}, {}
+        # Kompozit skin (PCOMP/PCOMPG): YALNIZ 1 ply'lı kartlar güncellenir; 1'den fazla ply'lı kartların property'si
+        # DEĞİŞTİRİLMEZ - Excel kalınlığı sadece offset hesabında kullanılır.
+        comp, comp_failed, comp_multi = {}, {}, {}
         for r in reps:
             comp.update(r.get('comp', {}))
             comp_failed.update(r.get('comp_failed', {}))
-        if comp or comp_failed:
+            comp_multi.update(r.get('comp_multi', {}))
+        if comp or comp_failed or comp_multi:
+            self.log("\n  --- Composite skin (PCOMP/PCOMPG) ---")
             changed = {p: v for p, v in comp.items() if abs(v[1] - v[0]) > 1e-6 * max(abs(v[0]), 1e-12)}
-            self.log(f"\n  --- Composite skin (PCOMP/PCOMPG) ---")
-            self.log(f"  {len(comp)} composite PID(s) matched the Skin Property sheet: ply thicknesses scaled by one common "
-                     f"factor so the TOTAL laminate thickness equals the Excel value ({len(changed)} changed, "
-                     f"{len(comp) - len(changed)} already equal). Ply ratios, angles and materials are unchanged.")
+            self.log(f"  Single-ply: {len(comp)} PID(s) UPDATED - the ply thickness was set to the Excel value "
+                     f"({len(changed)} changed, {len(comp) - len(changed)} already equal).")
             for pid in sorted(changed, key=lambda p: -abs(changed[p][1] - changed[p][0]))[:10]:
                 o, n = changed[pid]
-                self.log(f"    PID {pid}: total {o:.4f} -> {n:.4f}")
+                self.log(f"    PID {pid}: {o:.4f} -> {n:.4f}")
             if len(changed) > 10:
                 self.log(f"    ... and {len(changed) - 10} more (largest changes listed first)")
+            if comp_multi:
+                self.log(f"  Multi-ply: {len(comp_multi)} PID(s) have MORE THAN 1 PLY - their BDF property is NOT updated "
+                         f"(layup unchanged). Only the Excel thickness is used, for the OFFSET calculation:")
+                ordered = sorted(comp_multi)
+                for ln in [", ".join(f"{p}({comp_multi[p]})" for p in ordered[k:k + 8]) for k in range(0, len(ordered), 8)][:40]:
+                    self.log(f"      {ln}")
+                if len(ordered) > 320:
+                    self.log(f"      ... and {len(ordered) - 320} more   (format: PID(number of plies))")
+                else:
+                    self.log("      (format: PID(number of plies))")
             if comp_failed:
-                self.log(f"  WARNING: {len(comp_failed)} composite PID(s) could NOT be scaled (card left as is):")
+                self.log(f"  WARNING: {len(comp_failed)} composite PID(s) could NOT be read (card left as is):")
                 for pid in sorted(comp_failed)[:30]:
                     self.log(f"    PID {pid}: {comp_failed[pid]}")
 
@@ -5207,7 +5238,9 @@ class BarPropertySolverTab:
             for pid in miss:
                 groups.setdefault(types.get(pid), []).append(pid)
             for t in sorted((k for k in groups if k), key=lambda k: -len(groups[k])):
-                self.log(f"    {len(groups[t])} PID(s) are {t} (not a {want}) - {note_other}:")
+                nt = ("multi-ply laminates (or unreadable cards, see above): the BDF property is NOT changed, the Excel "
+                      "thickness is only used by the offset calculation") if t in ('PCOMP', 'PCOMPG') and want == 'PSHELL' else note_other
+                self.log(f"    {len(groups[t])} PID(s) are {t} (not a {want}) - {nt}:")
                 for ln in lines_of(groups[t]):
                     self.log(f"      {ln}")
             if None in groups:
@@ -5395,6 +5428,18 @@ class BarPropertySolverTab:
             rows = []
             default_t_pids, no_t_shells = set(), set()    # kalınlığı bilinmeyen PID'ler (yalnızca log için)
 
+            # Etkin skin kalınlığı: Excel 'Skin Property' (yoksa All BDF'ten okunan PSHELL/PCOMP toplamı); bunlarda da yoksa
+            # bu iterasyonun maneuver BDF'indeki PSHELL T / PCOMP ply toplamı. PCOMP için de çalışır (offset yalnız PSHELL'e bağlı DEĞİL).
+            man_t = {}
+            for _pid, _pr in bdf.properties.items():
+                _t = _prop_total_thickness(_pr)
+                if _t is not None:
+                    man_t[_pid] = _t
+
+            def eff_t(_pid):
+                _t = self.current_skin_thicknesses.get(_pid)
+                return _t if _t is not None else man_t.get(_pid)
+
             for eid in self.landing_elem_ids:
                 if eid not in bdf.elements:
                     continue
@@ -5404,9 +5449,10 @@ class BarPropertySolverTab:
                     continue
 
                 # Bu PID'in etkin skin kalınlığını al (Excel öncelikli, yoksa BDF); yoksa 3.0 varsayılan.
-                if pid not in self.current_skin_thicknesses:
-                    default_t_pids.add(pid)                 # Excel'de yok ve BDF'te PSHELL değil (örn. PCOMP) -> 3.0 varsayılıyor
-                t = self.current_skin_thicknesses.get(pid, 3.0)
+                t = eff_t(pid)
+                if t is None:
+                    default_t_pids.add(pid)                 # Excel'de yok, BDF'te de PSHELL/PCOMP kalınlığı yok -> 3.0 varsayılıyor
+                    t = 3.0
                 t = max(0.1, t)
                 zoffset = -t / 2.0
 
@@ -5469,14 +5515,18 @@ class BarPropertySolverTab:
             # normali yönünün tersine, (shell kalınlığı + bar kalınlığının
             # yarısı) kadar kaydırılır.
             bar_min = self.default_bar_thickness
+            bar_skip = {}                                   # sebep -> [bar eid]  (offset ALAMAYAN bar'ların nedeni, log için)
             for eid in self.bar_offset_elem_ids:
                 if eid not in bdf.elements:
+                    bar_skip.setdefault("not found in the maneuver BDF itself (may be in an INCLUDE'd file)", []).append(eid)
                     continue
                 elem = bdf.elements[eid]
                 if elem.type not in ['CBAR', 'CBEAM']:
+                    bar_skip.setdefault("not a CBAR/CBEAM element", []).append(eid)
                     continue
                 pid = elem.pid if hasattr(elem, 'pid') else None
                 if pid is None:
+                    bar_skip.setdefault("has no property id", []).append(eid)
                     continue
 
                 # Bu iterasyonda uygulanan override varsa onu, yoksa Excel
@@ -5487,8 +5537,12 @@ class BarPropertySolverTab:
                 # Bar'ın iki ucunun (node_ids[:2]) ortak oturduğu shell
                 # eleman(lar)ını bul (iki düğümün de ait olduğu shell kümelerinin kesişimi).
                 bar_nodes = elem.node_ids[:2]
-                if bar_nodes[0] in node_to_shells and bar_nodes[1] in node_to_shells:
+                if not (bar_nodes[0] in node_to_shells and bar_nodes[1] in node_to_shells):
+                    bar_skip.setdefault("an end node is not part of any CQUAD4/CTRIA3", []).append(eid)
+                else:
                     common = set(node_to_shells[bar_nodes[0]]) & set(node_to_shells[bar_nodes[1]])
+                    if not common:
+                        bar_skip.setdefault("its two end nodes do not share a common CQUAD4/CTRIA3", []).append(eid)
 
                     # Section Type: 'C' / 'I' / 'C Strap' / 'I Strap' -> sec_type = kesit şekli (C ya da I), my_strap = Strap mı.
                     sec_raw = self.bar_section_types.get(eid, 'I')
@@ -5556,9 +5610,10 @@ class BarPropertySolverTab:
                             shell_pid = shell_elem.pid if hasattr(shell_elem, 'pid') else None
                             if not shell_pid:
                                 continue
-                            if shell_pid not in self.current_skin_thicknesses:
+                            shell_t = eff_t(shell_pid)
+                            if shell_t is None:
                                 no_t_shells.add(shell_pid)
-                            shell_t = self.current_skin_thicknesses.get(shell_pid, 0)
+                                shell_t = 0
                             if shell_t <= 0:
                                 continue
                             try:
@@ -5590,9 +5645,10 @@ class BarPropertySolverTab:
                                 shell_elem = bdf.elements[shell_eid]
                                 shell_pid = shell_elem.pid if hasattr(shell_elem, 'pid') else None
                                 if shell_pid:
-                                    if shell_pid not in self.current_skin_thicknesses:
+                                    shell_t = eff_t(shell_pid)
+                                    if shell_t is None:
                                         no_t_shells.add(shell_pid)
-                                    shell_t = self.current_skin_thicknesses.get(shell_pid, 0)
+                                        shell_t = 0
                                     if shell_t > max_t:
                                         max_t = shell_t
                                         best_normal = landing_normals.get(shell_eid)
@@ -5679,6 +5735,20 @@ class BarPropertySolverTab:
                                      'WA_X': vec[0], 'WA_Y': vec[1], 'WA_Z': vec[2],
                                      'Duplicate Bars': ' '.join(str(d) for d in dups) if dups else '',
                                      'Duplicate Dim1 Added': add_dim if dups else ''})
+                    elif common:
+                        if not any(sh in landing_normals and landing_normals[sh] is not None for sh in common):
+                            why = ("the shell(s) it sits on are not in the Landing sheet (only Landing shells are used as the "
+                                   "skin) or have no valid normal")
+                        else:
+                            why = "the Landing shell(s) it sits on have no known thickness"
+                        bar_skip.setdefault(why, []).append(eid)
+
+            n_bar_total = len(self.bar_offset_elem_ids)
+            n_bar_skipped = sum(len(v) for v in bar_skip.values())
+            self.log(f"    {label}Bar offsets: {n_bar_total - n_bar_skipped} of {n_bar_total} Bar_Offset element(s) got an offset"
+                      + (f", {n_bar_skipped} did NOT:" if n_bar_skipped else ""))
+            for why, ids in sorted(bar_skip.items(), key=lambda kv: -len(kv[1])):
+                self.log(f"    WARNING: {label}{len(ids)} bar(s) skipped - {why}: {ids[:15]}{' ...' if len(ids) > 15 else ''}")
 
             if default_t_pids:
                 self.log(f"    WARNING: {label}{len(default_t_pids)} landing shell PID(s) have no known thickness (not in the Skin "

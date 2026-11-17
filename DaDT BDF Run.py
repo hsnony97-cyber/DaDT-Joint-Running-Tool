@@ -1105,8 +1105,8 @@ def _preflight_collect(app, key, tool, log=lambda m: None, snapshot=None):
                     rest = [p for p in miss if p not in comp_set]
                     if comp:
                         add('info', f"Skin Property: {len(comp)} PID(s) are composite properties "
-                                    f"({'/'.join(sorted({scan['prop_types'][p] for p in comp}))}, e.g. {comp[:5]}) - the BDF layup is "
-                                    f"NOT changed; the Excel thickness is only used by the offset calculation")
+                                    f"({'/'.join(sorted({scan['prop_types'][p] for p in comp}))}, e.g. {comp[:5]}) - their ply thicknesses "
+                                    f"are scaled proportionally so the total equals the Excel thickness (PCOMP/PCOMPG only)")
                     if skin and rest:
                         add('warn', f"Skin Property: {len(rest)} of {len(skin)} PID(s) have neither a PSHELL nor a composite card in the "
                                     f"BDF files - {_pf_missing_text(rest, scan, 'PSHELL')}")
@@ -3990,6 +3990,199 @@ def _read_bdf_without_includes(bdf_obj, bdf_path, **read_kwargs):
 
 
 # ============================================================================
+# Kompozit skin (PCOMP / PCOMPG) kalınlık ölçekleme yardımcıları
+# ----------------------------------------------------------------------------
+# Excel 'Skin Property' sayfasındaki kalınlık, PCOMP/PCOMPG için TOPLAM laminat kalınlığı kabul edilir
+# (offset hesabı da zaten bunu kullanıyor). Karttaki her ply'ın T değeri AYNI oranla çarpılır, böylece
+# ply dizilimi/oranları korunur ve toplam kalınlık Excel değerine eşitlenir (LAM=SYM'de toplam = 2 x yarım dizilim).
+#  - Desteklenen yazımlar: sabit 8'lik alan, büyük alan (PCOMP*, 16'lık alanlar), serbest biçim (virgüllü).
+#  - PCOMP: devam satırı başına 2 ply (MID,T,THETA,SOUT); PCOMPG: satır başına 1 ply (GPLYID,MID,T,THETA,SOUT).
+#  - T boşsa Nastran önceki ply'ın T'sini kullanır: boş bırakılır (önceki ölçeklendiği için o da ölçeklenir).
+#  - Z0 (varsa) aynı oranla ölçeklenir ki laminatın referans düzleme göre konumu oransal olarak korunsun.
+#  - Kart okunamazsa (None, None, sebep) döner ve kart AYNEN bırakılır (sessizce yanlış yazılmaz).
+# ============================================================================
+_NAS_REAL_EXP = re.compile(r'^([+-]?(?:\d+\.?\d*|\.\d+))([+-]\d+)$')
+
+
+def _nas_float(s):
+    """Nastran gerçel sayısını okur: '0.125', '1.-3' (=1e-3), '1.5D2', '.5'. Boş/okunamazsa None."""
+    s = s.strip().upper().replace('D', 'E')
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        m = _NAS_REAL_EXP.match(s)
+        if m:
+            try:
+                return float(m.group(1) + 'E' + m.group(2))
+            except ValueError:
+                return None
+    return None
+
+
+def _fmt_real_w(x, w):
+    """x'i w karakterlik alana, hassasiyeti koruyan EN KISA düz ya da bilimsel gösterimle yazar (sağa yaslı)."""
+    if x == 0:
+        return "0.".rjust(w)
+    cands = []
+    for p in range(0, 11):
+        cands.append(f"{x:.{p}f}" + ('.' if p == 0 else ''))
+    for p in range(0, 9):
+        m, e = f"{x:.{p}E}".split('E')
+        cands.append(f"{m}E{int(e)}" if p else f"{m}.E{int(e)}")
+    cands.sort(key=len)                                   # kısa olan önce (sıralama kararlı)
+    best, best_err = None, None
+    for tol in (1e-7, 1e-5):
+        for s in cands:
+            if len(s) > w:
+                break
+            v = _nas_float(s)
+            if v is None or v == 0:
+                continue
+            err = abs(v - x) / abs(x)
+            if err <= tol:
+                return s.rjust(w)
+            if best_err is None or err < best_err:
+                best, best_err = s, err
+    return (best if best is not None else f"{x:.{max(w - 7, 1)}E}"[:w]).rjust(w)
+
+
+def _card_pid(line):
+    """Kart ana satırından PID (sabit/büyük alan/serbest biçim); okunamazsa None."""
+    try:
+        if ',' in line[:9]:
+            return int(line.split(',')[1])
+        if line[:8].rstrip().endswith('*'):
+            return int(line[8:24])
+        return int(line[8:16])
+    except (ValueError, IndexError):
+        return None
+
+
+def _composite_card_extent(lines, i):
+    """lines[i] bir PCOMP/PCOMPG ana satırıysa kartın son satırının indeksini döner (devam satırları dahil).
+    Kart içindeki '$' yorum satırları devam satırı varsa karta dahil edilir, boş satır kartı bitirir."""
+    last = i
+    j = i + 1
+    while j < len(lines):
+        l = lines[j]
+        s = l.strip()
+        if l[:1] in ('+', '*', ',') or (l[:1] in (' ', '\t') and s and not s.startswith('$')):
+            last = j
+        elif not s.startswith('$'):
+            break
+        j += 1
+    return last
+
+
+def _scale_composite_card(card_lines, target_t):
+    """PCOMP/PCOMPG kartının (ana + devam satırları) ply kalınlıklarını orantılı ölçekleyip toplamı target_t yapar.
+    Dönüş: (yeni_satırlar, eski_toplam, yeni_toplam) ya da (None, None, sebep_metni)."""
+    head = card_lines[0]
+    name = head[:8].split(',')[0].strip().upper()
+    large = name.endswith('*')
+    kind = name.rstrip('*')
+    free = ',' in head[:9]
+    if kind not in ('PCOMP', 'PCOMPG'):
+        return None, None, "not a PCOMP/PCOMPG card"
+    if large and free:
+        return None, None, "large-field free format is not supported"
+    data = [k for k, l in enumerate(card_lines) if l.strip() and not l.lstrip().startswith('$')]
+
+    # Kart alan numarası (0=ad, 1=PID, 2=Z0, ..., 8=LAM, 9.. = ply alanları) -> fiziksel konum
+    slots = {}
+    nlog = (len(data) + 1) // 2 if large else len(data)
+    for J in range(nlog):
+        for c in range(8):
+            f = c + 1 if J == 0 else 9 + 8 * (J - 1) + c
+            if free:
+                slots[f] = ('c', data[J], c + 1)
+            elif large:
+                kk = 2 * J + c // 4
+                if kk >= len(data):
+                    break
+                slots[f] = ('f', data[kk], 8 + 16 * (c % 4), 24 + 16 * (c % 4))
+            else:
+                slots[f] = ('f', data[J], 8 + 8 * c, 16 + 8 * c)
+
+    def get(lines_, f):
+        sl = slots.get(f)
+        if sl is None:
+            return ''
+        if sl[0] == 'f':
+            return lines_[sl[1]][sl[2]:sl[3]]
+        parts = lines_[sl[1]].rstrip('\r\n').split(',')
+        return parts[sl[2]] if sl[2] < len(parts) else ''
+
+    stride, width, toff = (4, 4, 1) if kind == 'PCOMP' else (8, 5, 2)
+
+    def scan(lines_):
+        plies, last_t, f0 = [], None, 9
+        maxf = max(slots)
+        while f0 <= maxf:
+            block = [get(lines_, f0 + o).strip() for o in range(width)]
+            if any(block):
+                ts = block[toff]
+                if ts:
+                    t = _nas_float(ts)
+                    if t is None:
+                        return None, f"cannot read ply thickness '{ts}'"
+                    explicit = True
+                else:
+                    if last_t is None:
+                        return None, "first ply has no thickness"
+                    t, explicit = last_t, False
+                last_t = t
+                plies.append((f0 + toff, t, explicit))
+            f0 += stride
+        if not plies:
+            return None, "no plies found"
+        mult = 2.0 if get(lines_, 8).strip().upper() == 'SYM' else 1.0
+        return plies, mult
+
+    plies, mult = scan(card_lines)
+    if plies is None:
+        return None, None, mult
+    old_total = mult * sum(t for _, t, _ in plies)
+    if old_total <= 0:
+        return None, None, "total ply thickness is zero"
+    factor = target_t / old_total
+    if abs(factor - 1.0) < 1e-6:
+        return list(card_lines), old_total, old_total
+
+    new = list(card_lines)
+
+    def put(f, x):
+        sl = slots[f]
+        k = sl[1]
+        body = new[k].rstrip('\r\n')
+        nl = new[k][len(body):]
+        if sl[0] == 'f':
+            body = body.ljust(sl[3])
+            w = sl[3] - sl[2]
+            txt = _fmt_real_w(x, w).strip()
+            left = body[sl[2]:sl[3]][:1] not in (' ', '')       # eski değer sola yaslıysa sola yaslı yaz (görünüm aynı kalsın)
+            new[k] = body[:sl[2]] + (txt.ljust(w) if left else txt.rjust(w)) + body[sl[3]:] + nl
+        else:
+            parts = body.split(',')
+            parts[sl[2]] = f"{x:.8g}"
+            new[k] = ','.join(parts) + nl
+
+    for f, t, explicit in plies:
+        if explicit:
+            put(f, t * factor)
+    z0 = _nas_float(get(card_lines, 2))
+    if z0 is not None:
+        put(2, z0 * factor)
+
+    plies2, mult2 = scan(new)
+    if plies2 is None:
+        return None, None, f"rewritten card could not be re-read ({mult2})"
+    return new, old_total, mult2 * sum(t for _, t, _ in plies2)
+
+
+# ============================================================================
 # LL2 (yük include budama) yardımcıları
 # ----------------------------------------------------------------------------
 # Merged BDF'te yükler, adında SUBCASE'in 'LOAD = <id>' numarasının geçtiği INCLUDE dosyalarıyla gelir
@@ -4516,8 +4709,17 @@ class BarPropertySolverTab:
                     t = prop.t if hasattr(prop, 't') and prop.t is not None else None
                     if t is not None:
                         self.original_skin_thicknesses[pid] = t
+                elif prop.type in ('PCOMP', 'PCOMPG'):
+                    # Kompozit: toplam laminat kalınlığı (ply T'lerinin toplamı; LAM=SYM'de 2x) offset için yedek değer.
+                    try:
+                        t = float(sum(prop.thicknesses)) * (2.0 if str(getattr(prop, 'lam', '') or '').upper() == 'SYM' else 1.0)
+                    except Exception:
+                        t = None
+                    if t is not None and t > 0:
+                        self.original_skin_thicknesses[pid] = t
             if self.original_skin_thicknesses:
-                self.log(f"  PSHELL thicknesses extracted: {len(self.original_skin_thicknesses)} properties (fallback for offset calc)")
+                self.log(f"  PSHELL/PCOMP thicknesses extracted: {len(self.original_skin_thicknesses)} properties "
+                          f"(fallback for offset calc; PCOMP = total ply thickness)")
             # Excel değerleri varsa onları, yoksa BDF'ten okunan bu
             # orijinal PSHELL kalınlıklarını "etkin" (current_skin_thicknesses)
             # değer olarak birleştir.
@@ -4854,6 +5056,7 @@ class BarPropertySolverTab:
         bar_updated = 0
         skin_updated = 0
         upd_bar, upd_skin = set(), set()        # GERÇEKTEN güncellenen PID'ler (rapor için)
+        comp_scaled, comp_failed = {}, {}       # PCOMP/PCOMPG: {PID: (eski toplam, yeni toplam)} / {PID: sebep}
         seen_types, n_include = {}, 0           # BDF'te görülen {PID: property kart adı}, INCLUDE sayısı
         # _write_bdf_for_model'deki PBARL mantığıyla aynı sabit-genişlik
         # alan okuma/yazma yaklaşımı, ama burada TÜM self.bar_properties
@@ -4918,6 +5121,28 @@ class BarPropertySolverTab:
                 except:
                     pass
 
+            elif line.startswith('PCOMP'):
+                # Kompozit skin: Excel kalınlığı TOPLAM laminat kalınlığıdır; ply T'leri orantılı ölçeklenir.
+                nm = line[:8].split(',')[0].strip().rstrip('*').upper()
+                pid = _card_pid(line) if nm in ('PCOMP', 'PCOMPG') else None
+                if pid is not None and pid in self.skin_properties:
+                    last = _composite_card_extent(lines, i)
+                    try:
+                        card = lines[i:last + 1]
+                        new_card, old_t, new_t = _scale_composite_card(card, self.skin_properties[pid]['thickness'])
+                    except Exception as e:                       # beklenmedik kart biçimi: kartı AYNEN bırak
+                        new_card, old_t, new_t = None, None, f"{type(e).__name__}: {e}"
+                    if new_card is None:
+                        comp_failed[pid] = new_t
+                        new_lines.extend(card)
+                    else:
+                        new_lines.extend(new_card)
+                        skin_updated += 1
+                        upd_skin.add(pid)
+                        comp_scaled[pid] = (old_t, new_t)
+                    i = last + 1
+                    continue
+
             new_lines.append(line)
             i += 1
 
@@ -4925,17 +5150,19 @@ class BarPropertySolverTab:
             f.writelines(new_lines)
 
         self.log(f"    {os.path.basename(source_path)}: {bar_updated} bar props, "
-                  f"{skin_updated} skin props set to Excel base values")
+                  f"{skin_updated} skin props set to Excel base values"
+                  + (f" (incl. {len(comp_scaled)} PCOMP/PCOMPG scaled)" if comp_scaled else ""))
         reports = getattr(self, '_prop_update_reports', None)
         if reports is not None:                   # _build_base_model toplu rapor için biriktirir
             reports.append({'name': os.path.basename(source_path), 'upd_bar': upd_bar, 'upd_skin': upd_skin,
-                            'types': seen_types, 'n_include': n_include})
+                            'types': seen_types, 'n_include': n_include,
+                            'comp': comp_scaled, 'comp_failed': comp_failed})
         return output_bdf
 
     # _log_not_updated_properties: Excel'deki Bar/Skin Property PID'lerinden HİÇBİR BDF'te güncellenemeyenleri
     # (hepsi, kısaltmadan) nedeniyle birlikte log'a yazar. Neden: PID'in BDF'te başka bir property tipi olması
-    # (ör. skin PCOMP/PCOMPG, bar PBAR/PBEAML - bunlar güncellenmez; Excel kalınlığı yalnızca offset hesabında
-    # kullanılır) ya da BDF dosyalarında hiç bulunmaması (INCLUDE'lanan dosyada olabilir / bu modelde yok).
+    # (ör. skin PSOLID, bar PBAR/PBEAML - bunlar güncellenmez; Excel kalınlığı yalnızca offset hesabında
+    # kullanılır; skin PCOMP/PCOMPG ise ply'ları orantılı ölçeklenerek güncellenir) ya da BDF dosyalarında hiç bulunmaması (INCLUDE'lanan dosyada olabilir / bu modelde yok).
     def _log_not_updated_properties(self):
         reps = getattr(self, '_prop_update_reports', None) or []
         if not reps or not (self.bar_properties or self.skin_properties):
@@ -4949,6 +5176,27 @@ class BarPropertySolverTab:
         upd_skin = set().union(*[r['upd_skin'] for r in reps])
         miss_bar = sorted(set(self.bar_properties) - upd_bar)
         miss_skin = sorted(set(self.skin_properties) - upd_skin)
+
+        # Kompozit skin (PCOMP/PCOMPG): ply kalınlıkları orantılı ölçeklendi -> özet (+ okunamayan kartlar)
+        comp, comp_failed = {}, {}
+        for r in reps:
+            comp.update(r.get('comp', {}))
+            comp_failed.update(r.get('comp_failed', {}))
+        if comp or comp_failed:
+            changed = {p: v for p, v in comp.items() if abs(v[1] - v[0]) > 1e-6 * max(abs(v[0]), 1e-12)}
+            self.log(f"\n  --- Composite skin (PCOMP/PCOMPG) ---")
+            self.log(f"  {len(comp)} composite PID(s) matched the Skin Property sheet: ply thicknesses scaled by one common "
+                     f"factor so the TOTAL laminate thickness equals the Excel value ({len(changed)} changed, "
+                     f"{len(comp) - len(changed)} already equal). Ply ratios, angles and materials are unchanged.")
+            for pid in sorted(changed, key=lambda p: -abs(changed[p][1] - changed[p][0]))[:10]:
+                o, n = changed[pid]
+                self.log(f"    PID {pid}: total {o:.4f} -> {n:.4f}")
+            if len(changed) > 10:
+                self.log(f"    ... and {len(changed) - 10} more (largest changes listed first)")
+            if comp_failed:
+                self.log(f"  WARNING: {len(comp_failed)} composite PID(s) could NOT be scaled (card left as is):")
+                for pid in sorted(comp_failed)[:30]:
+                    self.log(f"    PID {pid}: {comp_failed[pid]}")
 
         def lines_of(pids, per=10):
             return [", ".join(str(p) for p in pids[i:i + per]) for i in range(0, len(pids), per)]
@@ -4978,7 +5226,7 @@ class BarPropertySolverTab:
                     "the BDF property is NOT changed, Excel dim1/dim2 is only used by the offset calculation")
         if miss_skin:
             section("Skin Property", miss_skin, len(self.skin_properties), "PSHELL",
-                    "the BDF layup/thickness is NOT changed, the Excel thickness is only used by the offset calculation")
+                    "the BDF property is NOT changed, the Excel thickness is only used by the offset calculation")
 
     def _build_base_model(self, run_folder):
         """Apply the Excel base Bar/Skin properties to every loaded BDF and to
@@ -5434,11 +5682,11 @@ class BarPropertySolverTab:
 
             if default_t_pids:
                 self.log(f"    WARNING: {label}{len(default_t_pids)} landing shell PID(s) have no known thickness (not in the Skin "
-                          f"Property sheet and not a PSHELL in the BDF, e.g. PCOMP) - the default 3.0 is used for their offset: "
+                          f"Property sheet and not a PSHELL/PCOMP in the BDF) - the default 3.0 is used for their offset: "
                           f"{sorted(default_t_pids)[:15]}{' ...' if len(default_t_pids) > 15 else ''}")
             if no_t_shells:
                 self.log(f"    WARNING: {label}{len(no_t_shells)} shell PID(s) next to Bar_Offset bars have no known thickness "
-                          f"(not in the Skin Property sheet and not a PSHELL, e.g. PCOMP) - these shells are skipped as skin "
+                          f"(not in the Skin Property sheet and not a PSHELL/PCOMP) - these shells are skipped as skin "
                           f"candidates for the bar offset: {sorted(no_t_shells)[:15]}{' ...' if len(no_t_shells) > 15 else ''}")
             if not rows:
                 return None

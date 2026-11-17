@@ -6236,14 +6236,21 @@ class BarPropertySolverTab:
             # tıklayınca Nastran'ın konsola yazdığı hata okunabilir. TEMP/TMP, aracın kullandığı Scratch Folder'a ayarlanır.
             debug_bat = None
             try:
-                bat_lines = ["@echo off", f'cd /d "{folder}"']
-                if scratch_base:
-                    bat_lines += [f'set "TEMP={scratch_base}"', f'set "TMP={scratch_base}"']
-                bat_lines.append(" ".join([f'"{cmd[0]}"', f'"{cmd[1]}"', f'out="{folder}"'] + cmd[3:]))
-                bat_lines += ["echo.", "echo Exit code: %ERRORLEVEL%", "pause"]
-                debug_bat = os.path.join(folder, "_run_nastran_debug.bat")
-                with open(debug_bat, 'w', encoding='latin-1', errors='replace') as bf:
-                    bf.write("\r\n".join(bat_lines) + "\r\n")
+                def _bat(exe, name):
+                    lines_ = ["@echo off", f'cd /d "{folder}"']
+                    if scratch_base:
+                        lines_ += [f'set "TEMP={os.path.normpath(scratch_base)}"', f'set "TMP={os.path.normpath(scratch_base)}"']
+                    lines_.append(" ".join([f'"{exe}"', f'"{cmd[1]}"', f'out="{folder}"'] + cmd[3:]))
+                    lines_ += ["echo.", "echo Exit code: %ERRORLEVEL%", "pause"]
+                    path_ = os.path.join(folder, name)
+                    # newline='\r\n': Python '\n'leri Windows'ta zaten '\r\n' yapar; elle '\r\n' yazmak '\r\r\n' (boş satırlar) üretiyordu.
+                    with open(path_, 'w', encoding='latin-1', errors='replace', newline='\r\n') as bf:
+                        bf.write("\n".join(lines_) + "\n")
+                    return path_
+                debug_bat = _bat(cmd[0], "_run_nastran_debug.bat")
+                _con = os.path.join(os.path.dirname(cmd[0]), 'nastran.exe')
+                if os.path.basename(cmd[0]).lower() == 'nastranw.exe' and os.path.exists(_con):
+                    _bat(_con, "_run_nastran_debug_console.bat")      # konsol sürümü: hata mesajını pencerede gösterir
             except Exception:
                 debug_bat = None
             result = subprocess.run(cmd, cwd=cwd_dir, env=env, capture_output=True, text=True)
@@ -6269,11 +6276,26 @@ class BarPropertySolverTab:
                               f".f06/.f04/.log/.op2 for {_base} - it stopped before reading the input.")
                     if result.stdout and result.stdout.strip():
                         self.log(f"    {label}Nastran console output: {result.stdout.strip()[-800:]}")
-                    self.log(f"    {label}Likely causes: license not available (too many parallel runs - try Max Parallel Runs = 1), "
-                              f"unusable path (too long / special characters in the BDF or out= folder), unreadable/unwritable folder, "
-                              f"or a bad Nastran command option. Run the command above by hand in cmd to compare."
-                              + (f" Double-click this file to see Nastran's own console message: {debug_bat}" if debug_bat else ""))
-                    return False
+                    # nastranw.exe (pencereli başlatıcı) hata mesajını pencereye yazıp kapanır, bize hiçbir şey döndürmez. Konsol
+                    # sürümü nastran.exe (aynı klasörde) aynı komutla denenir: hem gerçek çalıştırma olur hem hata mesajı yakalanır.
+                    alt = os.path.join(os.path.dirname(nastran), 'nastran.exe')
+                    if (os.path.basename(nastran).lower() == 'nastranw.exe' and os.path.exists(alt)
+                            and not getattr(self, '_nastran_no_console_retry', False)):
+                        self.log(f"    {label}Retrying with the console version: {alt}")
+                        result = subprocess.run([alt] + cmd[1:], cwd=cwd_dir, env=env, capture_output=True, text=True)
+                        self.log(f"    {label}nastran.exe exited with code {result.returncode}")
+                        for nm_, tx_ in (('stdout', result.stdout), ('stderr', result.stderr)):
+                            if tx_ and tx_.strip():
+                                self.log(f"    {label}nastran.exe {nm_}: {tx_.strip()[-1200:]}")
+                        t_g = time.time()
+                        while time.time() - t_g < getattr(self, '_nastran_start_grace', 180) and not _has_out():
+                            time.sleep(3)
+                    if not _has_out():
+                        self.log(f"    {label}Likely causes: license not available (too many parallel runs - try Max Parallel Runs = 1), "
+                                  f"unusable path (too long / special characters in the BDF or out= folder), unreadable/unwritable folder, "
+                                  f"or a bad Nastran command option. Double-click the _run_nastran_debug*.bat files in {folder} to see "
+                                  f"Nastran's own console message.")
+                        return False
 
             if made_temp_scratch:
                 # Nastran gerçekten bu özel scratch klasörünü mü kullandı,

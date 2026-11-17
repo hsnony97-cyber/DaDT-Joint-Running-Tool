@@ -6098,6 +6098,21 @@ class BarPropertySolverTab:
                 self.log(f"    {label}LL2: {n_load} load INCLUDE(s) in {os.path.basename(bdf_path)}; "
                           f"{ll2_removed_total} removed in total ({ll2_removed_total / n_runs:.0f} per run on average), "
                           f"{ll2_kept_total / n_runs:.0f} kept per run on average")
+                # Rapor dosyası: neyin HER run'dan silindiği / her run'da kaldığı (LL2 sonrası Nastran sorun çıkarırsa buradan bakılır)
+                try:
+                    rp = os.path.join(os.path.dirname(bdf_path), "_ll2_report.txt")
+                    with open(rp, 'w', encoding='utf-8') as rf:
+                        rf.write(f"LL2 report for {os.path.basename(bdf_path)}\n{n_load} load INCLUDE(s); {n_runs} run file(s) of up to {cases_per_split} cases\n\n")
+                        rf.write(f"== {len(orphan)} load INCLUDE(s) with a number in the file name that is NO SUBCASE's LOAD id -> REMOVED from EVERY run ==\n")
+                        rf.write("   (if Nastran fails after LL2, check whether any of these is a common/unit load some LOAD combination needs)\n")
+                        for nm_ in sorted(set(orphan)):
+                            rf.write(f"   {nm_}\n")
+                        rf.write(f"\n== {len(nonum)} load INCLUDE(s) with NO number in the file name -> KEPT in every run ==\n")
+                        for nm_ in sorted(set(nonum)):
+                            rf.write(f"   {nm_}\n")
+                    self.log(f"    {label}LL2 report (what was removed from every run / kept in every run): {rp}")
+                except OSError:
+                    pass
                 if orphan:
                     self.log(f"    {label}WARNING: LL2: {len(orphan)} load INCLUDE(s) have a number in the file name that is no SUBCASE's "
                               f"LOAD id - removed from EVERY run (e.g. {', '.join(orphan[:5])}{' ...' if len(orphan) > 5 else ''})")

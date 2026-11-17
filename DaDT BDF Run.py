@@ -6173,6 +6173,20 @@ class BarPropertySolverTab:
             self.log(f"    {label}WARNING: Nastran exe not found!")
             return False
 
+        # Yollar 'D:/a/b' + '\\c\\d' gibi KARIŞIK eğik çizgilerle gelebiliyor (Output Folder '/' ile yazılıp altına '\\' eklenince);
+        # Nastran başlatıcısına tek tip (Windows'ta '\\') yol ver.
+        nastran, bdf_path, folder = os.path.normpath(nastran), os.path.normpath(bdf_path), os.path.normpath(folder)
+
+        # Paralel run'lar AYNI ANDA başlamasın: Nastran lisans/scratch alırken eşzamanlı 10 başlangıç yarışabilir ve pencere
+        # hiçbir çıktı yazmadan kapanabilir. Başlangıçlar arasında en az _nastran_start_stagger sn bırak.
+        stagger = float(getattr(self, '_nastran_start_stagger', 2.0))
+        lock = self.__dict__.setdefault('_nastran_start_lock', threading.Lock())
+        with lock:
+            wait = stagger - (time.time() - self.__dict__.get('_nastran_last_start', 0.0))
+            if wait > 0:
+                time.sleep(wait)
+            self._nastran_last_start = time.time()
+
         t_run_start = time.time()
 
         # Neither of the two earlier approaches to scratch isolation actually

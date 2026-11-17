@@ -4210,7 +4210,9 @@ def _scale_composite_card(card_lines, target_t, single_ply_only=False):
 # LL2 seçiliyken her run yalnızca KENDİ subcase'lerinin yük include'larını tutar; diğer subcase'lerinkiler silinir.
 #  - 'Yük include'u' = yolunda LOAD klasörü geçen INCLUDE ('/LOAD/'; \ ve / fark etmez, büyük-küçük harf fark etmez).
 #  - Bir include, dosya ADINDAKİ sayılardan biri bir subcase'in LOAD/TEMPERATURE(LOAD) numarasıysa o subcase'e aittir.
-#  - Hiçbir subcase numarasıyla eşleşmeyen yük include'ları (örn. THRUST_BALANCE.BDF) GÜVENLİ taraf olarak HER run'da kalır.
+#  - Dosya adında sayı OLAN yük include'u (örn. VENT_2400026.BDF) yalnızca sayısı o run'ın LOAD numaralarındaysa kalır;
+#    değilse (başka run'ın subcase'i ya da hiçbir subcase'e ait değil) silinir.
+#  - Dosya adında HİÇ sayı olmayan yük include'ları (örn. THRUST_BALANCE.BDF) bağlanamadığı için HER run'da kalır.
 #  - Yol 72 karakteri aşınca birden çok satıra bölünür: kart tırnaktan tırnağa komple okunur/silinir (yetim satır kalmaz).
 # ============================================================================
 _LL_RE_LOAD = re.compile(r'^\s*(?:LOAD|DLOAD)\s*=\s*(\d+)', re.I)
@@ -4273,19 +4275,20 @@ def _ll2_include_info(bulk_lines):
 
 
 def _prune_load_includes(bulk_lines, info, split_ids, all_ids):
-    """Bu run'ın subcase numaralarına (split_ids) ait olmayan, ama başka bir subcase'e (all_ids) ait yük include'larını
-    tırnaktan tırnağa siler. Dönüş: (yeni_satırlar, tutulan_yük_include, silinen)."""
+    """Dosya adında sayı olan ama o sayılardan HİÇBİRİ bu run'ın LOAD numaraları (split_ids) arasında olmayan yük include'larını
+    tırnaktan tırnağa siler (all_ids yalnızca eski imza uyumu için). Sayısız include'lar kalır.
+    Dönüş: (yeni_satırlar, tutulan_yük_include, silinen)."""
     out, pos, kept, removed = [], 0, 0, 0
     for i0, i1, is_load, tokens, _name in info:
         if not is_load:
             continue
         if tokens & split_ids:
             kept += 1
-        elif tokens & all_ids:                    # başka run'ın subcase'ine ait -> sil
+        elif tokens:                               # adında sayı var ama bu run'ın LOAD'larında yok -> sil
             out.extend(bulk_lines[pos:i0])
             pos = i1
             removed += 1
-        else:                                      # hiçbir subcase'e bağlanamıyor -> güvenli taraf: tut
+        else:                                      # adında hiç sayı yok -> bağlanamıyor: güvenli taraf, tut
             kept += 1
     out.extend(bulk_lines[pos:])
     return out, kept, removed
@@ -6040,6 +6043,11 @@ class BarPropertySolverTab:
                 run_bulk, k_n, r_n = _prune_load_includes(bulk_lines, ll2_info, split_ids, ll2_all_ids)
                 ll2_kept_total += k_n
                 ll2_removed_total += r_n
+                def _sc_id(k):
+                    m_ = re.search(r'\d+', lines[subcase_idxs[k]])
+                    return m_.group(0) if m_ else '?'
+                self.log(f"    {label}LL2 run{run_idx + 1}: SUBCASE {_sc_id(start_sc)} .. {_sc_id(end_sc - 1)} "
+                          f"({end_sc - start_sc} cases) -> {k_n} load INCLUDE(s) kept, {r_n} removed")
 
             out_path = f"{base}_run{run_idx + 1}{ext}"
             with open(out_path, 'w', encoding='latin-1') as f:
@@ -6054,7 +6062,8 @@ class BarPropertySolverTab:
                   f"in {time.time() - t_split_start:.1f}s")
         if ll2_info is not None:
             n_load = sum(1 for x in ll2_info if x[2])
-            noid = [x[4] for x in ll2_info if x[2] and not (x[3] & ll2_all_ids)]
+            orphan = [x[4] for x in ll2_info if x[2] and x[3] and not (x[3] & ll2_all_ids)]     # sayısı var, hiçbir subcase'e ait değil
+            nonum = [x[4] for x in ll2_info if x[2] and not x[3]]                                # adında hiç sayı yok
             if n_load == 0:
                 self.log(f"    {label}WARNING: LL2 selected but no load INCLUDE (a path with a '/LOAD/' folder) was found in "
                           f"{os.path.basename(bdf_path)} - nothing was pruned.")
@@ -6062,9 +6071,12 @@ class BarPropertySolverTab:
                 self.log(f"    {label}LL2: {n_load} load INCLUDE(s) in {os.path.basename(bdf_path)}; "
                           f"{ll2_removed_total} removed in total ({ll2_removed_total / n_runs:.0f} per run on average), "
                           f"{ll2_kept_total / n_runs:.0f} kept per run on average")
-                if noid:
-                    self.log(f"    {label}WARNING: LL2: {len(noid)} load INCLUDE(s) match no SUBCASE LOAD/TEMPERATURE(LOAD) id and stay "
-                              f"in EVERY run (e.g. {', '.join(noid[:5])}{' ...' if len(noid) > 5 else ''})")
+                if orphan:
+                    self.log(f"    {label}WARNING: LL2: {len(orphan)} load INCLUDE(s) have a number in the file name that is no SUBCASE's "
+                              f"LOAD id - removed from EVERY run (e.g. {', '.join(orphan[:5])}{' ...' if len(orphan) > 5 else ''})")
+                if nonum:
+                    self.log(f"    {label}NOTE: LL2: {len(nonum)} load INCLUDE(s) have no number in the file name and stay in EVERY run "
+                              f"(e.g. {', '.join(nonum[:5])}{' ...' if len(nonum) > 5 else ''})")
         return run_paths
 
     # ==================== STRUCTURE-ONLY BDF (NO INCLUDES) ====================

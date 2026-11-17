@@ -791,6 +791,100 @@ def _pf_scan_bdfs(paths, log):
     return pshell, pbarl
 
 
+def _pf_scan_bar_pairs(path):
+    """BDF'teki CBAR/CBEAM kartlarının {eid: (GA, GB)} haritası (metin taraması; sabit/serbest/büyük alan;
+    INCLUDE'lanan dosyalar taranmaz)."""
+    pairs = {}
+    with open(path, 'r', encoding='latin-1', newline='') as f:
+        for line in f:
+            h = line[:6].upper()
+            if h.startswith('CBAR') and line[4:5] in ' ,*\t':
+                sep = line[4:5]
+            elif h.startswith('CBEAM') and line[5:6] in ' ,*\t':
+                sep = line[5:6]
+            else:
+                continue
+            try:
+                if sep == ',':
+                    parts = line.rstrip('\r\n').split(',')
+                    eid, ga, gb = int(parts[1]), int(parts[3]), int(parts[4])
+                elif sep == '*':
+                    eid, ga, gb = int(line[8:24]), int(line[40:56]), int(line[56:72])
+                else:
+                    eid, ga, gb = int(line[8:16]), int(line[24:32]), int(line[32:40])
+                pairs[eid] = (ga, gb)
+            except (ValueError, IndexError):
+                continue
+    return pairs
+
+
+def _pf_bar_offset_info(excel):
+    """Excel'den (Bar_Offset eleman ID listesi, {eid: SECTION TYPE}) - load_element_ids ile aynı mantık."""
+    ids, sec = [], {}
+
+    def harvest(df, positional):
+        sec_col = next((c for c in df.columns if 'section' in _wf_norm(c) and 'type' in _wf_norm(c)), None)
+        if sec_col is None and positional and len(df.columns) >= 2:
+            sec_col = df.columns[1]
+        if sec_col is None:
+            return
+        for _, row in df.iterrows():
+            try:
+                eid = int(row[df.columns[0]])
+                st = str(row[sec_col]).strip().upper()
+            except (TypeError, ValueError):
+                continue
+            if st and st != 'NAN':
+                sec[eid] = st
+    with pd.ExcelFile(excel) as xl:
+        for name in xl.sheet_names:
+            sl = _wf_norm(name)
+            if 'bar' in sl and 'offset' in sl:
+                df = pd.read_excel(xl, sheet_name=name)
+                ids = df.iloc[:, 0].dropna().astype(int).tolist()
+                harvest(df, False)
+            elif 'section' in sl and 'type' in sl:
+                harvest(pd.read_excel(xl, sheet_name=name), True)
+    return ids, sec
+
+
+def _pf_duplicate_bar_checks(excel_path, maneuver_bdf, add, log=lambda m: None):
+    """Aynı iki düğümü paylaşan (duplicate) barlar: ikisi de Bar_Offset'teyse biri 'Strap' olmalı."""
+    ids, sec = _pf_bar_offset_info(excel_path)
+    if not ids:
+        return
+    log("scanning bar nodes in the maneuver BDF ...")
+    pairs = _pf_scan_bar_pairs(maneuver_bdf)
+    listed = set(ids)
+    groups = {}
+    for eid, (ga, gb) in pairs.items():
+        if ga != gb:
+            groups.setdefault(frozenset((ga, gb)), []).append(eid)
+    n_groups, with_dup = 0, set()
+    for _key, bars in groups.items():
+        if len(bars) < 2:
+            continue
+        lb = sorted(b for b in bars if b in listed)
+        if not lb:
+            continue                                             # Bar_Offset ile ilgisi olmayan grup
+        n_groups += 1
+        with_dup.update(lb)
+        if len(bars) >= 3:
+            add('warn', f"{len(bars)} bars are stacked on the same two nodes {sorted(bars)} - check the stacking order/offsets of this group")
+        if len(lb) >= 2:
+            straps = [b for b in lb if sec.get(b) == 'STRAP']
+            if not straps:
+                add('err', f"Bars {lb} share BOTH nodes and are all in Bar_Offset - set Section Type = Strap for exactly one of them "
+                           f"(the Strap bar is offset directly like an I section; the other goes under skin + strap)")
+            elif len(straps) > 1:
+                add('err', f"Bars {straps} share BOTH nodes and are all marked Strap - exactly one of them may be the Strap")
+    if n_groups:
+        add('info', f"{n_groups} duplicate-bar group(s) (bars sharing both nodes) among the Bar_Offset elements")
+    lonely = sorted(b for b in listed if sec.get(b) == 'STRAP' and b not in with_dup)
+    if lonely:
+        add('info', f"Strap bar(s) without a duplicate bar: {lonely[:8]} - they are offset like an I section")
+
+
 def _pf_sheet_pids(excel, sheet_norm_key):
     """Excel'de (adı normalleştirilerek bulunan) sayfanın ilk sütunundaki tamsayı PID'ler."""
     out = set()
@@ -955,6 +1049,12 @@ def _preflight_collect(app, key, tool, log=lambda m: None, snapshot=None):
                         add('ok', f"Skin Property: all {len(skin)} PID(s) found as PSHELL")
                 except Exception as e:
                     add('warn', f"Bar/Skin Property check skipped: {e}")
+                man_bdfs = [b for b in bdf_lists.get('maneuver_bdfs', []) if os.path.isfile(b)]
+                if man_bdfs:
+                    try:
+                        _pf_duplicate_bar_checks(excel_path, man_bdfs[0], add, log)
+                    except Exception as e:
+                        add('warn', f"Duplicate bar check skipped: {e}")
                 if key == 'improved_iterative':
                     try:
                         web = tool._read_web_property(excel_path)
@@ -4834,7 +4934,32 @@ class BarPropertySolverTab:
                     for nid in elem.node_ids:
                         node_to_shells.setdefault(nid, []).append(eid)
 
-            # ---- Bar offsetleri: WA = WB = -normal * (landing_t + bar_t/2) ----
+            # ---- Duplicate bar tespiti: AYNI İKİ düğümü (GA/GB, sıradan bağımsız) paylaşan CBAR/CBEAM'ler ----
+            # Üst üste konmuş barlar: biri diğerinin üstüne oturacağı için offsete duplicate'in dim1'i eklenir
+            # (bkz. bar döngüsü). Sözlük anahtarı frozenset({GA, GB}).
+            pair_to_bars = {}
+            for b_eid, b_elem in bdf.elements.items():
+                if b_elem.type in ('CBAR', 'CBEAM'):
+                    try:
+                        n2 = list(b_elem.node_ids[:2])
+                    except Exception:
+                        continue
+                    if len(n2) == 2 and None not in n2 and n2[0] != n2[1]:
+                        pair_to_bars.setdefault(frozenset(n2), []).append(b_eid)
+            listed_bars = set(self.bar_offset_elem_ids)
+
+            def _dup_dim1(d_eid):
+                # Duplicate barın dim1'i: ÇÖZDÜRÜLECEK FEM'deki (bu iterasyonun yazılmış maneuver BDF'indeki) PBARL.
+                try:
+                    prop = bdf.properties.get(bdf.elements[d_eid].pid)
+                    dims = getattr(prop, 'dim', None)
+                    if prop is not None and prop.type == 'PBARL' and dims:
+                        return float(dims[0])
+                except Exception:
+                    pass
+                return None
+
+            # ---- Bar offsetleri: WA = WB = -normal * (landing_t + bar_t/2 [+ duplicate dim1]) ----
             # Bir bar elemanı, iki ucunun oturduğu landing shell'in üstünde
             # duruyor kabul edilir; bu yüzden offset vektörü, o shell'in
             # normali yönünün tersine, (shell kalınlığı + bar kalınlığının
@@ -4963,7 +5088,42 @@ class BarPropertySolverTab:
                                         best_normal = landing_normals.get(shell_eid)
 
                     if best_normal is not None and max_t > 0:
-                        offset_mag = max_t + bar_t / 2.0
+                        # ---- Duplicate (aynı iki düğümü paylaşan) bar(lar) ----
+                        #  * Bu bar 'Strap' ise: I gibi DOĞRUDAN offsetlenir (skin'in hemen altına), eklenen bir şey yok.
+                        #  * Değilse (I/C): skin VE duplicate'in altına gidilir -> duplicate'in dim1'i offsete eklenir.
+                        #    Duplicate de Bar_Offset'te ama Strap DEĞİLSE hangisinin altta olduğu belirsizdir: eklenmez,
+                        #    uyarılır (Check inputs bunu hata olarak bildirir). 3+ bar üst üste ise ayrıca uyarılır.
+                        add_dim = 0.0
+                        dups = [d for d in pair_to_bars.get(frozenset(bar_nodes), []) if d != eid]
+                        if dups:
+                            my_strap = (sec_type == 'STRAP')
+                            added, skipped = [], []
+                            if not my_strap:
+                                for d in dups:
+                                    d_strap = (self.bar_section_types.get(d, 'I') == 'STRAP')
+                                    if d in listed_bars and not d_strap:
+                                        skipped.append(f"{d} (also in Bar_Offset but not Strap - which one is lower is undefined)")
+                                        continue
+                                    d_dim1 = _dup_dim1(d)
+                                    if d_dim1 is None:
+                                        skipped.append(f"{d} (dim1 not found - its property is not a PBARL)")
+                                        continue
+                                    add_dim += d_dim1
+                                    added.append(f"{d} (dim1={d_dim1:g})")
+                            if my_strap:
+                                note = "this bar is a Strap -> direct offset (no duplicate dim1 added)"
+                            elif added:
+                                note = f"offset increased by duplicate dim1 = {add_dim:g}: " + ", ".join(added)
+                            else:
+                                note = "no duplicate dim1 added"
+                            if skipped:
+                                note += " | skipped: " + "; ".join(skipped)
+                            self.log(f"    WARNING: {label}Bar {eid} (Section Type={sec_type}) has duplicate bar(s) "
+                                      f"{dups} sharing BOTH nodes - {note}")
+                            if len(dups) >= 2:
+                                self.log(f"    WARNING: {label}{len(dups) + 1} bars are stacked on the same two nodes "
+                                          f"({eid}, {', '.join(str(d) for d in dups)}) - check the stacking order/offsets of this group.")
+                        offset_mag = max_t + bar_t / 2.0 + add_dim
                         vec = -best_normal * offset_mag
 
                         # ---- C-kesit (kanal) eksantriklik terimi ----
@@ -5004,7 +5164,9 @@ class BarPropertySolverTab:
                                 vec = vec + np.sign(side) * y_panel * (dim2 / 2.0)
 
                         rows.append({'Type': 'Bar', 'Element': eid, 'ZOffset': '',
-                                     'WA_X': vec[0], 'WA_Y': vec[1], 'WA_Z': vec[2]})
+                                     'WA_X': vec[0], 'WA_Y': vec[1], 'WA_Z': vec[2],
+                                     'Duplicate Bars': ' '.join(str(d) for d in dups) if dups else '',
+                                     'Duplicate Dim1 Added': add_dim if dups else ''})
 
             if not rows:
                 return None
@@ -5014,7 +5176,8 @@ class BarPropertySolverTab:
             n_bar = sum(1 for r in rows if r['Type'] == 'Bar')
             csv_path = os.path.join(folder, 'offsets.csv')
             with open(csv_path, 'w', newline='') as f:
-                w = csv.DictWriter(f, fieldnames=['Type', 'Element', 'ZOffset', 'WA_X', 'WA_Y', 'WA_Z'])
+                w = csv.DictWriter(f, fieldnames=['Type', 'Element', 'ZOffset', 'WA_X', 'WA_Y', 'WA_Z',
+                                                  'Duplicate Bars', 'Duplicate Dim1 Added'])
                 w.writeheader()
                 w.writerows(rows)
             self.log(f"    {label}Offset CSV: {n_landing} landing, {n_bar} bar -> {csv_path} "

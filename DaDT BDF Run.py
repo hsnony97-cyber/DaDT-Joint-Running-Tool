@@ -5856,22 +5856,22 @@ class BarPropertySolverTab:
                         eid = int(line[8:16].strip())
                         if eid in landing_offsets:
                             padded = line.rstrip().ljust(72)
-                            new_lines.append(padded[:64] + fmt(landing_offsets[eid]) + '\n')
+                            new_lines.append(padded[:64] + fmt(landing_offsets[eid]) + line.rstrip('\r\n')[72:] + '\n')   # [72:] = varsa devam işareti
                             applied_landing += 1
                             i += 1
                             continue
                     except:
                         pass
 
-                # CTRIA3'te ZOFFSET alanı CQUAD4'e göre bir alan daha erken
-                # başlar (49-56. karakter, [48:56]) çünkü CTRIA3'ün 4. düğüm
-                # alanı (G4) yoktur.
+                # CTRIA3'te ZOFFS alanı CQUAD4'e göre bir alan daha erken başlar ([56:64]; CQUAD4'te [64:72]) çünkü
+                # CTRIA3'ün 4. düğüm alanı (G4) yoktur. [48:56] THETA/MCID alanıdır - DOKUNULMAZ (eskiden yanlışlıkla
+                # buraya yazılıyordu, ZOFFS hiç set edilmiyordu).
                 elif line.startswith('CTRIA3'):
                     try:
                         eid = int(line[8:16].strip())
                         if eid in landing_offsets:
-                            padded = line.rstrip().ljust(56)
-                            new_lines.append(padded[:48] + fmt(landing_offsets[eid]) + '\n')
+                            padded = line.rstrip().ljust(64)
+                            new_lines.append(padded[:56] + fmt(landing_offsets[eid]) + line.rstrip('\r\n')[64:] + '\n')
                             applied_landing += 1
                             i += 1
                             continue
@@ -5912,15 +5912,14 @@ class BarPropertySolverTab:
                                 i += 2
                                 continue
                             else:
-                                # Devam satırı yoksa SIFIRDAN bir devam satırı
-                                # üret: benzersiz bir süreklilik etiketi
-                                # ("+CB" + eleman ID'sinin son 4 hanesi) ile
-                                # ana satıra ekle, PA/PB alanlarını boş
-                                # (varsayılan pin bağlantısı) bırakıp WA/WB'yi doldur.
-                                cont_name = '+CB' + str(eid)[-4:]
-                                new_lines.append(line.rstrip() + cont_name + '\n')
+                                # Devam satırı yoksa SIFIRDAN bir devam satırı üret. Ana satır AYNEN kalır, devam satırının
+                                # süreklilik alanı BOŞ bırakılır (Nastran: ana kartın hemen ardından gelen, işaretsiz devam
+                                # satırı ona bağlanır). Eskiden ana satırın SONUNA '+CB<son 4 hane>' ekleniyordu: OFFT boş
+                                # olan (72 karakterden kısa) CBAR'larda bu işaret X3/OFFT alanının içine biniyor (kart
+                                # bozuluyor) ve farklı bar'lar aynı işareti alabiliyordu.
+                                new_lines.append(line if line.endswith('\n') else line + '\n')
 
-                                new_cont = cont_name.ljust(8)
+                                new_cont = ' ' * 8
                                 new_cont += '        '   # PA
                                 new_cont += '        '   # PB
                                 new_cont += fmt(offset_vec[0])

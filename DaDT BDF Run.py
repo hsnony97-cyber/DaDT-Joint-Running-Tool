@@ -767,6 +767,7 @@ _PF_LISTS = {'bdf_merge': [('thermal_bdfs', 'Thermal BDF'), ('maneuver_bdfs', 'M
              'improved_iterative': [('bdf_paths', 'All BDF Files'), ('maneuver_bdfs', 'Maneuver BDF')]}
 
 
+_PF_COMPOSITE = ('PCOMP', 'PCOMPG', 'PCOMPS', 'PBCOMP')
 _PF_PROP_CARDS = {'PSHELL', 'PCOMP', 'PCOMPG', 'PBAR', 'PBARL', 'PBEAM', 'PBEAML', 'PROD', 'PSOLID', 'PBUSH', 'PELAS',
                   'PMASS', 'PGAP', 'PSHEAR', 'PTUBE', 'PBCOMP', 'PBEND', 'PLPLANE', 'PCOMPS'}
 
@@ -1099,11 +1100,19 @@ def _preflight_collect(app, key, tool, log=lambda m: None, snapshot=None):
                         add('ok', f"Bar Property: all {len(bar)} PID(s) found as PBARL")
                     skin = _pf_sheet_pids(excel_path, 'skinproperty')
                     miss = sorted(skin - scan['pshell_pids'])
-                    if skin and miss:
-                        add('warn', f"Skin Property: {len(miss)} of {len(skin)} PID(s) have no PSHELL card in the BDF files - "
-                                    f"{_pf_missing_text(miss, scan, 'PSHELL')}")
+                    comp = [p for p in miss if scan['prop_types'].get(p) in _PF_COMPOSITE]
+                    comp_set = set(comp)
+                    rest = [p for p in miss if p not in comp_set]
+                    if comp:
+                        add('info', f"Skin Property: {len(comp)} PID(s) are composite properties "
+                                    f"({'/'.join(sorted({scan['prop_types'][p] for p in comp}))}, e.g. {comp[:5]}) - the BDF layup is "
+                                    f"NOT changed; the Excel thickness is only used by the offset calculation")
+                    if skin and rest:
+                        add('warn', f"Skin Property: {len(rest)} of {len(skin)} PID(s) have neither a PSHELL nor a composite card in the "
+                                    f"BDF files - {_pf_missing_text(rest, scan, 'PSHELL')}")
                     elif skin:
-                        add('ok', f"Skin Property: all {len(skin)} PID(s) found as PSHELL")
+                        add('ok', f"Skin Property: all {len(skin)} PID(s) found "
+                                  f"({len(skin) - len(comp)} PSHELL" + (f", {len(comp)} composite" if comp else "") + ")")
                 except Exception as e:
                     add('warn', f"Bar/Skin Property check skipped: {e}")
                 man_bdfs = [b for b in bdf_lists.get('maneuver_bdfs', []) if os.path.isfile(b)]
@@ -4739,12 +4748,31 @@ class BarPropertySolverTab:
         i = 0
         bar_updated = 0
         skin_updated = 0
+        upd_bar, upd_skin = set(), set()        # GERÇEKTEN güncellenen PID'ler (rapor için)
+        seen_types, n_include = {}, 0           # BDF'te görülen {PID: property kart adı}, INCLUDE sayısı
         # _write_bdf_for_model'deki PBARL mantığıyla aynı sabit-genişlik
         # alan okuma/yazma yaklaşımı, ama burada TÜM self.bar_properties
         # PID'leri (sweep grubu kısıtlaması yok) ve ayrıca PSHELL kalınlığı
         # da işleniyor.
         while i < len(lines):
             line = lines[i]
+
+            # Rapor için: bu satır bir property kartıysa (PSHELL/PCOMP/PBARL/PBAR...) PID'ini ve tipini not et.
+            c0 = line[:1]
+            if c0 == 'P':
+                nm = line[:8].split(',')[0].strip().rstrip('*').upper()
+                if nm in _PF_PROP_CARDS:
+                    try:
+                        if ',' in line[:9]:
+                            seen_types.setdefault(int(line.split(',')[1]), nm)
+                        elif line[:8].rstrip().endswith('*'):
+                            seen_types.setdefault(int(line[8:24]), nm)
+                        else:
+                            seen_types.setdefault(int(line[8:16]), nm)
+                    except (ValueError, IndexError):
+                        pass
+            elif c0 == 'I' and line[:7].upper() == 'INCLUDE':
+                n_include += 1
 
             if line.startswith('PBARL'):
                 try:
@@ -4764,6 +4792,7 @@ class BarPropertySolverTab:
                             new_lines.append(f"{cont_name}{d1:8.4f}{d2:8.4f}{rest}")
                             i += 1
                         bar_updated += 1
+                        upd_bar.add(pid)
                         continue
                 except:
                     pass
@@ -4778,6 +4807,7 @@ class BarPropertySolverTab:
                         rest = line[32:] if len(line) > 32 else '\n'
                         new_lines.append(line[:24] + f"{t:8.4f}" + rest)
                         skin_updated += 1
+                        upd_skin.add(pid)
                         i += 1
                         continue
                 except:
@@ -4791,7 +4821,59 @@ class BarPropertySolverTab:
 
         self.log(f"    {os.path.basename(source_path)}: {bar_updated} bar props, "
                   f"{skin_updated} skin props set to Excel base values")
+        reports = getattr(self, '_prop_update_reports', None)
+        if reports is not None:                   # _build_base_model toplu rapor için biriktirir
+            reports.append({'name': os.path.basename(source_path), 'upd_bar': upd_bar, 'upd_skin': upd_skin,
+                            'types': seen_types, 'n_include': n_include})
         return output_bdf
+
+    # _log_not_updated_properties: Excel'deki Bar/Skin Property PID'lerinden HİÇBİR BDF'te güncellenemeyenleri
+    # (hepsi, kısaltmadan) nedeniyle birlikte log'a yazar. Neden: PID'in BDF'te başka bir property tipi olması
+    # (ör. skin PCOMP/PCOMPG, bar PBAR/PBEAML - bunlar güncellenmez; Excel kalınlığı yalnızca offset hesabında
+    # kullanılır) ya da BDF dosyalarında hiç bulunmaması (INCLUDE'lanan dosyada olabilir / bu modelde yok).
+    def _log_not_updated_properties(self):
+        reps = getattr(self, '_prop_update_reports', None) or []
+        if not reps or not (self.bar_properties or self.skin_properties):
+            return
+        types, n_inc = {}, 0
+        for r in reps:
+            for pid, t in r['types'].items():
+                types.setdefault(pid, t)
+            n_inc = max(n_inc, r['n_include'])
+        upd_bar = set().union(*[r['upd_bar'] for r in reps])
+        upd_skin = set().union(*[r['upd_skin'] for r in reps])
+        miss_bar = sorted(set(self.bar_properties) - upd_bar)
+        miss_skin = sorted(set(self.skin_properties) - upd_skin)
+
+        def lines_of(pids, per=10):
+            return [", ".join(str(p) for p in pids[i:i + per]) for i in range(0, len(pids), per)]
+
+        def section(title, miss, total, want, note_other):
+            self.log(f"  {title}: {len(miss)} of {total} Excel PID(s) NOT updated in any BDF")
+            groups = {}
+            for pid in miss:
+                groups.setdefault(types.get(pid), []).append(pid)
+            for t in sorted((k for k in groups if k), key=lambda k: -len(groups[k])):
+                self.log(f"    {len(groups[t])} PID(s) are {t} (not a {want}) - {note_other}:")
+                for ln in lines_of(groups[t]):
+                    self.log(f"      {ln}")
+            if None in groups:
+                inc = (f" - they may be in INCLUDE'd files ({n_inc} INCLUDE card(s) in the BDFs are not followed)"
+                       if n_inc else " - they do not exist in these BDF files")
+                self.log(f"    {len(groups[None])} PID(s) are not in the BDF files at all{inc}:")
+                for ln in lines_of(groups[None]):
+                    self.log(f"      {ln}")
+
+        self.log("\n  --- Excel properties that could NOT be updated ---")
+        if not miss_bar and not miss_skin:
+            self.log("  All Excel Bar/Skin Property PIDs were updated in at least one BDF.")
+            return
+        if miss_bar:
+            section("Bar Property", miss_bar, len(self.bar_properties), "PBARL",
+                    "the BDF property is NOT changed, Excel dim1/dim2 is only used by the offset calculation")
+        if miss_skin:
+            section("Skin Property", miss_skin, len(self.skin_properties), "PSHELL",
+                    "the BDF layup/thickness is NOT changed, the Excel thickness is only used by the offset calculation")
 
     def _build_base_model(self, run_folder):
         """Apply the Excel base Bar/Skin properties to every loaded BDF and to
@@ -4813,6 +4895,7 @@ class BarPropertySolverTab:
         # Maneuver (offset kaynağı) BDF'ine de Excel Bar/Skin değerlerini uygula.
         # Listede birden fazla maneuver BDF olsa da sadece İLKİ (maneuver_bdfs[0])
         # offset kaynağı olarak kullanılır.
+        self._prop_update_reports = []            # her _apply_excel_properties çağrısı buraya rapor ekler
         self.maneuver_base_path = None
         if self.maneuver_bdfs:
             man_folder = os.path.join(base_folder, "maneuver")
@@ -4833,6 +4916,10 @@ class BarPropertySolverTab:
             self.log(f"  Base model ready for {bdf_info['name']}: {os.path.basename(base_path)}")
 
         self.log(f"  Properties applied in {time.time() - t_props_start:.1f}s")
+        try:
+            self._log_not_updated_properties()
+        except Exception as e:
+            self.log(f"  (could not build the 'not updated properties' report: {e})")
 
         # Base model üzerinde Nastran'ı çalıştır. thickness_overrides={} demek,
         # her PID'in self.bar_properties'teki temel (Excel) değerini kullanacağı
@@ -4953,6 +5040,7 @@ class BarPropertySolverTab:
             # yerine gerçek yüzeyde modellensin diye).
             landing_normals = {}
             rows = []
+            default_t_pids, no_t_shells = set(), set()    # kalınlığı bilinmeyen PID'ler (yalnızca log için)
 
             for eid in self.landing_elem_ids:
                 if eid not in bdf.elements:
@@ -4963,6 +5051,8 @@ class BarPropertySolverTab:
                     continue
 
                 # Bu PID'in etkin skin kalınlığını al (Excel öncelikli, yoksa BDF); yoksa 3.0 varsayılan.
+                if pid not in self.current_skin_thicknesses:
+                    default_t_pids.add(pid)                 # Excel'de yok ve BDF'te PSHELL değil (örn. PCOMP) -> 3.0 varsayılıyor
                 t = self.current_skin_thicknesses.get(pid, 3.0)
                 t = max(0.1, t)
                 zoffset = -t / 2.0
@@ -5113,6 +5203,8 @@ class BarPropertySolverTab:
                             shell_pid = shell_elem.pid if hasattr(shell_elem, 'pid') else None
                             if not shell_pid:
                                 continue
+                            if shell_pid not in self.current_skin_thicknesses:
+                                no_t_shells.add(shell_pid)
                             shell_t = self.current_skin_thicknesses.get(shell_pid, 0)
                             if shell_t <= 0:
                                 continue
@@ -5145,6 +5237,8 @@ class BarPropertySolverTab:
                                 shell_elem = bdf.elements[shell_eid]
                                 shell_pid = shell_elem.pid if hasattr(shell_elem, 'pid') else None
                                 if shell_pid:
+                                    if shell_pid not in self.current_skin_thicknesses:
+                                        no_t_shells.add(shell_pid)
                                     shell_t = self.current_skin_thicknesses.get(shell_pid, 0)
                                     if shell_t > max_t:
                                         max_t = shell_t
@@ -5233,6 +5327,14 @@ class BarPropertySolverTab:
                                      'Duplicate Bars': ' '.join(str(d) for d in dups) if dups else '',
                                      'Duplicate Dim1 Added': add_dim if dups else ''})
 
+            if default_t_pids:
+                self.log(f"    WARNING: {label}{len(default_t_pids)} landing shell PID(s) have no known thickness (not in the Skin "
+                          f"Property sheet and not a PSHELL in the BDF, e.g. PCOMP) - the default 3.0 is used for their offset: "
+                          f"{sorted(default_t_pids)[:15]}{' ...' if len(default_t_pids) > 15 else ''}")
+            if no_t_shells:
+                self.log(f"    WARNING: {label}{len(no_t_shells)} shell PID(s) next to Bar_Offset bars have no known thickness "
+                          f"(not in the Skin Property sheet and not a PSHELL, e.g. PCOMP) - these shells are skipped as skin "
+                          f"candidates for the bar offset: {sorted(no_t_shells)[:15]}{' ...' if len(no_t_shells) > 15 else ''}")
             if not rows:
                 return None
 

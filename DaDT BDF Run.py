@@ -767,32 +767,70 @@ _PF_LISTS = {'bdf_merge': [('thermal_bdfs', 'Thermal BDF'), ('maneuver_bdfs', 'M
              'improved_iterative': [('bdf_paths', 'All BDF Files'), ('maneuver_bdfs', 'Maneuver BDF')]}
 
 
+_PF_PROP_CARDS = {'PSHELL', 'PCOMP', 'PCOMPG', 'PBAR', 'PBARL', 'PBEAM', 'PBEAML', 'PROD', 'PSOLID', 'PBUSH', 'PELAS',
+                  'PMASS', 'PGAP', 'PSHEAR', 'PTUBE', 'PBCOMP', 'PBEND', 'PLPLANE', 'PCOMPS'}
+
+
 def _pf_scan_bdfs(paths, log):
-    """BDF'leri metin olarak tarar: {PSHELL PID: T}, PBARL PID kümesi (INCLUDE'lanan dosyalar taranmaz)."""
+    """BDF'leri metin olarak tarar (INCLUDE'lanan dosyalar TAKİP EDİLMEZ). Dönüş: (pshell_t, pbarl, info)
+    pshell_t : {PSHELL PID: T}   (yalnızca T alanı dolu olanlar - kalınlık karşılaştırması için)
+    pbarl    : PBARL PID kümesi
+    info     : {'pshell_pids': tüm PSHELL PID'leri (T boş olsa da), 'prop_types': {PID: kart adı}, 'n_include': INCLUDE sayısı}"""
     pshell, pbarl = {}, set()
+    info = {'pshell_pids': set(), 'prop_types': {}, 'n_include': 0}
     for p in paths:
         log(f"scanning {os.path.basename(p)} ...")
         try:
             with open(p, 'r', encoding='latin-1', newline='') as f:
                 for line in f:
-                    h = line[:6]
-                    if h == 'PSHELL':
+                    c0 = line[:1]
+                    if c0 == 'I' and line[:7].upper() == 'INCLUDE':
+                        info['n_include'] += 1
+                        continue
+                    if c0 != 'P':
+                        continue
+                    name = line[:8].split(',')[0].strip().rstrip('*').upper()
+                    if name not in _PF_PROP_CARDS:
+                        continue
+                    try:
+                        if ',' in line[:9]:
+                            pid = int(line.split(',')[1])
+                        elif line[:8].rstrip().endswith('*'):
+                            pid = int(line[8:24])
+                        else:
+                            pid = int(line[8:16])
+                    except (ValueError, IndexError):
+                        continue
+                    info['prop_types'].setdefault(pid, name)
+                    if name == 'PSHELL':
+                        info['pshell_pids'].add(pid)
                         parsed = _wf_parse_pshell(line)
                         if parsed and parsed[2] is not None:
-                            pshell[parsed[1]] = parsed[2]
-                    elif h == 'PBARL' and line[5:6] in ' \t,*\r\n':
-                        try:
-                            if line[5:6] == ',':
-                                pbarl.add(int(line.split(',')[1]))
-                            elif line[5:6] == '*':
-                                pbarl.add(int(line[8:24]))
-                            else:
-                                pbarl.add(int(line[8:16]))
-                        except (ValueError, IndexError):
-                            pass
+                            pshell[pid] = parsed[2]
+                    elif name == 'PBARL':
+                        pbarl.add(pid)
         except OSError:
             pass
-    return pshell, pbarl
+    return pshell, pbarl, info
+
+
+def _pf_missing_text(miss, info, expect_card):
+    """Eksik PID'ler için açıklama: başka bir property kartı olarak var mı, yoksa ana BDF'lerde hiç yok mu."""
+    other = {}
+    for pid in miss:
+        t = info['prop_types'].get(pid)
+        if t:
+            other.setdefault(t, []).append(pid)
+    parts = []
+    for t, pids in sorted(other.items(), key=lambda kv: -len(kv[1])):
+        parts.append(f"{len(pids)} exist as {t} (e.g. {pids[:3]})")
+    n_none = len(miss) - sum(len(v) for v in other.values())
+    if n_none:
+        none_ex = [p for p in miss if p not in info['prop_types']][:5]
+        parts.append(f"{n_none} are not in the BDF files at all (e.g. {none_ex})" +
+                     (f" - they may be in INCLUDE'd files ({info['n_include']} INCLUDE card(s) are not followed) or not exist in this model"
+                      if info['n_include'] else " - they do not exist in this model"))
+    return "; ".join(parts) + (f" - only {expect_card} cards are updated from this sheet" if other else "")
 
 
 # _parse_section_type: Excel'deki 'Section Type' metnini (şekil, strap_mı) ayırır.
@@ -1048,20 +1086,22 @@ def _preflight_collect(app, key, tool, log=lambda m: None, snapshot=None):
             bdfs = list(dict.fromkeys(bdf_lists.get('bdf_paths', []) + bdf_lists.get('maneuver_bdfs', [])))
             bdfs = [b for b in bdfs if os.path.isfile(b)]
             if bdfs:
-                pshell_t, pbarl = _pf_scan_bdfs(bdfs, log)
-                add('info', f"BDF scan: {len(pshell_t)} PSHELL and {len(pbarl)} PBARL card(s) in the BDF files themselves "
-                            f"(INCLUDE'd files are not scanned)")
+                pshell_t, pbarl, scan = _pf_scan_bdfs(bdfs, log)
+                add('info', f"BDF scan: {len(scan['pshell_pids'])} PSHELL and {len(pbarl)} PBARL card(s) in the BDF files themselves "
+                            f"({scan['n_include']} INCLUDE card(s) are not followed)")
                 try:
                     bar = _pf_sheet_pids(excel_path, 'barproperty')
                     miss = sorted(bar - pbarl)
                     if bar and miss:
-                        add('warn', f"Bar Property: {len(miss)} PID(s) have no PBARL card in the BDFs, e.g. {miss[:8]}")
+                        add('warn', f"Bar Property: {len(miss)} of {len(bar)} PID(s) have no PBARL card in the BDF files - "
+                                    f"{_pf_missing_text(miss, scan, 'PBARL')}")
                     elif bar:
                         add('ok', f"Bar Property: all {len(bar)} PID(s) found as PBARL")
                     skin = _pf_sheet_pids(excel_path, 'skinproperty')
-                    miss = sorted(skin - set(pshell_t))
+                    miss = sorted(skin - scan['pshell_pids'])
                     if skin and miss:
-                        add('warn', f"Skin Property: {len(miss)} PID(s) have no PSHELL card in the BDFs, e.g. {miss[:8]}")
+                        add('warn', f"Skin Property: {len(miss)} of {len(skin)} PID(s) have no PSHELL card in the BDF files - "
+                                    f"{_pf_missing_text(miss, scan, 'PSHELL')}")
                     elif skin:
                         add('ok', f"Skin Property: all {len(skin)} PID(s) found as PSHELL")
                 except Exception as e:
@@ -1079,9 +1119,10 @@ def _preflight_collect(app, key, tool, log=lambda m: None, snapshot=None):
                             add('err', "Web Property sheet has no usable rows")
                         else:
                             add('ok', f"Web Property: {len(web)} PID(s) with a thickness")
-                            miss = sorted(p for p in web if p not in pshell_t)
+                            miss = sorted(p for p in web if p not in scan['pshell_pids'])
                             if miss:
-                                add('warn', f"Web Property: {len(miss)} PID(s) have no PSHELL card in the BDFs, e.g. {miss[:8]}")
+                                add('warn', f"Web Property: {len(miss)} of {len(web)} PID(s) have no PSHELL card in the BDF files - "
+                                            f"{_pf_missing_text(miss, scan, 'PSHELL')}")
                             skin = _pf_sheet_pids(excel_path, 'skinproperty')
                             both = sorted(set(web) & skin)
                             if both:

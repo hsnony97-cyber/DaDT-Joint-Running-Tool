@@ -6217,44 +6217,28 @@ class BarPropertySolverTab:
         # them for this subprocess only (not the whole session) so its
         # scratch lands in the chosen Scratch Folder instead of the system
         # C: temp drive, without touching any other process on the machine.
-        scratch_base = self.scratch_folder.get().strip()
+        scratch_base = os.path.normpath(self.scratch_folder.get().strip()) if self.scratch_folder.get().strip() else ''
         run_scratch_dir = None
         made_temp_scratch = False
         try:
-            env = None
             if scratch_base:
-                # Scratch Folder verilmişse: o klasörün altında bu run'a özel,
-                # benzersiz bir alt klasör oluştur ve TEMP/TMP ortam
-                # değişkenlerini SADECE bu alt process için bu klasöre yönlendir
-                # (os.environ.copy() ile - gerçek ortam değişkenleri/diğer
-                # süreçler etkilenmez).
                 os.makedirs(scratch_base, exist_ok=True)
-                run_scratch_dir = tempfile.mkdtemp(prefix="nastran_scr_", dir=scratch_base)
-                made_temp_scratch = True
-                env = os.environ.copy()
-                env['TEMP'] = run_scratch_dir
-                env['TMP'] = run_scratch_dir
-                self.log(f"    {label}Scratch dir (via TEMP/TMP): {run_scratch_dir}")
 
-            cwd_dir = run_scratch_dir or folder
-
-            # Nastran komut satırı: out= sonuç çıktı klasörü, scratch=yes
-            # geçici dosyalar kullanılsın, batch=no etkileşimsiz/arka plan modu.
-            cmd = [nastran, bdf_path, f"out={folder}", "scratch=yes", "batch=no"]
+            # Nastran komut satırı: out= sonuç çıktı klasörü, scratch=yes geçici dosyalar kullanılsın, batch=no etkileşimsiz mod.
+            cmd_args = [bdf_path, f"out={folder}", "scratch=yes", "batch=no"]
             mem = self.nastran_memory.get().strip()
             if mem:
-                cmd.append(f"mem={mem}")
+                cmd_args.append(f"mem={mem}")
+            cmd = [nastran] + cmd_args
 
-            # Komut satırını logla: sorun olursa aynısını cmd'de elle çalıştırıp farkı görebilirsin.
-            self.log(f"    {label}Nastran command: " + " ".join(f'"{c}"' if ' ' in c else c for c in cmd) + f"   (cwd: {cwd_dir})")
-            # Aynı komutu çalıştırıp SONUNDA BEKLEYEN (pause) bir .bat yaz: Nastran penceresi anında kapanıyorsa, bu dosyaya çift
-            # tıklayınca Nastran'ın konsola yazdığı hata okunabilir. TEMP/TMP, aracın kullandığı Scratch Folder'a ayarlanır.
+            # Aynı komutu çalıştırıp SONUNDA BEKLEYEN (pause) .bat'lar: Nastran penceresi anında kapanıyorsa çift tıklayınca
+            # Nastran'ın konsola yazdığı hata okunabilir (TEMP/TMP = Scratch Folder, çalışma dizini = run klasörü).
             debug_bat = None
             try:
                 def _bat(exe, name):
                     lines_ = ["@echo off", f'cd /d "{folder}"']
                     if scratch_base:
-                        lines_ += [f'set "TEMP={os.path.normpath(scratch_base)}"', f'set "TMP={os.path.normpath(scratch_base)}"']
+                        lines_ += [f'set "TEMP={scratch_base}"', f'set "TMP={scratch_base}"']
                     lines_.append(" ".join([f'"{exe}"', f'"{cmd[1]}"', f'out="{folder}"'] + cmd[3:]))
                     lines_ += ["echo.", "echo Exit code: %ERRORLEVEL%", "pause"]
                     path_ = os.path.join(folder, name)
@@ -6268,49 +6252,80 @@ class BarPropertySolverTab:
                     _bat(_con, "_run_nastran_debug_console.bat")      # konsol sürümü: hata mesajını pencerede gösterir
             except Exception:
                 debug_bat = None
-            result = subprocess.run(cmd, cwd=cwd_dir, env=env, capture_output=True, text=True)
-            if result.returncode != 0:
-                self.log(f"    {label}WARNING: Nastran exited with code {result.returncode}")
-                if result.stderr:
-                    self.log(f"    {label}stderr: {result.stderr.strip()[:500]}")
-                if result.stdout and result.stdout.strip():
-                    self.log(f"    {label}stdout: {result.stdout.strip()[-500:]}")
 
-            # Nastran hiçbir çıktı dosyası (.f06/.f04/.log/.op2) üretmeden çıktıysa beklemenin anlamı yok (eskiden .f06'yı
-            # bir saate kadar bekliyordu). nastranw gibi bir başlatıcı asıl işi ayrı bir süreçte sürdürebileceği için önce
-            # kısa bir süre (180 sn) çıktı dosyasının belirmesine izin ver; yine yoksa ayrıntıyla başarısız say.
             _base = os.path.splitext(os.path.basename(bdf_path))[0]
-            _dirs = [folder] + ([run_scratch_dir] if run_scratch_dir else [])
-            _has_out = lambda: any(os.path.exists(os.path.join(d, _base + e)) for d in _dirs for e in ('.f06', '.f04', '.log', '.op2'))
-            if not _has_out():
+            _has_out = lambda: any(os.path.exists(os.path.join(d, _base + e))
+                                   for d in ([folder] + ([run_scratch_dir] if run_scratch_dir else []))
+                                   for e in ('.f06', '.f04', '.log', '.op2'))
+            _MODE_TXT = {'A': "per-run scratch dir as TEMP/TMP and cwd", 'B': "Scratch Folder as TEMP/TMP, cwd = run folder",
+                         'C': "no TEMP/TMP change, cwd = run folder (same as running it by hand)"}
+
+            def _attempt(mode, exe):
+                """Nastran'ı bir BAŞLATMA MODUYLA çalıştırır. A: bu run'a özel scratch alt klasörü TEMP/TMP + cwd (eski yöntem);
+                B: TEMP/TMP = Scratch Folder'ın kendisi, cwd = run klasörü; C: ortam/cwd değişikliği YOK (elle çözmekle aynı)."""
+                nonlocal run_scratch_dir
+                env, cwd = None, folder
+                if scratch_base and mode == 'A':
+                    if run_scratch_dir is None:
+                        run_scratch_dir = os.path.normpath(tempfile.mkdtemp(prefix="nastran_scr_", dir=scratch_base))
+                    env = os.environ.copy()
+                    env['TEMP'] = env['TMP'] = run_scratch_dir
+                    cwd = run_scratch_dir
+                elif scratch_base and mode == 'B':
+                    env = os.environ.copy()
+                    env['TEMP'] = env['TMP'] = scratch_base
+                full = [exe] + cmd_args
+                self.log(f"    {label}Nastran command [mode {mode}: {_MODE_TXT[mode]}]: "
+                          + " ".join(f'"{c}"' if ' ' in c else c for c in full) + f"   (cwd: {cwd})")
+                res = subprocess.run(full, cwd=cwd, env=env, capture_output=True, text=True)
+                if res.returncode != 0:
+                    self.log(f"    {label}WARNING: Nastran exited with code {res.returncode}")
+                if res.stderr and res.stderr.strip():
+                    self.log(f"    {label}stderr: {res.stderr.strip()[-500:]}")
+                if res.stdout and res.stdout.strip() and (res.returncode != 0 or not _has_out()):
+                    self.log(f"    {label}stdout: {res.stdout.strip()[-800:]}")
+                return res
+
+            # Denenecek (mod, exe) sırası: daha önce ÇALIŞMIŞ olan başa; sonra A -> B -> C; en son konsol sürümü nastran.exe.
+            modes = ['A', 'B', 'C'] if scratch_base else ['C']
+            attempts = [(m, nastran) for m in modes]
+            alt = os.path.join(os.path.dirname(nastran), 'nastran.exe')
+            if (os.path.basename(nastran).lower() == 'nastranw.exe' and os.path.exists(alt)
+                    and not getattr(self, '_nastran_no_console_retry', False)):
+                attempts.append((modes[-1] if modes[-1] != 'A' else 'B', alt))
+            pref = getattr(self, '_nastran_launch_ok', None)
+            if pref in attempts:
+                attempts = [pref] + [a_ for a_ in attempts if a_ != pref]
+
+            grace = getattr(self, '_nastran_start_grace', 45)
+            result, used = None, None
+            for ai, (m, exe) in enumerate(attempts):
+                if ai > 0:
+                    self.log(f"    {label}Retrying with mode {m}" + (" using the console version nastran.exe" if exe != nastran else "") + "...")
+                result = _attempt(m, exe)
+                # Nastran hiçbir çıktı (.f06/.f04/.log/.op2) üretmeden çıktıysa beklemenin anlamı yok. nastranw gibi bir başlatıcı
+                # işi ayrı süreçte sürdürebileceği için kısa bir süre (grace) çıktının belirmesine izin ver.
                 t_g = time.time()
-                while time.time() - t_g < getattr(self, '_nastran_start_grace', 180) and not _has_out():
+                while not _has_out() and time.time() - t_g < grace:
                     time.sleep(3)
-                if not _has_out():
-                    self.log(f"    {label}WARNING: Nastran ended (exit code {result.returncode}) after {time.time() - t_run_start:.1f}s and wrote NO "
-                              f".f06/.f04/.log/.op2 for {_base} - it stopped before reading the input.")
-                    if result.stdout and result.stdout.strip():
-                        self.log(f"    {label}Nastran console output: {result.stdout.strip()[-800:]}")
-                    # nastranw.exe (pencereli başlatıcı) hata mesajını pencereye yazıp kapanır, bize hiçbir şey döndürmez. Konsol
-                    # sürümü nastran.exe (aynı klasörde) aynı komutla denenir: hem gerçek çalıştırma olur hem hata mesajı yakalanır.
-                    alt = os.path.join(os.path.dirname(nastran), 'nastran.exe')
-                    if (os.path.basename(nastran).lower() == 'nastranw.exe' and os.path.exists(alt)
-                            and not getattr(self, '_nastran_no_console_retry', False)):
-                        self.log(f"    {label}Retrying with the console version: {alt}")
-                        result = subprocess.run([alt] + cmd[1:], cwd=cwd_dir, env=env, capture_output=True, text=True)
-                        self.log(f"    {label}nastran.exe exited with code {result.returncode}")
-                        for nm_, tx_ in (('stdout', result.stdout), ('stderr', result.stderr)):
-                            if tx_ and tx_.strip():
-                                self.log(f"    {label}nastran.exe {nm_}: {tx_.strip()[-1200:]}")
-                        t_g = time.time()
-                        while time.time() - t_g < getattr(self, '_nastran_start_grace', 180) and not _has_out():
-                            time.sleep(3)
-                    if not _has_out():
-                        self.log(f"    {label}Likely causes: license not available (too many parallel runs - try Max Parallel Runs = 1), "
-                                  f"unusable path (too long / special characters in the BDF or out= folder), unreadable/unwritable folder, "
-                                  f"or a bad Nastran command option. Double-click the _run_nastran_debug*.bat files in {folder} to see "
-                                  f"Nastran's own console message.")
-                        return False
+                if _has_out():
+                    used = (m, exe)
+                    break
+                self.log(f"    {label}WARNING: mode {m} - Nastran ended (exit code {result.returncode}) after "
+                          f"{time.time() - t_run_start:.1f}s and wrote NO .f06/.f04/.log/.op2 for {_base} - it stopped before reading the input.")
+
+            if used is None:
+                self.log(f"    {label}Nastran did not start in any mode. Likely causes: license not available (try Max Parallel Runs = 1), "
+                          f"unusable path (too long / special characters in the BDF or out= folder), unwritable folder, or a bad "
+                          f"command option. Double-click the _run_nastran_debug*.bat files in {folder} to see Nastran's own console message.")
+                return False
+            if used != attempts[0] or (ai > 0):
+                self.log(f"    {label}NOTE: Nastran only started with mode {used[0]} ({_MODE_TXT[used[0]]})"
+                          + (" using nastran.exe" if used[1] != nastran else "") + " - using it for the remaining runs."
+                          + (" WARNING: in this mode Nastran's scratch files go to the Windows temp folder (usually C:), NOT the Scratch Folder - "
+                             "watch the free space of that drive." if used[0] == 'C' and scratch_base else ""))
+            self._nastran_launch_ok = used
+            made_temp_scratch = (used[0] == 'A')
 
             if made_temp_scratch:
                 # Nastran gerçekten bu özel scratch klasörünü mü kullandı,
@@ -6340,7 +6355,7 @@ class BarPropertySolverTab:
             # Scratch files are pure intermediates, never needed once the run is
             # done - clean up our own temp scratch dir so a long sweep doesn't
             # fill the scratch disk.
-            if made_temp_scratch and run_scratch_dir and os.path.isdir(run_scratch_dir):
+            if run_scratch_dir and os.path.isdir(run_scratch_dir):
                 shutil.rmtree(run_scratch_dir, ignore_errors=True)
 
     def _describe_run_progress(self, dirs, base):

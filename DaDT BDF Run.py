@@ -5478,6 +5478,34 @@ class BarPropertySolverTab:
                 rows.append({'Type': 'Landing', 'Element': eid, 'ZOffset': zoffset,
                              'WA_X': '', 'WA_Y': '', 'WA_Z': ''})
 
+            # ---- Bar'ların oturabileceği SKIN shell'leri ----
+            # Landing sheet'indeki shell'lere EK olarak, PID'i 'Skin Property' sheet'inde olan her CQUAD4/CTRIA3 de skin adayıdır
+            # (PCOMP skin'ler çoğunlukla Landing listesinde değil). Web Property PID'leri skin sayılmaz.
+            skin_pids_ok = set(self.skin_properties) - set(getattr(self, 'web_pids', set()))
+            _sn_cache = {}
+
+            def normal_of(sh):
+                n = landing_normals.get(sh)
+                if n is not None or sh in landing_normals:
+                    return n
+                if sh in _sn_cache:
+                    return _sn_cache[sh]
+                n = None
+                el = bdf.elements.get(sh)
+                if el is not None and el.type in ('CQUAD4', 'CTRIA3') and getattr(el, 'pid', None) in skin_pids_ok:
+                    try:
+                        nodes = [bdf.nodes[x] for x in el.node_ids[:3] if x in bdf.nodes]
+                        if len(nodes) >= 3:
+                            q1, q2, q3 = [np.array(x.get_position()) for x in nodes]
+                            nv = np.cross(q2 - q1, q3 - q1)
+                            nl_ = np.linalg.norm(nv)
+                            if nl_ > 1e-10:
+                                n = nv / nl_
+                    except Exception:
+                        n = None
+                _sn_cache[sh] = n
+                return n
+
             # Her düğümün hangi shell (CQUAD4/CTRIA3) elemanlarına ait olduğunun
             # haritasını çıkar - bir bar elemanının "hangi landing shell'in
             # üzerinde oturduğunu" bulmak için kullanılacak.
@@ -5607,7 +5635,7 @@ class BarPropertySolverTab:
                         best_proj = -np.inf
                         n_checked = 0
                         for shell_eid in common:
-                            if shell_eid not in landing_normals or landing_normals[shell_eid] is None:
+                            if normal_of(shell_eid) is None:
                                 continue
                             shell_elem = bdf.elements[shell_eid]
                             shell_pid = shell_elem.pid if hasattr(shell_elem, 'pid') else None
@@ -5629,7 +5657,7 @@ class BarPropertySolverTab:
                             proj = np.dot(shell_centroid - bar_mid, yhat)
                             if proj > best_proj:
                                 best_proj = proj
-                                best_normal = landing_normals[shell_eid]
+                                best_normal = normal_of(shell_eid)
                                 max_t = shell_t
                         if best_normal is None:
                             self.log(f"    WARNING: Bar {eid} (Section Type=C) - direction-based "
@@ -5644,7 +5672,7 @@ class BarPropertySolverTab:
                         # SESSİZCE hiç offset almadan kalmasını önlemek için
                         # garanti bir geri dönüş (fallback) olarak var.
                         for shell_eid in common:
-                            if shell_eid in landing_normals:
+                            if normal_of(shell_eid) is not None:
                                 shell_elem = bdf.elements[shell_eid]
                                 shell_pid = shell_elem.pid if hasattr(shell_elem, 'pid') else None
                                 if shell_pid:
@@ -5654,7 +5682,7 @@ class BarPropertySolverTab:
                                         shell_t = 0
                                     if shell_t > max_t:
                                         max_t = shell_t
-                                        best_normal = landing_normals.get(shell_eid)
+                                        best_normal = normal_of(shell_eid)
 
                     if best_normal is not None and max_t > 0:
                         # ---- Duplicate (aynı iki düğümü paylaşan) bar(lar) ----
@@ -5739,9 +5767,9 @@ class BarPropertySolverTab:
                                      'Duplicate Bars': ' '.join(str(d) for d in dups) if dups else '',
                                      'Duplicate Dim1 Added': add_dim if dups else ''})
                     elif common:
-                        if not any(sh in landing_normals and landing_normals[sh] is not None for sh in common):
-                            why = ("the shell(s) it sits on are not in the Landing sheet (only Landing shells are used as the "
-                                   "skin) or have no valid normal")
+                        if not any(normal_of(sh) is not None for sh in common):
+                            why = ("the shell(s) it sits on are neither in the Landing sheet nor have a PID in the Skin Property "
+                                   "sheet (only those are used as the skin), or have no valid normal")
                         else:
                             why = "the Landing shell(s) it sits on have no known thickness"
                         bar_skip.setdefault(why, []).append(eid)
@@ -11541,6 +11569,7 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
         injected = {pid: t for pid, t in web_thk.items() if pid not in t3.skin_properties}
         for pid, t in injected.items():
             t3.skin_properties[pid] = {'thickness': t}
+        t3.web_pids = set(injected)                         # bar offset skin adaylarından hariç tutulur (web = skin değil)
         t3._refresh_effective_skin_thicknesses()           # offset hesabı da güncel kalınlığı görsün
         self.log(f"  Web Property thicknesses handed to the Nastran Solver like Skin Property "
                   f"({len(injected)}/{len(web_thk)} propert(ies))")

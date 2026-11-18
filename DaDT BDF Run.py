@@ -5491,7 +5491,9 @@ class BarPropertySolverTab:
                         pass
                 landing_normals[eid] = normal  # bar offsetleri için sonra tekrar kullanılacak
                 rows.append({'Type': 'Landing', 'Element': eid, 'ZOffset': zoffset,
-                             'WA_X': '', 'WA_Y': '', 'WA_Z': ''})
+                             'WA_X': '', 'WA_Y': '', 'WA_Z': '',
+                             'PID': pid, 'Property': getattr(bdf.properties.get(pid), 'type', '?'), 'Thickness Used': t,
+                             'Source': 'Landing sheet' if eid in _in_sheet else 'PCOMP skin (Skin Property sheet)'})
 
             # ---- Bar'ların oturabileceği SKIN shell'leri ----
             # Landing sheet'indeki shell'lere EK olarak, PID'i 'Skin Property' sheet'inde olan her CQUAD4/CTRIA3 de skin adayıdır
@@ -5785,7 +5787,9 @@ class BarPropertySolverTab:
                         rows.append({'Type': 'Bar', 'Element': eid, 'ZOffset': '',
                                      'WA_X': vec[0], 'WA_Y': vec[1], 'WA_Z': vec[2],
                                      'Duplicate Bars': ' '.join(str(d) for d in dups) if dups else '',
-                                     'Duplicate Dim1 Added': add_dim if dups else ''})
+                                     'Duplicate Dim1 Added': add_dim if dups else '',
+                                     'PID': pid, 'Property': getattr(bdf.properties.get(pid), 'type', '?'), 'Thickness Used': max_t,
+                                     'Source': 'Bar_Offset sheet (Thickness Used = skin thickness)'})
                     elif common:
                         if not any(normal_of(sh) is not None for sh in common):
                             why = ("the shell(s) it sits on are neither in the Landing sheet nor have a PID in the Skin Property "
@@ -5818,10 +5822,12 @@ class BarPropertySolverTab:
             csv_path = os.path.join(folder, 'offsets.csv')
             with open(csv_path, 'w', newline='') as f:
                 w = csv.DictWriter(f, fieldnames=['Type', 'Element', 'ZOffset', 'WA_X', 'WA_Y', 'WA_Z',
-                                                  'Duplicate Bars', 'Duplicate Dim1 Added'])
+                                                  'Duplicate Bars', 'Duplicate Dim1 Added',
+                                                  'PID', 'Property', 'Thickness Used', 'Source'])
                 w.writeheader()
                 w.writerows(rows)
-            self.log(f"    {label}Offset CSV: {n_landing} landing, {n_bar} bar -> {csv_path} "
+            n_land_comp = sum(1 for r in rows if r['Type'] == 'Landing' and r.get('Property') in ('PCOMP', 'PCOMPG'))
+            self.log(f"    {label}Offset CSV: {n_landing} landing ({n_land_comp} PCOMP/PCOMPG, {n_landing - n_land_comp} other), {n_bar} bar -> {csv_path} "
                       f"(total {time.time() - t_offset_start:.1f}s)")
             return csv_path
 

@@ -5446,7 +5446,19 @@ class BarPropertySolverTab:
                 _t = self.current_skin_thicknesses.get(_pid)
                 return _t if _t is not None else man_t.get(_pid)
 
-            for eid in self.landing_elem_ids:
+            # Landing sheet'indeki elemanlara EK olarak, PID'i 'Skin Property' sheet'inde olan PCOMP/PCOMPG shell'ler de AYNI landing
+            # offsetini (zoffset = -t/2) alır (PSHELL skin'lerle aynı mantık). Web Property PID'leri hariç.
+            _web = set(getattr(self, 'web_pids', set()))
+            comp_skin_pids = {_p for _p in self.skin_properties if _p not in _web
+                              and getattr(bdf.properties.get(_p), 'type', None) in ('PCOMP', 'PCOMPG')}
+            _in_sheet = set(self.landing_elem_ids)
+            extra_comp = [_e for _e, _el in bdf.elements.items()
+                          if _e not in _in_sheet and _el.type in ('CQUAD4', 'CTRIA3') and getattr(_el, 'pid', None) in comp_skin_pids] \
+                if comp_skin_pids else []
+            n_comp_in_sheet = sum(1 for _e in self.landing_elem_ids
+                                  if getattr(bdf.properties.get(getattr(bdf.elements.get(_e), 'pid', None)), 'type', None) in ('PCOMP', 'PCOMPG'))
+
+            for eid in list(self.landing_elem_ids) + extra_comp:
                 if eid not in bdf.elements:
                     continue
                 elem = bdf.elements[eid]
@@ -5508,6 +5520,11 @@ class BarPropertySolverTab:
                         n = None
                 _sn_cache[sh] = n
                 return n
+
+            n_landing_rows = len(rows)
+            self.log(f"    {label}Landing offsets: {n_landing_rows} shell(s) - {len(self.landing_elem_ids)} from the Landing sheet "
+                      f"({n_comp_in_sheet} of them PCOMP/PCOMPG) + {len(extra_comp)} PCOMP/PCOMPG skin shell(s) not in the sheet "
+                      f"(PID in the Skin Property sheet, {len(comp_skin_pids)} composite PID(s))")
 
             # Her düğümün hangi shell (CQUAD4/CTRIA3) elemanlarına ait olduğunun
             # haritasını çıkar - bir bar elemanının "hangi landing shell'in

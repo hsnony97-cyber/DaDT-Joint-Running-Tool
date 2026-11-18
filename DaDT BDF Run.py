@@ -3990,6 +3990,22 @@ def _read_bdf_without_includes(bdf_obj, bdf_path, **read_kwargs):
     return bdf_obj, n_inc, t_copy
 
 
+def _bdf_has_relative_include(path):
+    """BDF'te GÖRECELİ yollu (sürücü harfi / '/' ile başlamayan) bir INCLUDE var mı? Varsa dosya başka klasöre taşınmamalı."""
+    try:
+        with open(path, 'r', encoding='latin-1', errors='replace') as f:
+            for line in f:
+                if line[:7].upper() != 'INCLUDE':
+                    continue
+                m = re.search(r"""['"]\s*([^'"]*)""", line)
+                p = m.group(1).strip() if m else (line.split(None, 1)[1].strip() if len(line.split(None, 1)) > 1 else '')
+                if p and not (re.match(r'^[A-Za-z]:', p) or p[0] in '/\\'):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 # ============================================================================
 # Kompozit skin (PCOMP / PCOMPG) kalınlık ölçekleme yardımcıları
 # ----------------------------------------------------------------------------
@@ -6220,6 +6236,7 @@ class BarPropertySolverTab:
         scratch_base = os.path.normpath(self.scratch_folder.get().strip()) if self.scratch_folder.get().strip() else ''
         run_scratch_dir = None
         made_temp_scratch = False
+        stage_dir = stage_bdf = None          # mod S: kısa yollu geçici çalışma klasörü ve içindeki BDF
         try:
             if scratch_base:
                 os.makedirs(scratch_base, exist_ok=True)
@@ -6255,17 +6272,40 @@ class BarPropertySolverTab:
 
             _base = os.path.splitext(os.path.basename(bdf_path))[0]
             _has_out = lambda: any(os.path.exists(os.path.join(d, _base + e))
-                                   for d in ([folder] + ([run_scratch_dir] if run_scratch_dir else []))
+                                   for d in ([folder] + ([run_scratch_dir] if run_scratch_dir else []) + ([stage_dir] if stage_dir else []))
                                    for e in ('.f06', '.f04', '.log', '.op2'))
             _MODE_TXT = {'A': "per-run scratch dir as TEMP/TMP and cwd", 'B': "Scratch Folder as TEMP/TMP, cwd = run folder",
-                         'C': "no TEMP/TMP change, cwd = run folder (same as running it by hand)"}
+                         'C': "no TEMP/TMP change, cwd = run folder (same as running it by hand)",
+                         'S': "SHORT staging folder (BDF linked/copied there, results moved back), Scratch Folder as TEMP/TMP"}
+
+            def _make_stage():
+                """Kısa yollu geçici klasör: BDF buraya hard link (olmazsa kopya) edilir; Nastran bu kısa yolla çalışır."""
+                nonlocal stage_dir, stage_bdf
+                root = scratch_base or os.path.join(os.path.splitdrive(folder)[0] + os.sep, "_dadt_n")
+                os.makedirs(root, exist_ok=True)
+                d = tempfile.mkdtemp(prefix="s", dir=root)                  # 's' + 8 karakter: kısa
+                nb = os.path.join(d, os.path.basename(bdf_path))
+                try:
+                    os.link(bdf_path, nb)
+                except OSError:
+                    shutil.copy2(bdf_path, nb)
+                stage_dir, stage_bdf = os.path.normpath(d), os.path.normpath(nb)
 
             def _attempt(mode, exe):
                 """Nastran'ı bir BAŞLATMA MODUYLA çalıştırır. A: bu run'a özel scratch alt klasörü TEMP/TMP + cwd (eski yöntem);
                 B: TEMP/TMP = Scratch Folder'ın kendisi, cwd = run klasörü; C: ortam/cwd değişikliği YOK (elle çözmekle aynı)."""
                 nonlocal run_scratch_dir
                 env, cwd = None, folder
-                if scratch_base and mode == 'A':
+                full_args = cmd_args
+                if mode == 'S':
+                    if stage_dir is None:
+                        _make_stage()
+                    full_args = [stage_bdf, f"out={stage_dir}", "scratch=yes", "batch=no"] + ([f"mem={mem}"] if mem else [])
+                    cwd = stage_dir
+                    if scratch_base:
+                        env = os.environ.copy()
+                        env['TEMP'] = env['TMP'] = scratch_base
+                elif scratch_base and mode == 'A':
                     if run_scratch_dir is None:
                         run_scratch_dir = os.path.normpath(tempfile.mkdtemp(prefix="nastran_scr_", dir=scratch_base))
                     env = os.environ.copy()
@@ -6274,7 +6314,7 @@ class BarPropertySolverTab:
                 elif scratch_base and mode == 'B':
                     env = os.environ.copy()
                     env['TEMP'] = env['TMP'] = scratch_base
-                full = [exe] + cmd_args
+                full = [exe] + full_args
                 self.log(f"    {label}Nastran command [mode {mode}: {_MODE_TXT[mode]}]: "
                           + " ".join(f'"{c}"' if ' ' in c else c for c in full) + f"   (cwd: {cwd})")
                 res = subprocess.run(full, cwd=cwd, env=env, capture_output=True, text=True)
@@ -6288,6 +6328,17 @@ class BarPropertySolverTab:
 
             # Denenecek (mod, exe) sırası: daha önce ÇALIŞMIŞ olan başa; sonra A -> B -> C; en son konsol sürümü nastran.exe.
             modes = ['A', 'B', 'C'] if scratch_base else ['C']
+            # Mod S (kısa geçici klasör): TEMP yönlendirmesiyle UZUN yol birlikte Nastran'ı sessizce öldürüyordu (gerçek makinede
+            # klasör kısaltılınca çalıştı). Yol uzunsa S başa, değilse C'den önce denenir. Göreceli INCLUDE varsa kullanılmaz.
+            if scratch_base and not _bdf_has_relative_include(bdf_path):
+                if len(bdf_path) > 100:
+                    modes = ['S'] + modes
+                    self.log(f"    {label}NOTE: the BDF path is {len(bdf_path)} characters long - Nastran is first tried from a short staging "
+                              f"folder (results are moved back afterwards).")
+                else:
+                    modes.insert(modes.index('C'), 'S')
+            elif scratch_base:
+                self.log(f"    {label}NOTE: the BDF has relative INCLUDE path(s) - the short staging folder mode is not used.")
             attempts = [(m, nastran) for m in modes]
             alt = os.path.join(os.path.dirname(nastran), 'nastran.exe')
             if (os.path.basename(nastran).lower() == 'nastranw.exe' and os.path.exists(alt)
@@ -6326,6 +6377,9 @@ class BarPropertySolverTab:
                              "watch the free space of that drive." if used[0] == 'C' and scratch_base else ""))
             self._nastran_launch_ok = used
             made_temp_scratch = (used[0] == 'A')
+            if used[0] != 'S' and stage_dir:                      # S denendi ama başka mod kazandı: geçici klasörü hemen temizle
+                shutil.rmtree(stage_dir, ignore_errors=True)
+                stage_dir = stage_bdf = None
 
             if made_temp_scratch:
                 # Nastran gerçekten bu özel scratch klasörünü mü kullandı,
@@ -6342,7 +6396,8 @@ class BarPropertySolverTab:
             # actually exited, unlike the earlier shell=True + Popen().wait()
             # combination. Still confirm the .op2 as a safety net in case some
             # install's launcher detaches a child process anyway.
-            if not self._wait_for_op2(bdf_path, folder, scratch_dir=run_scratch_dir, label=label):
+            if not self._wait_for_op2(stage_bdf if used[0] == 'S' else bdf_path, stage_dir if used[0] == 'S' else folder,
+                                      scratch_dir=run_scratch_dir, label=label):
                 self.log(f"    {label}WARNING: .op2 never appeared/finished writing - "
                           f"treating run as failed (after {time.time() - t_run_start:.1f}s)")
                 return False
@@ -6357,6 +6412,28 @@ class BarPropertySolverTab:
             # fill the scratch disk.
             if run_scratch_dir and os.path.isdir(run_scratch_dir):
                 shutil.rmtree(run_scratch_dir, ignore_errors=True)
+            if stage_dir and os.path.isdir(stage_dir):
+                # Mod S: sonuçları (f06/op2/...; geçici BDF bağlantısı hariç) gerçek klasöre taşı, geçici klasörü sil.
+                try:
+                    os.makedirs(folder, exist_ok=True)
+                    n_moved = 0
+                    for nm_ in os.listdir(stage_dir):
+                        if os.path.normpath(os.path.join(stage_dir, nm_)) == stage_bdf:
+                            continue
+                        dst_ = os.path.join(folder, nm_)
+                        if os.path.exists(dst_):
+                            try:
+                                os.remove(dst_)
+                            except OSError:
+                                pass
+                        shutil.move(os.path.join(stage_dir, nm_), dst_)
+                        n_moved += 1
+                    self.log(f"    {label}Short staging folder: {n_moved} result file(s) moved back to {folder}")
+                except Exception as e_:
+                    self.log(f"    {label}WARNING: could not move all results out of the short staging folder {stage_dir}: {e_} "
+                              f"(the files stay there)")
+                else:
+                    shutil.rmtree(stage_dir, ignore_errors=True)
 
     def _describe_run_progress(self, dirs, base):
         """Diagnostic string for the heartbeat below: which of the usual Nastran

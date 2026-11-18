@@ -3990,22 +3990,6 @@ def _read_bdf_without_includes(bdf_obj, bdf_path, **read_kwargs):
     return bdf_obj, n_inc, t_copy
 
 
-def _bdf_has_relative_include(path):
-    """BDF'te GÖRECELİ yollu (sürücü harfi / '/' ile başlamayan) bir INCLUDE var mı? Varsa dosya başka klasöre taşınmamalı."""
-    try:
-        with open(path, 'r', encoding='latin-1', errors='replace') as f:
-            for line in f:
-                if line[:7].upper() != 'INCLUDE':
-                    continue
-                m = re.search(r"""['"]\s*([^'"]*)""", line)
-                p = m.group(1).strip() if m else (line.split(None, 1)[1].strip() if len(line.split(None, 1)) > 1 else '')
-                if p and not (re.match(r'^[A-Za-z]:', p) or p[0] in '/\\'):
-                    return True
-    except OSError:
-        return False
-    return False
-
-
 # ============================================================================
 # Kompozit skin (PCOMP / PCOMPG) kalınlık ölçekleme yardımcıları
 # ----------------------------------------------------------------------------
@@ -5066,22 +5050,25 @@ class BarPropertySolverTab:
         not just the active sweep group. This is the base model that the sweep's
         per-group thickness changes are layered on top of.
 
-        Named "..._prop_updated" (rather than keeping source_path's own name)
+        Named "..._prp_updtd" (rather than keeping source_path's own name)
         so it's never confused with the later, actually-offset file - a
-        source file already named "..._offseted.bdf" (e.g. carried over from
+        source file already named "..._offst.bdf" (e.g. carried over from
         an earlier processing stage) would otherwise make this property-only
         step look like it had already applied offsets, and the real offset
-        step's own "_offseted" suffix on top of that produced a misleading
-        "..._offseted_offseted" name. Any existing trailing "_offseted" on
+        step's own "_offst" suffix on top of that produced a misleading
+        "..._offst_offst" name. Any existing trailing "_offst" on
         the source's own name is stripped first, so e.g.
-        "merged_maneuver_offseted.bdf" becomes "merged_maneuver_prop_updated.bdf"
-        here and "merged_maneuver_prop_updated_offseted.bdf" once actually
-        offset - not "merged_maneuver_offseted_prop_updated...", which just
+        "merged_maneuver_offst.bdf" becomes "merged_maneuver_prp_updtd.bdf"
+        here and "merged_maneuver_prp_updtd_offst.bdf" once actually
+        offset - not "merged_maneuver_offst_prp_updtd...", which just
         carries the source's stale suffix along for no reason."""
         base, ext = os.path.splitext(os.path.basename(source_path))
-        if base.endswith('_offseted'):
-            base = base[:-len('_offseted')]
-        output_bdf = os.path.join(folder, base + "_prop_updated" + ext)
+        # Dosya adları KISA tutulur (Nastran çok uzun yollarda sessizce kapanıyor): _prp_updtd = property güncellendi,
+        # _offst = offset uygulandı. Eski uzun ekler ('_offseted') de kaynaktan temizlenir.
+        for suf in ('_offst', '_offseted'):
+            if base.endswith(suf):
+                base = base[:-len(suf)]
+        output_bdf = os.path.join(folder, base + "_prp_updtd" + ext)
 
         with open(source_path, 'r', encoding='latin-1') as f:
             lines = f.readlines()
@@ -5828,7 +5815,7 @@ class BarPropertySolverTab:
     def _apply_offsets_from_csv(self, bdf_path, csv_path, folder, label=""):
         """Read an offsets.csv (from _calculate_offset_csv) and write a copy of
         bdf_path with those ZOFFSET/WA-WB values applied, saved as
-        <name>_offseted.bdf in `folder`."""
+        <name>_offst.bdf in `folder`."""
         landing_offsets = {}
         bar_offsets = {}
         # offsets.csv'yi geri oku: Landing satırları {eid: zoffset}, Bar
@@ -5957,7 +5944,7 @@ class BarPropertySolverTab:
                 i += 1
 
             base, ext = os.path.splitext(os.path.basename(bdf_path))
-            output_bdf = os.path.join(folder, base + "_offseted" + ext)
+            output_bdf = os.path.join(folder, base + "_offst" + ext)
             with open(output_bdf, 'w', encoding='latin-1') as f:
                 f.writelines(new_lines)
 
@@ -6204,20 +6191,6 @@ class BarPropertySolverTab:
             self.log(f"    {label}WARNING: Nastran exe not found!")
             return False
 
-        # Yollar 'D:/a/b' + '\\c\\d' gibi KARIŞIK eğik çizgilerle gelebiliyor (Output Folder '/' ile yazılıp altına '\\' eklenince);
-        # Nastran başlatıcısına tek tip (Windows'ta '\\') yol ver.
-        nastran, bdf_path, folder = os.path.normpath(nastran), os.path.normpath(bdf_path), os.path.normpath(folder)
-
-        # Paralel run'lar AYNI ANDA başlamasın: Nastran lisans/scratch alırken eşzamanlı 10 başlangıç yarışabilir ve pencere
-        # hiçbir çıktı yazmadan kapanabilir. Başlangıçlar arasında en az _nastran_start_stagger sn bırak.
-        stagger = float(getattr(self, '_nastran_start_stagger', 2.0))
-        lock = self.__dict__.setdefault('_nastran_start_lock', threading.Lock())
-        with lock:
-            wait = stagger - (time.time() - self.__dict__.get('_nastran_last_start', 0.0))
-            if wait > 0:
-                time.sleep(wait)
-            self._nastran_last_start = time.time()
-
         t_run_start = time.time()
 
         # Neither of the two earlier approaches to scratch isolation actually
@@ -6233,30 +6206,46 @@ class BarPropertySolverTab:
         # them for this subprocess only (not the whole session) so its
         # scratch lands in the chosen Scratch Folder instead of the system
         # C: temp drive, without touching any other process on the machine.
-        scratch_base = os.path.normpath(self.scratch_folder.get().strip()) if self.scratch_folder.get().strip() else ''
+        scratch_base = self.scratch_folder.get().strip()
         run_scratch_dir = None
         made_temp_scratch = False
-        stage_dir = stage_bdf = None          # mod S: kısa yollu geçici çalışma klasörü ve içindeki BDF
         try:
+            env = None
             if scratch_base:
+                # Scratch Folder verilmişse: o klasörün altında bu run'a özel,
+                # benzersiz bir alt klasör oluştur ve TEMP/TMP ortam
+                # değişkenlerini SADECE bu alt process için bu klasöre yönlendir
+                # (os.environ.copy() ile - gerçek ortam değişkenleri/diğer
+                # süreçler etkilenmez).
                 os.makedirs(scratch_base, exist_ok=True)
+                run_scratch_dir = tempfile.mkdtemp(prefix="nastran_scr_", dir=scratch_base)
+                made_temp_scratch = True
+                env = os.environ.copy()
+                env['TEMP'] = run_scratch_dir
+                env['TMP'] = run_scratch_dir
+                self.log(f"    {label}Scratch dir (via TEMP/TMP): {run_scratch_dir}")
 
-            # Nastran komut satırı: out= sonuç çıktı klasörü, scratch=yes geçici dosyalar kullanılsın, batch=no etkileşimsiz mod.
-            cmd_args = [bdf_path, f"out={folder}", "scratch=yes", "batch=no"]
+            cwd_dir = run_scratch_dir or folder
+
+            # Nastran komut satırı: out= sonuç çıktı klasörü, scratch=yes
+            # geçici dosyalar kullanılsın, batch=no etkileşimsiz/arka plan modu.
+            cmd = [nastran, bdf_path, f"out={folder}", "scratch=yes", "batch=no"]
             mem = self.nastran_memory.get().strip()
             if mem:
-                cmd_args.append(f"mem={mem}")
-            cmd = [nastran] + cmd_args
+                cmd.append(f"mem={mem}")
 
-            # Aynı komutu çalıştırıp SONUNDA BEKLEYEN (pause) .bat'lar: Nastran penceresi anında kapanıyorsa çift tıklayınca
+            # Komut satırını logla: sorun olursa aynısını cmd'de elle çalıştırıp farkı görebilirsin.
+            self.log(f"    {label}Nastran command: " + " ".join(f'"{c}"' if ' ' in c else c for c in cmd) + f"   (cwd: {cwd_dir})")
+            # Aynı komutu çalıştırıp SONUNDA BEKLEYEN (pause) bir .bat yaz: Nastran penceresi anında kapanıyorsa çift tıklayınca
             # Nastran'ın konsola yazdığı hata okunabilir (TEMP/TMP = Scratch Folder, çalışma dizini = run klasörü).
             debug_bat = None
             try:
                 def _bat(exe, name):
-                    lines_ = ["@echo off", f'cd /d "{folder}"']
+                    lines_ = ["@echo off", f'cd /d "{os.path.normpath(folder)}"']
                     if scratch_base:
-                        lines_ += [f'set "TEMP={scratch_base}"', f'set "TMP={scratch_base}"']
-                    lines_.append(" ".join([f'"{exe}"', f'"{cmd[1]}"', f'out="{folder}"'] + cmd[3:]))
+                        lines_ += [f'set "TEMP={os.path.normpath(scratch_base)}"', f'set "TMP={os.path.normpath(scratch_base)}"']
+                    lines_.append(" ".join([f'"{os.path.normpath(exe)}"', f'"{os.path.normpath(cmd[1])}"',
+                                            f'out="{os.path.normpath(folder)}"'] + cmd[3:]))
                     lines_ += ["echo.", "echo Exit code: %ERRORLEVEL%", "pause"]
                     path_ = os.path.join(folder, name)
                     # newline='\r\n': Python '\n'leri Windows'ta zaten '\r\n' yapar; elle '\r\n' yazmak '\r\r\n' (boş satırlar) üretiyordu.
@@ -6270,116 +6259,35 @@ class BarPropertySolverTab:
             except Exception:
                 debug_bat = None
 
+            result = subprocess.run(cmd, cwd=cwd_dir, env=env, capture_output=True, text=True)
+            if result.returncode != 0:
+                self.log(f"    {label}WARNING: Nastran exited with code {result.returncode}")
+                if result.stderr:
+                    self.log(f"    {label}stderr: {result.stderr.strip()[:500]}")
+                if result.stdout and result.stdout.strip():
+                    self.log(f"    {label}stdout: {result.stdout.strip()[-500:]}")
+
+            # Nastran hiçbir çıktı dosyası (.f06/.f04/.log/.op2) üretmeden çıktıysa beklemenin anlamı yok (eskiden .f06'yı bir saate
+            # kadar bekliyordu). nastranw gibi bir başlatıcı işi ayrı bir süreçte sürdürebileceği için çıktı dosyasının belirmesine
+            # kısa bir süre (180 sn) izin ver; yine yoksa en olası sebebi (çok uzun yol) söyleyerek başarısız say.
             _base = os.path.splitext(os.path.basename(bdf_path))[0]
-            _has_out = lambda: any(os.path.exists(os.path.join(d, _base + e))
-                                   for d in ([folder] + ([run_scratch_dir] if run_scratch_dir else []) + ([stage_dir] if stage_dir else []))
-                                   for e in ('.f06', '.f04', '.log', '.op2'))
-            _MODE_TXT = {'A': "per-run scratch dir as TEMP/TMP and cwd", 'B': "Scratch Folder as TEMP/TMP, cwd = run folder",
-                         'C': "no TEMP/TMP change, cwd = run folder (same as running it by hand)",
-                         'S': "SHORT staging folder (BDF linked/copied there, results moved back), Scratch Folder as TEMP/TMP"}
-
-            def _make_stage():
-                """Kısa yollu geçici klasör: BDF buraya hard link (olmazsa kopya) edilir; Nastran bu kısa yolla çalışır."""
-                nonlocal stage_dir, stage_bdf
-                root = scratch_base or os.path.join(os.path.splitdrive(folder)[0] + os.sep, "_dadt_n")
-                os.makedirs(root, exist_ok=True)
-                d = tempfile.mkdtemp(prefix="s", dir=root)                  # 's' + 8 karakter: kısa
-                nb = os.path.join(d, os.path.basename(bdf_path))
-                try:
-                    os.link(bdf_path, nb)
-                except OSError:
-                    shutil.copy2(bdf_path, nb)
-                stage_dir, stage_bdf = os.path.normpath(d), os.path.normpath(nb)
-
-            def _attempt(mode, exe):
-                """Nastran'ı bir BAŞLATMA MODUYLA çalıştırır. A: bu run'a özel scratch alt klasörü TEMP/TMP + cwd (eski yöntem);
-                B: TEMP/TMP = Scratch Folder'ın kendisi, cwd = run klasörü; C: ortam/cwd değişikliği YOK (elle çözmekle aynı)."""
-                nonlocal run_scratch_dir
-                env, cwd = None, folder
-                full_args = cmd_args
-                if mode == 'S':
-                    if stage_dir is None:
-                        _make_stage()
-                    full_args = [stage_bdf, f"out={stage_dir}", "scratch=yes", "batch=no"] + ([f"mem={mem}"] if mem else [])
-                    cwd = stage_dir
-                    if scratch_base:
-                        env = os.environ.copy()
-                        env['TEMP'] = env['TMP'] = scratch_base
-                elif scratch_base and mode == 'A':
-                    if run_scratch_dir is None:
-                        run_scratch_dir = os.path.normpath(tempfile.mkdtemp(prefix="nastran_scr_", dir=scratch_base))
-                    env = os.environ.copy()
-                    env['TEMP'] = env['TMP'] = run_scratch_dir
-                    cwd = run_scratch_dir
-                elif scratch_base and mode == 'B':
-                    env = os.environ.copy()
-                    env['TEMP'] = env['TMP'] = scratch_base
-                full = [exe] + full_args
-                self.log(f"    {label}Nastran command [mode {mode}: {_MODE_TXT[mode]}]: "
-                          + " ".join(f'"{c}"' if ' ' in c else c for c in full) + f"   (cwd: {cwd})")
-                res = subprocess.run(full, cwd=cwd, env=env, capture_output=True, text=True)
-                if res.returncode != 0:
-                    self.log(f"    {label}WARNING: Nastran exited with code {res.returncode}")
-                if res.stderr and res.stderr.strip():
-                    self.log(f"    {label}stderr: {res.stderr.strip()[-500:]}")
-                if res.stdout and res.stdout.strip() and (res.returncode != 0 or not _has_out()):
-                    self.log(f"    {label}stdout: {res.stdout.strip()[-800:]}")
-                return res
-
-            # Denenecek (mod, exe) sırası: daha önce ÇALIŞMIŞ olan başa; sonra A -> B -> C; en son konsol sürümü nastran.exe.
-            modes = ['A', 'B', 'C'] if scratch_base else ['C']
-            # Mod S (kısa geçici klasör): TEMP yönlendirmesiyle UZUN yol birlikte Nastran'ı sessizce öldürüyordu (gerçek makinede
-            # klasör kısaltılınca çalıştı). Yol uzunsa S başa, değilse C'den önce denenir. Göreceli INCLUDE varsa kullanılmaz.
-            if scratch_base and not _bdf_has_relative_include(bdf_path):
-                if len(bdf_path) > 100:
-                    modes = ['S'] + modes
-                    self.log(f"    {label}NOTE: the BDF path is {len(bdf_path)} characters long - Nastran is first tried from a short staging "
-                              f"folder (results are moved back afterwards).")
-                else:
-                    modes.insert(modes.index('C'), 'S')
-            elif scratch_base:
-                self.log(f"    {label}NOTE: the BDF has relative INCLUDE path(s) - the short staging folder mode is not used.")
-            attempts = [(m, nastran) for m in modes]
-            alt = os.path.join(os.path.dirname(nastran), 'nastran.exe')
-            if (os.path.basename(nastran).lower() == 'nastranw.exe' and os.path.exists(alt)
-                    and not getattr(self, '_nastran_no_console_retry', False)):
-                attempts.append((modes[-1] if modes[-1] != 'A' else 'B', alt))
-            pref = getattr(self, '_nastran_launch_ok', None)
-            if pref in attempts:
-                attempts = [pref] + [a_ for a_ in attempts if a_ != pref]
-
-            grace = getattr(self, '_nastran_start_grace', 45)
-            result, used = None, None
-            for ai, (m, exe) in enumerate(attempts):
-                if ai > 0:
-                    self.log(f"    {label}Retrying with mode {m}" + (" using the console version nastran.exe" if exe != nastran else "") + "...")
-                result = _attempt(m, exe)
-                # Nastran hiçbir çıktı (.f06/.f04/.log/.op2) üretmeden çıktıysa beklemenin anlamı yok. nastranw gibi bir başlatıcı
-                # işi ayrı süreçte sürdürebileceği için kısa bir süre (grace) çıktının belirmesine izin ver.
+            _dirs = [folder] + ([run_scratch_dir] if run_scratch_dir else [])
+            _has_out = lambda: any(os.path.exists(os.path.join(d, _base + e)) for d in _dirs for e in ('.f06', '.f04', '.log', '.op2'))
+            if not _has_out():
                 t_g = time.time()
-                while not _has_out() and time.time() - t_g < grace:
+                while time.time() - t_g < getattr(self, '_nastran_start_grace', 180) and not _has_out():
                     time.sleep(3)
-                if _has_out():
-                    used = (m, exe)
-                    break
-                self.log(f"    {label}WARNING: mode {m} - Nastran ended (exit code {result.returncode}) after "
-                          f"{time.time() - t_run_start:.1f}s and wrote NO .f06/.f04/.log/.op2 for {_base} - it stopped before reading the input.")
-
-            if used is None:
-                self.log(f"    {label}Nastran did not start in any mode. Likely causes: license not available (try Max Parallel Runs = 1), "
-                          f"unusable path (too long / special characters in the BDF or out= folder), unwritable folder, or a bad "
-                          f"command option. Double-click the _run_nastran_debug*.bat files in {folder} to see Nastran's own console message.")
-                return False
-            if used != attempts[0] or (ai > 0):
-                self.log(f"    {label}NOTE: Nastran only started with mode {used[0]} ({_MODE_TXT[used[0]]})"
-                          + (" using nastran.exe" if used[1] != nastran else "") + " - using it for the remaining runs."
-                          + (" WARNING: in this mode Nastran's scratch files go to the Windows temp folder (usually C:), NOT the Scratch Folder - "
-                             "watch the free space of that drive." if used[0] == 'C' and scratch_base else ""))
-            self._nastran_launch_ok = used
-            made_temp_scratch = (used[0] == 'A')
-            if used[0] != 'S' and stage_dir:                      # S denendi ama başka mod kazandı: geçici klasörü hemen temizle
-                shutil.rmtree(stage_dir, ignore_errors=True)
-                stage_dir = stage_bdf = None
+                if not _has_out():
+                    self.log(f"    {label}WARNING: Nastran ended (exit code {result.returncode}) after {time.time() - t_run_start:.1f}s and wrote NO "
+                              f".f06/.f04/.log/.op2 for {_base}. The file paths are probably TOO LONG for Nastran: BDF path = "
+                              f"{len(bdf_path)} characters, out= folder = {len(folder)} characters"
+                              + (f", scratch dir = {len(run_scratch_dir)} characters" if run_scratch_dir else "")
+                              + ". Shorten the Output Folder / Scratch Folder path (a BDF path of about 120 characters or less worked), then run again. "
+                                "(Other possible causes: Nastran license not available, unwritable folder.)"
+                              + (f" To see Nastran's own console message, double-click: {debug_bat}" if debug_bat else ""))
+                    if result.stdout and result.stdout.strip():
+                        self.log(f"    {label}Nastran console output: {result.stdout.strip()[-800:]}")
+                    return False
 
             if made_temp_scratch:
                 # Nastran gerçekten bu özel scratch klasörünü mü kullandı,
@@ -6396,8 +6304,7 @@ class BarPropertySolverTab:
             # actually exited, unlike the earlier shell=True + Popen().wait()
             # combination. Still confirm the .op2 as a safety net in case some
             # install's launcher detaches a child process anyway.
-            if not self._wait_for_op2(stage_bdf if used[0] == 'S' else bdf_path, stage_dir if used[0] == 'S' else folder,
-                                      scratch_dir=run_scratch_dir, label=label):
+            if not self._wait_for_op2(bdf_path, folder, scratch_dir=run_scratch_dir, label=label):
                 self.log(f"    {label}WARNING: .op2 never appeared/finished writing - "
                           f"treating run as failed (after {time.time() - t_run_start:.1f}s)")
                 return False
@@ -6410,30 +6317,8 @@ class BarPropertySolverTab:
             # Scratch files are pure intermediates, never needed once the run is
             # done - clean up our own temp scratch dir so a long sweep doesn't
             # fill the scratch disk.
-            if run_scratch_dir and os.path.isdir(run_scratch_dir):
+            if made_temp_scratch and run_scratch_dir and os.path.isdir(run_scratch_dir):
                 shutil.rmtree(run_scratch_dir, ignore_errors=True)
-            if stage_dir and os.path.isdir(stage_dir):
-                # Mod S: sonuçları (f06/op2/...; geçici BDF bağlantısı hariç) gerçek klasöre taşı, geçici klasörü sil.
-                try:
-                    os.makedirs(folder, exist_ok=True)
-                    n_moved = 0
-                    for nm_ in os.listdir(stage_dir):
-                        if os.path.normpath(os.path.join(stage_dir, nm_)) == stage_bdf:
-                            continue
-                        dst_ = os.path.join(folder, nm_)
-                        if os.path.exists(dst_):
-                            try:
-                                os.remove(dst_)
-                            except OSError:
-                                pass
-                        shutil.move(os.path.join(stage_dir, nm_), dst_)
-                        n_moved += 1
-                    self.log(f"    {label}Short staging folder: {n_moved} result file(s) moved back to {folder}")
-                except Exception as e_:
-                    self.log(f"    {label}WARNING: could not move all results out of the short staging folder {stage_dir}: {e_} "
-                              f"(the files stay there)")
-                else:
-                    shutil.rmtree(stage_dir, ignore_errors=True)
 
     def _describe_run_progress(self, dirs, base):
         """Diagnostic string for the heartbeat below: which of the usual Nastran
@@ -8750,7 +8635,7 @@ class FullRunTab:
         moved into <run_folder>/_base_model/OP2_Results
       - Output Folder H5 (Post Processing) = <run_folder>/_base_model/H5_Results
       - BDF (Maneuver) / BDF (Thermal) (Post Processing) = the
-        '..._prop_updated_offseted_stru.bdf' files the solve wrote,
+        '..._prp_updtd_offst_stru.bdf' files the solve wrote,
         matched by 'maneuver'/'thermal' in their filename
       - Output Folder (Post Processing LE split) =
         <run_folder>/_base_model/Load_Extraction_Results
@@ -9495,7 +9380,7 @@ class IterativeFullRunTab:
       1. (every iteration) Solve the base model, then fill
          DTCG_Input_Excel_Data's blank 't1(mm)'/'tfem' columns (keyed by
          Bar Property ID) from the PBARL dim1 values the solve actually
-         wrote into its '..._prop_updated_offseted*.bdf' files - so the
+         wrote into its '..._prp_updtd_offst*.bdf' files - so the
          joint input excels always reflect what was really solved.
       2. Run Post Processing, then Joint Run (which already waits for
          every Joint Run exe to finish).

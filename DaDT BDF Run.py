@@ -3990,6 +3990,15 @@ def _read_bdf_without_includes(bdf_obj, bdf_path, **read_kwargs):
     return bdf_obj, n_inc, t_copy
 
 
+def _id_lines(ids, indent="        ", per=10, cap=5000):
+    """ID listesini satırlara böler (offsets_log.txt için); cap'ten fazlası '... and N more' ile kısaltılır."""
+    ids = list(ids)
+    out = [indent + ", ".join(str(x) for x in ids[k:k + per]) for k in range(0, min(len(ids), cap), per)]
+    if len(ids) > cap:
+        out.append(indent + f"... and {len(ids) - cap} more")
+    return out
+
+
 # ============================================================================
 # Kompozit skin (PCOMP / PCOMPG) kalınlık ölçekleme yardımcıları
 # ----------------------------------------------------------------------------
@@ -5388,6 +5397,129 @@ class BarPropertySolverTab:
         yhat = np.cross(zhat, ihat)
         return yhat, None
 
+    # _property_report_lines: Excel Bar/Skin Property -> BDF güncelleme özeti (kaç PID güncellendi / güncellenmedi ve neden), TÜM PID'ler.
+    def _property_report_lines(self):
+        reps = getattr(self, '_prop_update_reports', None) or []
+        if not reps:
+            return ["  (no property update report: the base model was not built in this session)"]
+        types, upd_bar, upd_skin, comp, comp_failed, comp_multi, n_inc = {}, set(), set(), {}, {}, {}, 0
+        for r in reps:
+            for pid, t in r['types'].items():
+                types.setdefault(pid, t)
+            upd_bar |= r['upd_bar']
+            upd_skin |= r['upd_skin']
+            comp.update(r.get('comp', {}))
+            comp_failed.update(r.get('comp_failed', {}))
+            comp_multi.update(r.get('comp_multi', {}))
+            n_inc = max(n_inc, r['n_include'])
+        out = []
+
+        def not_updated(miss, want):
+            groups = {}
+            for pid in miss:
+                groups.setdefault(types.get(pid), []).append(pid)
+            for t_, ids in sorted(((k, v) for k, v in groups.items() if k), key=lambda kv: -len(kv[1])):
+                out.append(f"      {len(ids)} PID(s) are {t_} (not a {want}) - the BDF property is not changed:")
+                out.extend(_id_lines(ids, "        "))
+            if None in groups:
+                out.append(f"      {len(groups[None])} PID(s) are not in the BDF files at all"
+                           + (f" (they may be in INCLUDE'd files - {n_inc} INCLUDE card(s) are not followed)" if n_inc else "") + ":")
+                out.extend(_id_lines(groups[None], "        "))
+
+        bar_all = set(self.bar_properties)
+        miss_bar = sorted(bar_all - upd_bar)
+        out.append(f"  Bar Property (Excel): {len(bar_all)} PID(s) -> updated {len(bar_all & upd_bar)}, NOT updated {len(miss_bar)}")
+        if miss_bar:
+            not_updated(miss_bar, "PBARL")
+        skin_all = set(self.skin_properties)
+        miss_skin = sorted(skin_all - upd_skin)
+        n_comp_upd = len(set(comp) & skin_all)
+        out.append(f"  Skin Property (Excel): {len(skin_all)} PID(s) -> updated {len(skin_all & upd_skin)} "
+                   f"(PSHELL {len((skin_all & upd_skin) - set(comp))}, single-ply PCOMP/PCOMPG {n_comp_upd}), NOT updated {len(miss_skin)}")
+        if miss_skin:
+            multi = sorted(set(comp_multi) & set(miss_skin))
+            if multi:
+                out.append(f"      {len(multi)} PCOMP/PCOMPG PID(s) have MORE THAN 1 PLY - property NOT updated (layup unchanged); only the "
+                           f"Excel thickness is used, for the offsets.  Format: PID(number of plies)")
+                out.extend(_id_lines([f"{p}({comp_multi[p]})" for p in multi], "        "))
+            bad = sorted(set(comp_failed) & set(miss_skin))
+            if bad:
+                out.append(f"      {len(bad)} composite PID(s) could not be read (card left as is):")
+                out.extend(f"        {p}: {comp_failed[p]}" for p in bad[:200])
+            rest = [p for p in miss_skin if p not in comp_multi and p not in comp_failed]
+            if rest:
+                not_updated(rest, "PSHELL")
+        return out
+
+    # _offset_log_write: offsets.csv'nin yanına offsets_log.txt yazar (bu iterasyonun offset hesabı + property güncelleme özeti).
+    # Sonradan _apply_offsets_from_csv, her BDF'e uygulamanın sonucunu bu dosyaya EKLER.
+    def _offset_log_write(self, folder, st, label="", error=None):
+        try:
+            rows = st.get('rows') or []
+            lrows = [r for r in rows if r['Type'] == 'Landing']
+            brows = [r for r in rows if r['Type'] == 'Bar']
+            L = [f"OFFSET LOG   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}   {label.strip()}",
+                 f"Maneuver (offset source) BDF : {self.maneuver_base_path}",
+                 f"Offsets CSV                  : {st.get('csv_path', '(not written)')}"]
+            if error:
+                L += ["", f"ERROR: {error}"]
+            L += ["", "=" * 78, "ELEMENTS", "=" * 78, "", "Landing shells (offset = -t/2 on the CQUAD4/CTRIA3 ZOFFS field)"]
+            n_sheet = len(self.landing_elem_ids)
+            miss, nopid = st.get('missing_landing', []), st.get('nopid_landing', [])
+            sheet_rows = [r for r in lrows if r.get('Source') == 'Landing sheet']
+            by_prop = {}
+            for r in sheet_rows:
+                by_prop[r.get('Property')] = by_prop.get(r.get('Property'), 0) + 1
+            L.append(f"  Landing sheet elements          : {n_sheet}")
+            L.append(f"    offset computed               : {len(sheet_rows)}   (" + ", ".join(f"{k} {v}" for k, v in sorted(by_prop.items(), key=lambda kv: str(kv[0]))) + ")")
+            L.append(f"    NOT computed                  : {len(miss) + len(nopid)}")
+            if miss:
+                L.append(f"      not found in the maneuver BDF itself (may be in an INCLUDE'd file): {len(miss)}")
+                L.extend(_id_lines(miss))
+            if nopid:
+                L.append(f"      element has no property id: {len(nopid)}")
+                L.extend(_id_lines(nopid))
+            extra = [r for r in lrows if r.get('Source') != 'Landing sheet']
+            L.append(f"  PCOMP/PCOMPG skin shells not in the Landing sheet (PID in the Skin Property sheet): {len(extra)} (all got an offset; "
+                     f"{st.get('comp_pids', 0)} composite PID(s))")
+            L.append(f"  Landing rows in offsets.csv     : {len(lrows)}")
+            nonshell = [r for r in lrows if r.get('Element Type') not in ('CQUAD4', 'CTRIA3')]
+            if nonshell:
+                L.append(f"  WARNING: {len(nonshell)} landing row(s) are not CQUAD4/CTRIA3 - they cannot be applied to the BDF (ZOFFS only exists on these cards):")
+                L.extend(_id_lines([r['Element'] for r in nonshell]))
+            if st.get('default_t_pids'):
+                L.append(f"  Thickness unknown for {len(st['default_t_pids'])} landing PID(s) (default 3.0 used):")
+                L.extend(_id_lines(sorted(st['default_t_pids'])))
+
+            L += ["", "Bars (Bar_Offset sheet; offset = -normal x (skin t + bar t/2 [+ duplicate dim1]))"]
+            n_bar_total = len(self.bar_offset_elem_ids)
+            skip = st.get('bar_skip', {})
+            n_skip = sum(len(v) for v in skip.values())
+            types_txt = ", ".join(f"{k} {v}" for k, v in sorted(st.get('bar_types', {}).items()))
+            L.append(f"  Bar_Offset sheet elements       : {n_bar_total}")
+            L.append(f"    offset computed               : {len(brows)}" + (f"   ({types_txt})" if types_txt else ""))
+            L.append(f"    NOT computed                  : {n_skip}")
+            for why, ids in sorted(skip.items(), key=lambda kv: -len(kv[1])):
+                L.append(f"      {len(ids)} bar(s): {why}")
+                L.extend(_id_lines(ids))
+            L.append(f"  Bars with duplicate bar(s) on the same two nodes: {st.get('dup_bars', 0)} (dim1 added for {st.get('dup_added', 0)}); "
+                     f"Strap bars: {st.get('strap', 0)}")
+            if st.get('no_t_shells'):
+                L.append(f"  {len(st['no_t_shells'])} shell PID(s) next to bars have no known thickness (skipped as skin candidates):")
+                L.extend(_id_lines(sorted(st['no_t_shells'])))
+            cbeam = [r for r in brows if r.get('Element Type') == 'CBEAM']
+            if cbeam:
+                L.append(f"  NOTE: {len(cbeam)} computed bar(s) are CBEAM - this tool writes WA/WB only on CBAR cards, so CBEAM offsets are NOT applied to the BDF.")
+
+            L += ["", "=" * 78, "PROPERTIES (Excel -> BDF base model)", "=" * 78, ""]
+            L += self._property_report_lines()
+            path = os.path.join(folder, "offsets_log.txt")
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(L) + "\n")
+            self.log(f"    {label}Offset log: {path}")
+        except Exception as e:
+            self.log(f"    {label}(could not write offsets_log.txt: {e})")
+
     def _calculate_offset_csv(self, thickness_overrides, folder, label=""):
         """Write the maneuver (offset source) BDF at THIS iteration's
         thickness_overrides (layered on its Excel-properties base, same as any
@@ -5403,6 +5535,7 @@ class BarPropertySolverTab:
             return None
 
         t_offset_start = time.time()
+        stats = {'missing_landing': [], 'nopid_landing': [], 'dup_bars': 0, 'dup_added': 0, 'strap': 0, 'bar_types': {}}   # offsets_log.txt için
         man_folder = os.path.join(folder, "maneuver_for_offset")
         os.makedirs(man_folder, exist_ok=True)
         # Bu iterasyonun thickness_overrides'ını maneuver BDF'ine uygulayarak,
@@ -5422,6 +5555,7 @@ class BarPropertySolverTab:
             self.log(f"    {label}Maneuver BDF parsed for offsets in {time.time() - t_parse_start:.1f}s")
         except Exception as e:
             self.log(f"    {label}Offset calc error reading maneuver BDF: {e}")
+            self._offset_log_write(folder, stats, label, error=f"the maneuver BDF could not be read: {e}")
             return None
 
         try:
@@ -5460,10 +5594,12 @@ class BarPropertySolverTab:
 
             for eid in list(self.landing_elem_ids) + extra_comp:
                 if eid not in bdf.elements:
+                    stats['missing_landing'].append(eid)
                     continue
                 elem = bdf.elements[eid]
                 pid = elem.pid if hasattr(elem, 'pid') else None
                 if pid is None:
+                    stats['nopid_landing'].append(eid)
                     continue
 
                 # Bu PID'in etkin skin kalınlığını al (Excel öncelikli, yoksa BDF); yoksa 3.0 varsayılan.
@@ -5493,7 +5629,8 @@ class BarPropertySolverTab:
                 rows.append({'Type': 'Landing', 'Element': eid, 'ZOffset': zoffset,
                              'WA_X': '', 'WA_Y': '', 'WA_Z': '',
                              'PID': pid, 'Property': getattr(bdf.properties.get(pid), 'type', '?'), 'Thickness Used': t,
-                             'Source': 'Landing sheet' if eid in _in_sheet else 'PCOMP skin (Skin Property sheet)'})
+                             'Source': 'Landing sheet' if eid in _in_sheet else 'PCOMP skin (Skin Property sheet)',
+                             'Element Type': elem.type})
 
             # ---- Bar'ların oturabileceği SKIN shell'leri ----
             # Landing sheet'indeki shell'lere EK olarak, PID'i 'Skin Property' sheet'inde olan her CQUAD4/CTRIA3 de skin adayıdır
@@ -5789,7 +5926,13 @@ class BarPropertySolverTab:
                                      'Duplicate Bars': ' '.join(str(d) for d in dups) if dups else '',
                                      'Duplicate Dim1 Added': add_dim if dups else '',
                                      'PID': pid, 'Property': getattr(bdf.properties.get(pid), 'type', '?'), 'Thickness Used': max_t,
-                                     'Source': 'Bar_Offset sheet (Thickness Used = skin thickness)'})
+                                     'Source': 'Bar_Offset sheet (Thickness Used = skin thickness)',
+                                     'Element Type': elem.type})
+                        stats['bar_types'][elem.type] = stats['bar_types'].get(elem.type, 0) + 1
+                        stats['strap'] += 1 if my_strap else 0
+                        if dups:
+                            stats['dup_bars'] += 1
+                            stats['dup_added'] += 1 if add_dim else 0
                     elif common:
                         if not any(normal_of(sh) is not None for sh in common):
                             why = ("the shell(s) it sits on are neither in the Landing sheet nor have a PID in the Skin Property "
@@ -5813,6 +5956,9 @@ class BarPropertySolverTab:
                 self.log(f"    WARNING: {label}{len(no_t_shells)} shell PID(s) next to Bar_Offset bars have no known thickness "
                           f"(not in the Skin Property sheet and not a PSHELL/PCOMP) - these shells are skipped as skin "
                           f"candidates for the bar offset: {sorted(no_t_shells)[:15]}{' ...' if len(no_t_shells) > 15 else ''}")
+            stats.update(rows=rows, bar_skip=bar_skip, default_t_pids=default_t_pids, no_t_shells=no_t_shells,
+                         comp_pids=len(comp_skin_pids), csv_path=os.path.join(folder, 'offsets.csv') if rows else None)
+            self._offset_log_write(folder, stats, label)
             if not rows:
                 return None
 
@@ -5823,7 +5969,7 @@ class BarPropertySolverTab:
             with open(csv_path, 'w', newline='') as f:
                 w = csv.DictWriter(f, fieldnames=['Type', 'Element', 'ZOffset', 'WA_X', 'WA_Y', 'WA_Z',
                                                   'Duplicate Bars', 'Duplicate Dim1 Added',
-                                                  'PID', 'Property', 'Thickness Used', 'Source'])
+                                                  'PID', 'Property', 'Thickness Used', 'Source', 'Element Type'])
                 w.writeheader()
                 w.writerows(rows)
             n_land_comp = sum(1 for r in rows if r['Type'] == 'Landing' and r.get('Property') in ('PCOMP', 'PCOMPG'))
@@ -5833,6 +5979,7 @@ class BarPropertySolverTab:
 
         except Exception as e:
             self.log(f"    {label}Offset calc error: {e}")
+            self._offset_log_write(folder, stats, label, error=f"offset calculation failed: {e}")
             return None
 
     def _apply_offsets_from_csv(self, bdf_path, csv_path, folder, label=""):
@@ -5841,12 +5988,14 @@ class BarPropertySolverTab:
         <name>_offst.bdf in `folder`."""
         landing_offsets = {}
         bar_offsets = {}
+        etype = {}                      # eid -> eleman tipi (CSV'deki 'Element Type'; offsets_log.txt için)
         # offsets.csv'yi geri oku: Landing satırları {eid: zoffset}, Bar
         # satırları {eid: (WA_X, WA_Y, WA_Z)} sözlüklerine dönüştürülür.
         try:
             with open(csv_path, 'r', newline='') as f:
                 for row in csv.DictReader(f):
                     eid = int(row['Element'])
+                    etype[eid] = row.get('Element Type', '') or ''
                     if row['Type'] == 'Landing':
                         landing_offsets[eid] = float(row['ZOffset'])
                     elif row['Type'] == 'Bar':
@@ -5870,6 +6019,7 @@ class BarPropertySolverTab:
             i = 0
             applied_landing = 0
             applied_bar = 0
+            applied_l_ids, applied_b_ids = set(), set()
 
             while i < len(lines):
                 line = lines[i]
@@ -5883,7 +6033,7 @@ class BarPropertySolverTab:
                         if eid in landing_offsets:
                             padded = line.rstrip().ljust(72)
                             new_lines.append(padded[:64] + fmt(landing_offsets[eid]) + line.rstrip('\r\n')[72:] + '\n')   # [72:] = varsa devam işareti
-                            applied_landing += 1
+                            applied_landing += 1; applied_l_ids.add(eid)
                             i += 1
                             continue
                     except:
@@ -5898,7 +6048,7 @@ class BarPropertySolverTab:
                         if eid in landing_offsets:
                             padded = line.rstrip().ljust(64)
                             new_lines.append(padded[:56] + fmt(landing_offsets[eid]) + line.rstrip('\r\n')[64:] + '\n')
-                            applied_landing += 1
+                            applied_landing += 1; applied_l_ids.add(eid)
                             i += 1
                             continue
                     except:
@@ -5934,7 +6084,7 @@ class BarPropertySolverTab:
 
                                 new_lines.append(line)
                                 new_lines.append(new_cont)
-                                applied_bar += 1
+                                applied_bar += 1; applied_b_ids.add(eid)
                                 i += 2
                                 continue
                             else:
@@ -5957,7 +6107,7 @@ class BarPropertySolverTab:
                                 new_cont += '\n'
                                 new_lines.append(new_cont)
 
-                                applied_bar += 1
+                                applied_bar += 1; applied_b_ids.add(eid)
                                 i += 1
                                 continue
                     except:
@@ -5972,6 +6122,29 @@ class BarPropertySolverTab:
                 f.writelines(new_lines)
 
             self.log(f"    {label}Offsets applied from CSV: {applied_landing} landing, {applied_bar} bar")
+            try:    # offsets_log.txt'ye bu BDF için uygulama sonucunu ekle
+                miss_l = sorted(set(landing_offsets) - applied_l_ids)
+                miss_b = sorted(set(bar_offsets) - applied_b_ids)
+                beam_b = [e for e in miss_b if etype.get(e) == 'CBEAM']
+                oth_b = [e for e in miss_b if etype.get(e) != 'CBEAM']
+                LA = ["", "=" * 78, f"APPLIED TO BDF: {os.path.basename(output_bdf)}   ({datetime.now().strftime('%H:%M:%S')})", "=" * 78,
+                      f"  Landing: {applied_landing} of {len(landing_offsets)} offsets written (ZOFFS), {len(miss_l)} NOT applied",
+                      f"  Bar    : {applied_bar} of {len(bar_offsets)} offsets written (WA/WB), {len(miss_b)} NOT applied"]
+                if miss_l:
+                    LA.append(f"    {len(miss_l)} landing element(s) NOT applied - no fixed-format CQUAD4/CTRIA3 card with that id in THIS file "
+                              f"(defined in an INCLUDE'd file, in another BDF, free/large-field format, or another element type):")
+                    LA.extend(_id_lines(miss_l))
+                if beam_b:
+                    LA.append(f"    {len(beam_b)} CBEAM bar(s) NOT applied - this tool writes WA/WB only on CBAR cards:")
+                    LA.extend(_id_lines(beam_b))
+                if oth_b:
+                    LA.append(f"    {len(oth_b)} bar(s) NOT applied - no fixed-format CBAR card with that id in THIS file "
+                              f"(INCLUDE'd file, another BDF, free/large-field format):")
+                    LA.extend(_id_lines(oth_b))
+                with open(os.path.join(os.path.dirname(csv_path), "offsets_log.txt"), 'a', encoding='utf-8') as lf:
+                    lf.write("\n".join(LA) + "\n")
+            except Exception as e_:
+                self.log(f"    {label}(could not append to offsets_log.txt: {e_})")
             return output_bdf
 
         except Exception as e:

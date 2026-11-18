@@ -941,6 +941,89 @@ def _pf_duplicate_bar_checks(excel_path, maneuver_bdf, add, log=lambda m: None):
         add('info', f"Strap bar(s) without a duplicate bar: {lonely[:8]} - they are offset normally by their own section (C or I)")
 
 
+def _pf_scan_shells_bars(path):
+    """BDF'teki CQUAD4/CTRIA3 -> {eid: pid} ve CBAR/CBEAM -> {eid: kart adı} (metin taraması; sabit/serbest/büyük alan;
+    INCLUDE'lanan dosyalar taranmaz)."""
+    shells, bars = {}, {}
+    with open(path, 'r', encoding='latin-1', newline='') as f:
+        for line in f:
+            c0 = line[:1]
+            if c0 not in ('C', 'c'):
+                continue
+            name = line[:8].split(',')[0].strip().rstrip('*').upper()
+            if name not in ('CQUAD4', 'CTRIA3', 'CBAR', 'CBEAM'):
+                continue
+            try:
+                if ',' in line[:9]:
+                    parts = line.rstrip('\r\n').split(',')
+                    eid, pid = int(parts[1]), int(parts[2])
+                elif line[:8].rstrip().endswith('*'):
+                    eid, pid = int(line[8:24]), int(line[24:40])
+                else:
+                    eid, pid = int(line[8:16]), int(line[16:24])
+            except (ValueError, IndexError):
+                continue
+            if name in ('CBAR', 'CBEAM'):
+                bars[eid] = name
+            else:
+                shells[eid] = pid
+    return shells, bars
+
+
+def _pf_landing_ids(excel):
+    """Excel'de adında 'landing' geçen sayfaların ilk sütunundaki eleman ID'leri (load_element_ids ile aynı mantık)."""
+    ids = []
+    with pd.ExcelFile(excel) as xl:
+        for name in xl.sheet_names:
+            if 'landing' in _wf_norm(name):
+                df = pd.read_excel(xl, sheet_name=name)
+                ids = df.iloc[:, 0].dropna().astype(int).tolist()
+    return ids
+
+
+def _pf_offset_element_checks(excel_path, maneuver_bdf, prop_types, add, log=lambda m: None):
+    """Landing / Bar_Offset elemanlarının maneuver BDF'te bulunup bulunmadığı; otomatik eklenecek PCOMP skin shell sayısı.
+    Dönüş: eklenecek PCOMP/PCOMPG skin shell sayısı (ya da None)."""
+    land = _pf_landing_ids(excel_path)
+    bar_ids, _sec = _pf_bar_offset_info(excel_path)
+    if not land and not bar_ids:
+        return None
+    log("scanning shell/bar elements in the maneuver BDF ...")
+    shells, bars = _pf_scan_shells_bars(maneuver_bdf)
+    n_extra = None
+    if land:
+        in_sheet = set(land)
+        found = [e for e in land if e in shells]
+        by = {}
+        for e in found:
+            t = prop_types.get(shells[e]) or '?'
+            by[t] = by.get(t, 0) + 1
+        miss = [e for e in land if e not in shells]
+        skin = _pf_sheet_pids(excel_path, 'skinproperty')
+        comp_skin = {p for p in skin if prop_types.get(p) in ('PCOMP', 'PCOMPG')}
+        extra = [e for e, p in shells.items() if e not in in_sheet and p in comp_skin]
+        n_extra = len(extra)
+        add('info', f"Landing offsets: {len(land)} element(s) in the Landing sheet ({len(found)} found in the maneuver BDF: "
+                    + ", ".join(f"{k} {v}" for k, v in sorted(by.items())) + ") + "
+                    f"{len(extra)} PCOMP/PCOMPG skin shell(s) with a Skin Property PID that are not in the sheet = {len(found) + len(extra)} shell(s) "
+                    f"will get ZOFFS = -t/2")
+        if miss:
+            add('warn', f"Landing sheet: {len(miss)} of {len(land)} element(s) are not CQUAD4/CTRIA3 cards in the maneuver BDF itself "
+                        f"(may be in INCLUDE'd files) - e.g. {miss[:8]}")
+    if bar_ids:
+        a = [e for e in bar_ids if bars.get(e) == 'CBAR']
+        b = [e for e in bar_ids if bars.get(e) == 'CBEAM']
+        c = [e for e in bar_ids if e not in bars]
+        add('info', f"Bar_Offset: {len(bar_ids)} element(s) - {len(a)} CBAR, {len(b)} CBEAM, {len(c)} not found in the maneuver BDF itself")
+        if b:
+            add('warn', f"{len(b)} Bar_Offset element(s) are CBEAM - their offset is computed but NOT written to the BDF (only CBAR cards get WA/WB), "
+                        f"e.g. {b[:8]}")
+        if c:
+            add('warn', f"Bar_Offset: {len(c)} element(s) are not CBAR/CBEAM cards in the maneuver BDF itself (may be in INCLUDE'd files) - "
+                        f"e.g. {c[:8]}")
+    return n_extra
+
+
 def _pf_sheet_pids(excel, sheet_norm_key):
     """Excel'de (adı normalleştirilerek bulunan) sayfanın ilk sütunundaki tamsayı PID'ler."""
     out = set()
@@ -1122,6 +1205,13 @@ def _preflight_collect(app, key, tool, log=lambda m: None, snapshot=None):
                         _pf_duplicate_bar_checks(excel_path, man_bdfs[0], add, log)
                     except Exception as e:
                         add('warn', f"Duplicate bar check skipped: {e}")
+                    try:
+                        n_extra = _pf_offset_element_checks(excel_path, man_bdfs[0], scan['prop_types'], add, log)
+                        fn = getattr(tool, '_apply_landing_extra', None)
+                        if n_extra is not None and fn is not None and app is not None:
+                            app.root.after(0, lambda: fn(n_extra))        # Load durum yazısını ana iş parçacığında güncelle
+                    except Exception as e:
+                        add('warn', f"Landing/Bar offset element check skipped: {e}")
                 if key == 'improved_iterative':
                     try:
                         web = tool._read_web_property(excel_path)
@@ -4368,6 +4458,7 @@ class BarPropertySolverTab:
         self.original_bar_thicknesses = {} # PID -> original dim1 from BDF
         self.maneuver_base_path = None    # Excel-properties-applied maneuver (offset source) BDF, set by _build_base_model
         self.landing_elem_ids = []        # offset uygulanacak "landing" (göçme) eleman ID'leri
+        self.landing_extra_count = None   # Landing sheet'inde olmayan ama landing offseti alacak PCOMP skin shell sayısı (bilinince)
         self.bar_offset_elem_ids = []     # offset uygulanacak bar eleman ID'leri
         self.bar_section_types = {}       # eid -> "C"/"I"/... ("Section Type" sayfasından); eksikse simetrik (I gibi) kabul edilir
 
@@ -4753,6 +4844,24 @@ class BarPropertySolverTab:
             # değer olarak birleştir.
             self._refresh_effective_skin_thicknesses()
 
+            # Load durum yazısı: Landing sheet + otomatik eklenen PCOMP/PCOMPG skin shell sayısı (offset hesabıyla aynı kural)
+            try:
+                man0 = os.path.normcase(os.path.abspath(self.maneuver_bdfs[0])) if self.maneuver_bdfs else None
+                mdl = next((b['model'] for b in self.bdf_models if man0 and os.path.normcase(os.path.abspath(b['path'])) == man0), None) \
+                    or self.bdf_model
+                web = set(getattr(self, 'web_pids', set()))
+                comp = {p_ for p_ in self.skin_properties if p_ not in web
+                        and getattr(mdl.properties.get(p_), 'type', None) in ('PCOMP', 'PCOMPG')}
+                in_sheet = set(self.landing_elem_ids)
+                n_extra = sum(1 for e_, el_ in mdl.elements.items()
+                              if e_ not in in_sheet and el_.type in ('CQUAD4', 'CTRIA3') and getattr(getattr(el_, 'pid', None), 'pid', getattr(el_, 'pid', None)) in comp) \
+                    if comp and self.landing_elem_ids else None
+                if n_extra is not None:
+                    self.log(f"  Landing: {len(in_sheet)} in the sheet + {n_extra} PCOMP/PCOMPG skin shell(s) (Skin Property PIDs) = {len(in_sheet) + n_extra} offset shell(s)")
+                    self.root.after(0, lambda n_=n_extra: self._apply_landing_extra(n_))
+            except Exception as e_:
+                self.log(f"  (could not count the PCOMP skin shells: {e_})")
+
             self.log(f"  Shells: {shell_count}, Bars: {bar_count}")
             self.log(f"\n  Total BDF models loaded: {len(self.bdf_models)} "
                       f"(took {time.time() - t_load_start:.1f}s total)")
@@ -4981,15 +5090,28 @@ class BarPropertySolverTab:
             n_strap = sum(1 for v in self.bar_section_types.values() if _parse_section_type(v)[1])
             if n_strap:
                 self.log(f"  Strap bars (Section Type contains 'Strap'): {n_strap}")
-            self.elem_status.config(
-                text=f"Landing: {len(self.landing_elem_ids)}, Bar offset: {len(self.bar_offset_elem_ids)}, "
-                     f"Section types: {len(self.bar_section_types)}",
-                foreground="green"
-            )
+            self.landing_extra_count = None            # Landing listesi değişti: PCOMP skin ek sayısı yeniden hesaplanmalı
+            self.elem_status.config(text=self._elem_status_text(), foreground="green")
 
         except Exception as e:
             self.log(f"ERROR: {e}")
             self.elem_status.config(text="Error", foreground="red")
+
+    # _elem_status_text / _apply_landing_extra: 'Landing: N' yazısı yalnızca Landing sheet'ini sayar; Skin Property'de PID'i olan
+    # PCOMP/PCOMPG skin shell'leri de landing offseti aldığı için (offset hesabı), toplam BDF okununca ya da Check inputs'ta bilinir.
+    def _elem_status_text(self):
+        n = len(self.landing_elem_ids)
+        ex = getattr(self, 'landing_extra_count', None)
+        land = (f"Landing: {n} + {ex} PCOMP skin = {n + ex}" if ex is not None
+                else f"Landing: {n} (+ PCOMP skin shells: counted by Check inputs / when the BDF is loaded)")
+        return f"{land}, Bar offset: {len(self.bar_offset_elem_ids)}, Section types: {len(self.bar_section_types)}"
+
+    def _apply_landing_extra(self, n_extra):
+        self.landing_extra_count = int(n_extra)
+        try:
+            self.elem_status.config(text=self._elem_status_text(), foreground="green")
+        except Exception:
+            pass
 
     # ==================== BDF WRITING ====================
     def _write_bdf_for_model(self, folder, model, original_path, thickness_overrides):

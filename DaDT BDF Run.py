@@ -4080,6 +4080,44 @@ def _read_bdf_without_includes(bdf_obj, bdf_path, **read_kwargs):
     return bdf_obj, n_inc, t_copy
 
 
+def _file_is_free(path):
+    """Dosya başka bir süreç tarafından KİLİTLİ değilse True (Windows paylaşım ihlali -> PermissionError). Yoksa/okunamıyorsa da True."""
+    try:
+        with open(path, 'r+b'):
+            return True
+    except PermissionError:
+        return False
+    except OSError:
+        return True
+
+
+def _move_with_retry(src, dst, log=lambda m: None, timeout=900, poll=10):
+    """shutil.move, ama dosya başka bir süreçte (Nastran'ın son kapanışı, antivirüs taraması...) açıksa WinError 32 ile
+    ÇÖKMEZ: timeout sn boyunca poll sn arayla yeniden dener. Kopya tamamlanıp yalnız kaynağı silmek kalmışsa onu dener,
+    yarım kalmış hedef kopyayı siler."""
+    t0 = time.time()
+    last_log = -1e9
+    while True:
+        try:
+            return shutil.move(src, dst)
+        except PermissionError as e:
+            if os.path.exists(src) and os.path.exists(dst):
+                try:
+                    if os.path.getsize(src) == os.path.getsize(dst):       # kopya tamam, yalnız kaynağı silme kaldı
+                        os.remove(src)
+                        return dst
+                    os.remove(dst)                                          # yarım kalmış kopya
+                except OSError:
+                    pass
+            if time.time() - t0 >= timeout:
+                raise
+            if time.time() - last_log >= 60:
+                last_log = time.time()
+                log(f"    {os.path.basename(src)} is still in use by another process (Nastran closing it / antivirus) - "
+                    f"waiting ({int(time.time() - t0)}s of {timeout}s) ...")
+            time.sleep(poll)
+
+
 def _id_lines(ids, indent="        ", per=10, cap=5000):
     """ID listesini satırlara böler (offsets_log.txt için); cap'ten fazlası '... and N more' ile kısaltılır."""
     ids = list(ids)
@@ -6721,6 +6759,14 @@ class BarPropertySolverTab:
                 if 'END OF JOB' in tail:
                     op2_dir, op2_path = _find_op2()
                     if op2_path:
+                        # f06'daki 'END OF JOB' ile Nastran'ın .op2'yi KAPATMASI arasında kısa bir aralık olabilir (büyük dosya);
+                        # sonraki aşama (OP2'yi taşıma/okuma) hemen başlarsa WinError 32 verir. Dosya serbest kalana kadar bekle.
+                        t_free = time.time()
+                        while not _file_is_free(op2_path) and time.time() - t_free < getattr(self, '_op2_free_timeout', 900):
+                            if int(time.time() - t_free) % 30 < poll_interval:
+                                self.log(f"    {label}...waiting for Nastran to release {os.path.basename(op2_path)} "
+                                          f"({int(time.time() - t_free)}s)")
+                            time.sleep(poll_interval)
                         # .op2 beklenen çıktı klasöründe değilse (scratch
                         # klasörüne yazılmışsa), beklenen yere kopyala -
                         # sonraki aşamalar (OP2->H5 dönüşümü vb.) onu hep
@@ -9337,7 +9383,7 @@ class FullRunTab:
                     dst = os.path.join(dest_folder, f"{base}_{i}{ext}")
                     i += 1
                 self.log(f"    NOTE: name collision, {fn} -> {os.path.basename(dst)}")
-            shutil.move(src, dst)
+            _move_with_retry(src, dst, self.log)
             moved += 1
         return moved
 
@@ -10104,7 +10150,7 @@ class IterativeFullRunTab:
                     dst = os.path.join(dest_folder, f"{base}_{i}{ext}")
                     i += 1
                 self.log(f"    NOTE: name collision, {fn} -> {os.path.basename(dst)}")
-            shutil.move(src, dst)
+            _move_with_retry(src, dst, self.log)
             moved += 1
         return moved
 

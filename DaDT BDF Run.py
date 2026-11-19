@@ -8013,7 +8013,8 @@ class PostProcessingTab:
                     warnings.append(f"stalled for {self._LE_STALL_WINDOW_SECONDS / 60:g} min - processes killed"
                                     + ("" if free else " (some processes may still be alive - their files may be locked)"))
                     return {'name': name, 'rc': None, 'seconds': time.time() - t0, 'tree_checked': True, 'warnings': warnings,
-                            'n_expected': len(expected_sets or []), 'n_found': 0, 'stalled': True}
+                            'n_expected': len(expected_sets or []), 'n_found': 0, 'stalled': True,
+                            'stall_mem': stalled['mem'], 'stall_pids': st['pids'], 'killed_clean': bool(free)}
         tree_checked, waited = True, 0
         while True:                                                # (2) çocuk process'ler
             alive = self._alive_descendants(proc.pid)
@@ -8091,6 +8092,30 @@ class PostProcessingTab:
 
         import queue
         msgs = queue.Queue()               # worker'lar log YAZMAZ, mesajı kuyruğa koyar; sadece orkestratör thread'i yazar
+
+        # ---- Yeniden başlatma günlüğü: Load Extraction ana klasörüne (LoadExtraction_NN klasörlerinin bulunduğu klasör) yazılır ----
+        base_dir = os.path.dirname(os.path.normpath(group_folders[0]))
+        restart_log = os.path.join(base_dir, "load_extraction_restart_log.txt")
+        ev_lock = threading.Lock()
+        hist = {}                          # grup adı -> {'last': son deneme no, 'reasons': [...], 'result': ...}
+
+        def _event(name, text):
+            try:
+                with ev_lock:
+                    with open(restart_log, 'a', encoding='utf-8') as lf:
+                        lf.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {name}: {text}\n")
+            except OSError:
+                pass
+        try:
+            with ev_lock:
+                with open(restart_log, 'a', encoding='utf-8') as lf:
+                    lf.write(f"\n==== Load Extraction {time.strftime('%Y-%m-%d %H:%M:%S')} | {len(jobs)} group(s) | up to {max_parallel} at a time | "
+                             f"{attempts - 1} restart(s) allowed, {_LE_RETRY_WAIT_SECONDS / 60:g} min wait before each | stall watchdog: "
+                             + (f"{self._LE_STALL_WINDOW_SECONDS / 60:g} min" if self._LE_STALL_WINDOW_SECONDS > 0 else "off")
+                             + f" | first attempt no. {start_attempt} ====\n")
+            self.log(f"  Restart log (which group was restarted and why): {restart_log}")
+        except OSError:
+            pass
         start_lock = threading.Lock()
         last_start = [None]
         started = []
@@ -8116,9 +8141,13 @@ class PostProcessingTab:
             return proc, log_file
 
         def _work(job):
+            name = job['name']
+            h = hist.setdefault(name, {'last': 0, 'reasons': [], 'result': 'running'})
             try:
                 _stage_le_exe(exe_path, job['dest'])               # bu grubun kendi exe kopyası (kilitten ÖNCE: kopyalar paralel yapılabilir)
             except OSError as e:
+                h['result'] = 'NOT STARTED'
+                _event(name, f"NOT STARTED - could not copy {exe_name} into the group folder: {e}")
                 return {'name': job['name'], 'rc': None, 'seconds': 0.0, 'tree_checked': True,
                         'warnings': [f"could not copy {exe_name} into the group folder: {e}"], 'n_expected': 0, 'n_found': 0,
                         'failed_start': True}
@@ -8130,15 +8159,25 @@ class PostProcessingTab:
                     if attempt == start_attempt:
                         msgs.put(f"    [retry {attempt - 1}/{attempts - 1}] {job['name']}: '{_LE_OK_JOINT}' is NOT in the load-ext_log file "
                                  f"- waiting {_LE_RETRY_WAIT_SECONDS / 60:g} min, then running the bat again")
+                    if attempt == start_attempt:
+                        _event(name, f"RESTART {attempt - 1}/{attempts - 1} - the first (untracked) run left no '{_LE_OK_JOINT}' line in its load-ext_log file; "
+                                     f"waiting {_LE_RETRY_WAIT_SECONDS / 60:g} min before restarting")
+                        h['reasons'].append(f"run 1: no success line (not tracked)")
                     time.sleep(_LE_RETRY_WAIT_SECONDS)
                     # Yeniden başlatmadan önce o klasördeki yarım kalmış .h5'leri ve eski log'ları sil (temiz başlangıç).
                     n_h5, n_lg, bad = _clean_le_outputs(job['dest'])
+                    _event(name, f"cleaned the folder: deleted {n_h5} .h5 file(s) and {n_lg} log file(s)"
+                                 + (f"; {len(bad)} could NOT be deleted: {', '.join(os.path.basename(b) for b in bad[:5])}" if bad else ""))
                     msgs.put(f"    [clean] {job['name']}: deleted {n_h5} .h5 file(s) and {n_lg} log file(s) before restarting"
                              + (f" - {len(bad)} could NOT be deleted: {', '.join(os.path.basename(b) for b in bad[:3])}" if bad else ""))
                 t_attempt = time.time()
                 got = _launch(job, attempt)
+                h['last'] = attempt
                 if isinstance(got, dict):
+                    h['result'] = 'NOT STARTED'
+                    _event(name, f"attempt {attempt}/{attempts}: NOT STARTED - {got['warnings'][0] if got.get('warnings') else 'unknown error'}")
                     return got
+                _event(name, f"attempt {attempt}/{attempts}: started")
                 proc, log_file = got
                 if attempt == start_attempt:
                     msgs.put(f"    [start] {job['name']}  ({len(started)}/{len(jobs)} started)")
@@ -8150,8 +8189,27 @@ class PostProcessingTab:
                 if _le_success(_LE_OK_JOINT, job['log'], [(job['dest'], True)], since=t_attempt):
                     if attempt > 1:
                         msgs.put(f"    [retry OK] {job['name']}: succeeded on attempt {attempt}")
+                    _event(name, f"attempt {attempt}/{attempts}: SUCCESS - '{_LE_OK_JOINT}' found after {time.time() - t_attempt:.0f}s"
+                                 + (f" (after {attempt - 1} restart(s))" if attempt > 1 else ""))
+                    h['result'] = 'OK' + (f" after {attempt - 1} restart(s)" if attempt > 1 else "")
                     break
+                # --- başarısız deneme: NEDEN? ---
+                if res.get('stalled'):
+                    reason = (f"STALLED - no CPU, memory or log/.h5 change for {self._LE_STALL_WINDOW_SECONDS / 60:g} min "
+                              f"(memory {res.get('stall_mem', 0) / 1048576:,.0f} MB, {res.get('stall_pids', '?')} process(es)); all processes of this "
+                              f"folder were killed" + ("" if res.get('killed_clean', True) else " (WARNING: some may still be alive)"))
+                    short = "stalled (processes killed)"
+                else:
+                    reason = (f"the exe ended without '{_LE_OK_JOINT}' in its load-ext_log file (exit code {res.get('rc')}, "
+                              f"ran {time.time() - t_attempt:.0f}s) - e.g. memory could not be set")
+                    short = f"no success line (exit code {res.get('rc')})"
+                _event(name, f"attempt {attempt}/{attempts}: FAILED - {reason}")
+                for ln in _le_failure_tail([job['log']] + _find_exe_logs(job['dest'], True, t_attempt), 3):
+                    _event(name, f"    > {ln}")
+                h['reasons'].append(f"attempt {attempt}: {short}")
                 if attempt < attempts:
+                    _event(name, f"RESTART {attempt}/{attempts - 1} scheduled - waiting {_LE_RETRY_WAIT_SECONDS / 60:g} min, then this folder's .h5 "
+                                 f"files and logs are deleted and the exe is started again")
                     for ln in _le_failure_tail([job['log']] + _find_exe_logs(job['dest'], True, t_attempt), 3):   # log silinmeden önce hata özeti
                         msgs.put(f"      (failed attempt {attempt}) {ln}")
                     msgs.put(f"    [retry {attempt}/{attempts - 1}] {job['name']}: '{_LE_OK_JOINT}' is NOT in the load-ext_log file "
@@ -8159,6 +8217,8 @@ class PostProcessingTab:
                              f"{_LE_RETRY_WAIT_SECONDS / 60:g} min, then running the bat again")
                 else:
                     res['warnings'].append(f"'{_LE_OK_JOINT}' not found in the load-ext_log file after {attempt} attempt(s) - giving up on this group")
+                    h['result'] = f"FAILED - gave up after {attempt} attempt(s)"
+                    _event(name, f"GAVE UP after {attempt} attempt(s) - no more restarts")
             res['seconds'] = time.time() - t_job
             res['attempts'] = attempt
             return res
@@ -8199,6 +8259,22 @@ class PostProcessingTab:
                       "check was skipped; completion rests on the bat process and the output files.")
         self.log(f"\n  LOAD EXTRACTION: {len(results)}/{len(jobs)} group(s) finished, {n_warn} with warnings "
                   f"(took {time.time() - t_start:.1f}s)")
+        try:                                                      # yeniden başlatma günlüğünün sonuna özet tablo
+            restarted = [j['name'] for j in jobs if hist.get(j['name'], {}).get('last', 1) > 1]
+            with ev_lock:
+                with open(restart_log, 'a', encoding='utf-8') as lf:
+                    lf.write(f"---- SUMMARY {time.strftime('%Y-%m-%d %H:%M:%S')} ----\n"
+                             f"{'group':<24}{'attempts':>9}{'restarts':>10}  result\n")
+                    for j in jobs:
+                        hh = hist.get(j['name'], {'last': 0, 'reasons': [], 'result': 'not run'})
+                        lf.write(f"{j['name']:<24}{hh['last']:>9}{max(0, hh['last'] - 1):>10}  {hh['result']}\n")
+                        for r in hh['reasons']:
+                            lf.write(f"{'':<24}  - {r}\n")
+                    lf.write(f"Restarted groups: {len(restarted)} of {len(jobs)}"
+                             + (f" ({', '.join(restarted[:20])}{' ...' if len(restarted) > 20 else ''})" if restarted else "") + "\n")
+            self.log(f"  Restarted groups: {len(restarted)} of {len(jobs)} - details: {restart_log}")
+        except OSError:
+            pass
         return n_started, n
 
     # _le_retry_missing_groups: 'Max Parallel Runs' BOŞ (fire-and-forget) modunda gruplar izlenmeden başlatılır; hepsi bittikten sonra

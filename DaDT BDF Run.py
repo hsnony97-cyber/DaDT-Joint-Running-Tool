@@ -4080,6 +4080,37 @@ def _read_bdf_without_includes(bdf_obj, bdf_path, **read_kwargs):
     return bdf_obj, n_inc, t_copy
 
 
+def _stage_le_exe(exe_path, dest_folder):
+    """Load Extraction exe'sinin o gruba ÖZEL kopyasını grup klasörüne koyar (aynı boyutta zaten varsa tekrar kopyalamaz).
+    Dönüş: kopyanın yolu."""
+    dst = os.path.join(dest_folder, os.path.basename(exe_path))
+    if os.path.isfile(dst) and os.path.getsize(dst) == os.path.getsize(exe_path):
+        return dst
+    shutil.copy2(exe_path, dst)
+    return dst
+
+
+def _delete_copied_le_exes(le_results_dir, exe_path):
+    """Her LoadExtraction_NN klasörüne kopyalanan Load Extraction exe'sini siler (kaynak exe'ye asla dokunmaz).
+    Dönüş: silinen kopya sayısı."""
+    if not exe_path or not le_results_dir or not os.path.isdir(le_results_dir):
+        return 0
+    name, src_real, n = os.path.basename(exe_path), os.path.realpath(exe_path), 0
+    for d in os.listdir(le_results_dir):
+        target = os.path.join(le_results_dir, d, name)
+        if not d.lower().startswith('loadextraction_') or not os.path.isfile(target) or os.path.realpath(target) == src_real:
+            continue
+        for attempt in range(4):                  # exe hâlâ çalışıyorsa (silinemez) kısa süre bekle, sonra bırak
+            try:
+                os.remove(target)
+                n += 1
+                break
+            except OSError:
+                if attempt < 3:
+                    time.sleep(3)
+    return n
+
+
 def _file_is_free(path):
     """Dosya başka bir süreç tarafından KİLİTLİ değilse True (Windows paylaşım ihlali -> PermissionError). Yoksa/okunamıyorsa da True."""
     try:
@@ -7604,18 +7635,24 @@ class PostProcessingTab:
                 self.root.after(0, lambda p=66 + (idx / n) * 34: self.progress_var.set(p))
                 continue
 
+            # Her grubun KENDİ exe kopyası kendi klasöründe çalışır (bat'taki cd de o klasör).
+            try:
+                group_exe = _stage_le_exe(exe_path, dest_folder)
+            except OSError as e:
+                self.log(f"    ERROR: could not copy {exe_name} into {dest_folder}: {e} - skipping this group.")
+                continue
             # Load_Ext_H5.exe'ye verilecek sabit komut satırı argümanları -
             # bu gruba özgü olan tek şey --xls (bu grubun TF-X Excel'i).
             cmd_line = (
-                f'{exe_name} --mode "Joint" --bdf "{maneuver_bdf}" --sprung-bdf "{thermal_bdf}" '
+                f'"{group_exe}" --mode "Joint" --bdf "{maneuver_bdf}" --sprung-bdf "{thermal_bdf}" '
                 f'--xls "{tfx_path}" --cid "Material" --nsigma "1.28" --pickle "{pickle_path}" '
                 f'--preproc "HM" --stress_output "NO" --output_coord "Buckling" --skin-angle-limit "30" '
                 f'--max-memory {max_memory} --machine "Local"'
             )
             bat_path = os.path.join(dest_folder, "loadext.bat")
             with open(bat_path, 'w', encoding='latin-1') as f:
-                f.write(f'cd /d "{exe_dir}"\n{cmd_line}\n')
-            self.log(f"    Batch file written: {bat_path}")
+                f.write(f'cd /d "{dest_folder}"\n{cmd_line}\n')
+            self.log(f"    {exe_name} copied into the group folder; batch file written: {bat_path}")
 
             # Popen (subprocess.run DEĞİL) ile "fırlat ve unut" (fire and
             # forget) şeklinde başlat - bu TF-X analizi dakikalarca/saatlerce
@@ -7624,7 +7661,7 @@ class PostProcessingTab:
             log_path = os.path.join(dest_folder, "loadext_log.txt")
             try:
                 log_file = open(log_path, 'w')
-                subprocess.Popen(["cmd", "/c", bat_path], cwd=exe_dir, stdout=log_file, stderr=subprocess.STDOUT,
+                subprocess.Popen(["cmd", "/c", bat_path], cwd=dest_folder, stdout=log_file, stderr=subprocess.STDOUT,
                                  creationflags=_NO_WINDOW)
                 self.log(f"    Launched (output -> {log_path})")
                 n_started += 1
@@ -7778,15 +7815,18 @@ class PostProcessingTab:
             if not tfx_path:
                 self.log(f"  ERROR: {name}: no '...Load_Extraction....xls*' file found - skipping.")
                 continue
+            # Her grubun KENDİ exe kopyası kendi klasöründe çalışır: bat'taki cd o klasör, exe'nin kopyası da orada (kopya, işin
+            # başlamasından hemen önce _work içinde yapılır).
+            group_exe = os.path.join(dest_folder, exe_name)
             cmd_line = (
-                f'{exe_name} --mode "Joint" --bdf "{maneuver_bdf}" --sprung-bdf "{thermal_bdf}" '
+                f'"{group_exe}" --mode "Joint" --bdf "{maneuver_bdf}" --sprung-bdf "{thermal_bdf}" '
                 f'--xls "{tfx_path}" --cid "Material" --nsigma "1.28" --pickle "{pickle_path}" '
                 f'--preproc "HM" --stress_output "NO" --output_coord "Buckling" --skin-angle-limit "30" '
                 f'--max-memory {max_memory} --machine "Local"'
             )
             bat_path = os.path.join(dest_folder, "loadext.bat")
             with open(bat_path, 'w', encoding='latin-1') as f:
-                f.write(f'cd /d "{exe_dir}"\n{cmd_line}\n')
+                f.write(f'cd /d "{dest_folder}"\n{cmd_line}\n')
             jobs.append({'idx': i + 1, 'name': name, 'dest': dest_folder, 'bat': bat_path,
                          'log': os.path.join(dest_folder, "loadext_log.txt"),
                          'expected': group_sets.get(dest_folder)})
@@ -7802,6 +7842,12 @@ class PostProcessingTab:
         started = []
 
         def _work(job):
+            try:
+                _stage_le_exe(exe_path, job['dest'])               # bu grubun kendi exe kopyası (kilitten ÖNCE: kopyalar paralel yapılabilir)
+            except OSError as e:
+                return {'name': job['name'], 'rc': None, 'seconds': 0.0, 'tree_checked': True,
+                        'warnings': [f"could not copy {exe_name} into the group folder: {e}"], 'n_expected': 0, 'n_found': 0,
+                        'failed_start': True}
             with start_lock:                                       # başlatmalar arası en az _LE_START_STAGGER sn
                 if last_start[0] is not None:
                     wait = self._LE_START_STAGGER - (time.time() - last_start[0])
@@ -7809,7 +7855,7 @@ class PostProcessingTab:
                         time.sleep(wait)
                 try:
                     log_file = open(job['log'], 'w')
-                    proc = subprocess.Popen(["cmd", "/c", job['bat']], cwd=exe_dir, stdout=log_file,
+                    proc = subprocess.Popen(["cmd", "/c", job['bat']], cwd=job['dest'], stdout=log_file,
                                             stderr=subprocess.STDOUT,
                                             creationflags=_NO_WINDOW)
                 except Exception as e:
@@ -9673,6 +9719,9 @@ class FullRunTab:
             # tasklist ile bekle, çünkü Joint Run'ın H5 taraması onların
             # Joint_Loads_*.h5 çıktısına bağımlı.
             self._wait_for_exe_to_finish(os.path.basename(self.le_exe_path.get().strip()))
+            # Load Extraction bitti: her LoadExtraction_NN klasörüne kopyalanan exe'leri sil (kaynak exe'ye dokunulmaz).
+            n_le_exe = _delete_copied_le_exes(le_results_dir, self.le_exe_path.get().strip())
+            self.log(f"  Deleted {n_le_exe} copied Load Extraction exe(s) from the LoadExtraction_NN folders")
             self.root.after(0, lambda: self.progress_var.set(70))
 
             # ==================== STAGE C: JOINT RUN ====================
@@ -11064,6 +11113,9 @@ class IterativeFullRunTab:
                 # taraması bunların çıktısına bağımlı olduğundan, hepsinin
                 # gerçekten bitmesini bekle.
                 self._wait_for_exe_to_finish(os.path.basename(self.le_exe_path.get().strip()))
+                # Load Extraction bitti: her LoadExtraction_NN klasörüne kopyalanan exe'leri sil (kaynak exe'ye dokunulmaz).
+                n_le_exe = _delete_copied_le_exes(le_results_dir, self.le_exe_path.get().strip())
+                self.log(f"  Deleted {n_le_exe} copied Load Extraction exe(s) from the LoadExtraction_NN folders")
 
                 # ---- STAGE C: JOINT RUN ----
                 # FullRunTab ile aynı mantık: t5 nesnesinin alanlarını doldur
@@ -12474,6 +12526,9 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
                 # taraması bunların çıktısına bağımlı olduğundan, hepsinin
                 # gerçekten bitmesini bekle.
                 self._wait_for_exe_to_finish(os.path.basename(self.le_exe_path.get().strip()))
+                # Load Extraction bitti: her LoadExtraction_NN klasörüne kopyalanan exe'leri sil (kaynak exe'ye dokunulmaz).
+                n_le_exe = _delete_copied_le_exes(le_results_dir, self.le_exe_path.get().strip())
+                self.log(f"  Deleted {n_le_exe} copied Load Extraction exe(s) from the LoadExtraction_NN folders")
 
                 # ---- STAGE C: JOINT RUN ----
                 # FullRunTab ile aynı mantık: t5 nesnesinin alanlarını doldur

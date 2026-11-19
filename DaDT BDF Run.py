@@ -7792,6 +7792,14 @@ class PostProcessingTab:
     _LE_POLL_SECONDS = 10        # çocuk process'leri kontrol aralığı (sn)
     _LE_OUTPUT_GRACE = 180       # bat bittikten sonra çıktıların diske yazılması için tanınan süre (sn)
     _LE_STABLE_POLL = 5          # dosya boyutu sabitlik kontrol aralığı (sn)
+    # TAKILMA BEKÇİSİ: bir grubun süreçleri (bat + exe + çocukları) _LE_STALL_WINDOW_SECONDS boyunca (1) CPU harcamıyor (toplam CPU süresi
+    # artışı < _LE_STALL_CPU_SECONDS), (2) belleği sabit (değişim < _LE_STALL_MEM_BYTES) VE (3) o klasörde log/.h5 dosyası değişmiyorsa
+    # "takıldı" sayılır: grubun TÜM süreçleri sonlandırılır ve grup, başarı satırı olmayan gruplar gibi (bekle, .h5+log sil, yeniden başlat) tekrarlanır.
+    _LE_STALL_WINDOW_SECONDS = 30 * 60   # 0 = bekçi kapalı
+    _LE_STALL_POLL_SECONDS = 60          # süreç istatistiklerinin örnekleme aralığı (sn)
+    _LE_EXIT_POLL_SECONDS = 2            # bat'ın bitip bitmediğine bakma aralığı (sn)
+    _LE_STALL_CPU_SECONDS = 20           # pencere içinde bundan az CPU süresi = boşta
+    _LE_STALL_MEM_BYTES = 64 * 1024 * 1024   # pencere içinde bundan az bellek değişimi = sabit
 
     # _process_table: {pid: parent_pid} (tüm süreçler) ya da okunamazsa None.
     # Windows: PowerShell CIM; olmazsa wmic. Ek paket gerekmez.
@@ -7857,11 +7865,155 @@ class PostProcessingTab:
                     files.append(os.path.join(dirpath, fn))
         return files
 
-    # _le_wait_group: başlatılmış bir grubun bitişini 3 kontrolle bekler; sonuç sözlüğü döner.
-    def _le_wait_group(self, name, dest_folder, proc, expected_sets):
+    # ---- TAKILMA BEKÇİSİ yardımcıları ----
+    # _proc_snapshot: tüm süreçlerin {pid, ppid, bellek, CPU süresi, exe yolu, komut satırı} listesi (PowerShell CIM; en fazla max_age sn
+    # eski bir kopya paylaşılır ki 35 grup 35 ayrı PowerShell çağrısı yapmasın). Okunamazsa None (Windows dışı dahil).
+    _snap_lock = threading.Lock()
+    _snap_cache = (0.0, None)
+
+    @classmethod
+    def _proc_snapshot(cls, max_age=20):
+        with cls._snap_lock:
+            if cls._snap_cache[1] is not None and time.time() - cls._snap_cache[0] <= max_age:
+                return cls._snap_cache[1]
+            try:
+                res = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-CimInstance Win32_Process | Select-Object "
+                     "ProcessId,ParentProcessId,WorkingSetSize,KernelModeTime,UserModeTime,ExecutablePath,CommandLine | ConvertTo-Json -Compress"],
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120, creationflags=_NO_WINDOW)
+                data = json.loads(res.stdout)
+                data = [data] if isinstance(data, dict) else data
+                cls._snap_cache = (time.time(), data)
+                return data
+            except Exception:
+                return None
+
+    # _le_group_pids: bir grubun TÜM süreçleri: bat'ın torunları + exe yolu ya da komut satırı bu grup klasörünü gösterenler.
+    # Her grubun kendi exe kopyası olduğu için (<grup>\Load_Ext_H5.exe) ayrım kesindir; bat'ı çıksa bile yetim exe bulunur.
+    def _le_group_pids(self, dest_folder, root_pid, max_age=20):
+        snap = self._proc_snapshot(max_age)
+        if snap is None:
+            return None, None
+        g = os.path.normpath(dest_folder).lower().replace('/', '\\').rstrip('\\') + '\\'
+        me = os.getpid()
+        children, info = {}, {}
+        for e in snap:
+            try:
+                pid, ppid = int(e.get('ProcessId')), int(e.get('ParentProcessId') or 0)
+            except (TypeError, ValueError):
+                continue
+            info[pid] = e
+            children.setdefault(ppid, []).append(pid)
+        pids, stack = set(), [root_pid]
+        while stack:
+            cur = stack.pop()
+            for c in children.get(cur, []):
+                if c not in pids:
+                    pids.add(c)
+                    stack.append(c)
+        if root_pid in info:
+            pids.add(root_pid)
+        for pid, e in info.items():
+            exe = str(e.get('ExecutablePath') or '').lower().replace('/', '\\')
+            cmd = str(e.get('CommandLine') or '').lower().replace('/', '\\')
+            if exe.startswith(g) or g in cmd:
+                pids.add(pid)
+        pids.discard(me)
+        return pids, info
+
+    # _le_group_stats: {'cpu': toplam CPU saniyesi, 'mem': toplam çalışma kümesi (bayt), 'pids': süreç sayısı} ya da None (okunamadı/süreç yok).
+    def _le_group_stats(self, dest_folder, root_pid):
+        pids, info = self._le_group_pids(dest_folder, root_pid)
+        if not pids:
+            return None
+        cpu = mem = 0
+        for pid in pids:
+            e = info.get(pid) or {}
+            try:
+                cpu += (int(e.get('KernelModeTime') or 0) + int(e.get('UserModeTime') or 0)) / 1e7
+                mem += int(e.get('WorkingSetSize') or 0)
+            except (TypeError, ValueError):
+                continue
+        return {'cpu': cpu, 'mem': mem, 'pids': len(pids)}
+
+    # _le_kill_group: grubun TÜM süreçlerini (ağaçlarıyla) sonlandırır; hiçbiri kalmayana kadar (en fazla ~90 sn) tekrarlar, çünkü
+    # süreç yaşarken .h5 dosyaları silinemez. Dönüş: True = grupta süreç kalmadı.
+    def _le_kill_group(self, dest_folder, root_pid):
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            pids, _info = self._le_group_pids(dest_folder, root_pid, max_age=0)
+            if pids is None:                                       # süreç tablosu okunamadı: en azından bat ağacını kapat
+                subprocess.run(["taskkill", "/PID", str(root_pid), "/T", "/F"], capture_output=True, creationflags=_NO_WINDOW)
+                time.sleep(5)
+                return False
+            if not pids:
+                return True
+            for pid in sorted(pids):
+                try:
+                    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, creationflags=_NO_WINDOW)
+                except Exception:
+                    pass
+            time.sleep(3)
+        return False
+
+    # _le_is_stalled: örnekler [(zaman, cpu_sn, bellek_bayt)] son _LE_STALL_WINDOW_SECONDS boyunca CPU ve bellek değişmiyorsa VE grup
+    # klasöründe aynı süre log/.h5 değişmediyse {'mem':..., 'idle_min':...} döner, değilse None.
+    def _le_is_stalled(self, samples, now, dest_folder, t_start):
+        window = self._LE_STALL_WINDOW_SECONDS
+        recent = [x for x in samples if x[0] >= now - window - self._LE_STALL_POLL_SECONDS]
+        if len(recent) < 2 or recent[-1][0] - recent[0][0] < window - self._LE_STALL_POLL_SECONDS * 1.01:
+            return None
+        cpu, mem = [x[1] for x in recent], [x[2] for x in recent]
+        if max(cpu) - min(cpu) >= self._LE_STALL_CPU_SECONDS or max(mem) - min(mem) >= self._LE_STALL_MEM_BYTES:
+            return None
+        last = t_start
+        for dp, _dn, fs in os.walk(dest_folder):
+            for fn in fs:
+                low = fn.lower()
+                if low.endswith('.h5') or (low.endswith(('.txt', '.log')) and 'loadextlog' in re.sub(r'[-_\s]', '', low)):
+                    try:
+                        last = max(last, os.path.getmtime(os.path.join(dp, fn)))
+                    except OSError:
+                        pass
+        if now - last < window:
+            return None
+        return {'mem': recent[-1][2], 'idle_min': (now - last) / 60}
+
+    # _le_wait_group: başlatılmış bir grubun bitişini 3 kontrolle bekler (+ takılma bekçisi); sonuç sözlüğü döner.
+    def _le_wait_group(self, name, dest_folder, proc, expected_sets, notify=None):
         t0 = time.time()
         warnings = []
-        rc = proc.wait()                                           # (1) bat süreci
+        poll = getattr(proc, 'poll', None)
+        if poll is None or self._LE_STALL_WINDOW_SECONDS <= 0:
+            rc = proc.wait()                                       # (1) bat süreci
+        else:
+            samples, next_sample, stalled = [], t0 + self._LE_STALL_POLL_SECONDS, None
+            while True:
+                rc = poll()
+                if rc is not None:
+                    break
+                time.sleep(self._LE_EXIT_POLL_SECONDS)
+                if time.time() < next_sample:
+                    continue
+                next_sample = time.time() + self._LE_STALL_POLL_SECONDS
+                st = self._le_group_stats(dest_folder, proc.pid)
+                if not st:
+                    continue
+                now = time.time()
+                samples.append((now, st['cpu'], st['mem']))
+                samples = [x for x in samples if now - x[0] <= self._LE_STALL_WINDOW_SECONDS * 1.5]
+                stalled = self._le_is_stalled(samples, now, dest_folder, t0)
+                if stalled:
+                    msg = (f"{name}: STALLED - no CPU, memory or log/H5 change for {self._LE_STALL_WINDOW_SECONDS / 60:g} min "
+                           f"(memory {stalled['mem'] / 1048576:,.0f} MB, {st['pids']} process(es)) - killing ALL of its processes")
+                    if notify:
+                        notify(f"    [stalled] {msg}")
+                    free = self._le_kill_group(dest_folder, proc.pid)
+                    warnings.append(f"stalled for {self._LE_STALL_WINDOW_SECONDS / 60:g} min - processes killed"
+                                    + ("" if free else " (some processes may still be alive - their files may be locked)"))
+                    return {'name': name, 'rc': None, 'seconds': time.time() - t0, 'tree_checked': True, 'warnings': warnings,
+                            'n_expected': len(expected_sets or []), 'n_found': 0, 'stalled': True}
         tree_checked, waited = True, 0
         while True:                                                # (2) çocuk process'ler
             alive = self._alive_descendants(proc.pid)
@@ -7991,7 +8143,7 @@ class PostProcessingTab:
                 if attempt == start_attempt:
                     msgs.put(f"    [start] {job['name']}  ({len(started)}/{len(jobs)} started)")
                 try:
-                    res = self._le_wait_group(job['name'], job['dest'], proc, job['expected'])
+                    res = self._le_wait_group(job['name'], job['dest'], proc, job['expected'], notify=msgs.put)
                 finally:
                     log_file.close()
                 # Başarı ifadesi log'un sonunda yoksa exe kendini (ör. bellek ayarlanamadığı için) başarısız kapatmıştır: bat'ı yeniden çalıştır.

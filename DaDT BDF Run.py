@@ -4097,6 +4097,40 @@ def _log_has_phrase(path, phrase, tail_bytes=262144):
         return False
 
 
+def _find_exe_logs(folder, recursive=True, since=None):
+    """Load Extraction exe'sinin KENDİ log dosyalarını bulur: adında 'load-ext_log' geçen .txt/.log (örn.
+    'load-ext_log-Joint-TF-X_Load_Extraction.txt'; '-', '_' ve boşluk farkı önemsiz). since verilirse yalnızca o andan (5 sn pay ile)
+    sonra değişmiş olanlar döner - önceki çalıştırmalardan kalan eski başarı satırı yanıltmasın."""
+    out = []
+    if not folder or not os.path.isdir(folder):
+        return out
+    walker = os.walk(folder) if recursive else [(folder, [], os.listdir(folder))]
+    for dp, _dn, fs in walker:
+        for fn in fs:
+            if not fn.lower().endswith(('.txt', '.log')) or 'loadextlog' not in re.sub(r'[-_\s]', '', fn.lower()):
+                continue
+            path = os.path.join(dp, fn)
+            try:
+                if since is not None and os.path.getmtime(path) < since - 5:
+                    continue
+            except OSError:
+                continue
+            out.append(path)
+    return out
+
+
+def _le_success(phrase, stdout_log, search_dirs, since=None):
+    """Load Extraction başarı satırı var mı? Önce aracın yönlendirdiği loadext_log.txt (stdout), sonra exe'nin kendi
+    'load-ext_log*.txt' dosyaları (search_dirs: [(klasör, rekürsif_mi)]) aranır."""
+    if _log_has_phrase(stdout_log, phrase):
+        return True
+    for folder, rec in search_dirs:
+        for path in _find_exe_logs(folder, rec, since):
+            if _log_has_phrase(path, phrase):
+                return True
+    return False
+
+
 def _stage_le_exe(exe_path, dest_folder):
     """Load Extraction exe'sinin o gruba ÖZEL kopyasını grup klasörüne koyar (aynı boyutta zaten varsa tekrar kopyalamaz).
     Dönüş: kopyanın yolu."""
@@ -7895,9 +7929,10 @@ class PostProcessingTab:
                     # Exe başarı satırı yazmadan kapandı (ör. bellek ayarlanamadı): yeniden başlatmadan önce bekle. Bekleme sırasında bu grubun
                     # havuz yeri DOLU kalır (yeni grup başlamaz), böylece diğer exe'lerin belleği bırakması için süre tanınır.
                     if attempt == start_attempt:
-                        msgs.put(f"    [retry {attempt - 1}/{attempts - 1}] {job['name']}: '{_LE_OK_JOINT}' is NOT in loadext_log.txt "
+                        msgs.put(f"    [retry {attempt - 1}/{attempts - 1}] {job['name']}: '{_LE_OK_JOINT}' is NOT in the load-ext_log file "
                                  f"- waiting {_LE_RETRY_WAIT_SECONDS / 60:g} min, then running the bat again")
                     time.sleep(_LE_RETRY_WAIT_SECONDS)
+                t_attempt = time.time()
                 got = _launch(job, attempt)
                 if isinstance(got, dict):
                     return got
@@ -7909,16 +7944,16 @@ class PostProcessingTab:
                 finally:
                     log_file.close()
                 # Başarı ifadesi log'un sonunda yoksa exe kendini (ör. bellek ayarlanamadığı için) başarısız kapatmıştır: bat'ı yeniden çalıştır.
-                if _log_has_phrase(job['log'], _LE_OK_JOINT):
+                if _le_success(_LE_OK_JOINT, job['log'], [(job['dest'], True)], since=t_attempt):
                     if attempt > 1:
                         msgs.put(f"    [retry OK] {job['name']}: succeeded on attempt {attempt}")
                     break
                 if attempt < attempts:
-                    msgs.put(f"    [retry {attempt}/{attempts - 1}] {job['name']}: '{_LE_OK_JOINT}' is NOT in loadext_log.txt "
+                    msgs.put(f"    [retry {attempt}/{attempts - 1}] {job['name']}: '{_LE_OK_JOINT}' is NOT in the load-ext_log file "
                              f"(exe closed without finishing, e.g. memory could not be set) - waiting "
                              f"{_LE_RETRY_WAIT_SECONDS / 60:g} min, then running the bat again")
                 else:
-                    res['warnings'].append(f"'{_LE_OK_JOINT}' not found in loadext_log.txt after {attempt} attempt(s) - giving up on this group")
+                    res['warnings'].append(f"'{_LE_OK_JOINT}' not found in the load-ext_log file after {attempt} attempt(s) - giving up on this group")
             res['seconds'] = time.time() - t_job
             res['attempts'] = attempt
             return res
@@ -7972,19 +8007,19 @@ class PostProcessingTab:
         max_extra = max_extra or _LE_MAX_RETRIES
         groups = self._find_le_groups_folders()
         missing = [g for g in groups if self._find_tfx_workbook_path(g)
-                   and not _log_has_phrase(os.path.join(g, "loadext_log.txt"), _LE_OK_JOINT)]
+                   and not _le_success(_LE_OK_JOINT, os.path.join(g, "loadext_log.txt"), [(g, True)])]
         if not missing:
-            self.log(f"  All {len(groups)} Load Extraction log(s) end with '{_LE_OK_JOINT}'.")
+            self.log(f"  All {len(groups)} Load Extraction log(s) contain '{_LE_OK_JOINT}'.")
             return 0
         exe_path = self.le_exe_path.get().strip()
-        self.log(f"\n  {len(missing)} of {len(groups)} Load Extraction group(s) have no '{_LE_OK_JOINT}' line in loadext_log.txt "
+        self.log(f"\n  {len(missing)} of {len(groups)} Load Extraction group(s) have no '{_LE_OK_JOINT}' line in their load-ext_log file "
                   f"- running their bat again after a {_LE_RETRY_WAIT_SECONDS / 60:g} min wait (up to {max_extra} more time(s)): "
                   f"{', '.join(os.path.basename(g) for g in missing[:8])}{' ...' if len(missing) > 8 else ''}")
         self._run_tfx_pool(missing, exe_path, os.path.dirname(exe_path) or None, os.path.basename(exe_path),
                            self.le_maneuver_bdf_path.get().strip(), self.le_thermal_bdf_path.get().strip(),
                            self.le_pickle_path.get().strip(), self.le_max_memory.get().strip(),
                            max(1, min(len(missing), 5)), time.time(), attempts=max_extra + 1, start_attempt=2)
-        still = [g for g in missing if not _log_has_phrase(os.path.join(g, "loadext_log.txt"), _LE_OK_JOINT)]
+        still = [g for g in missing if not _le_success(_LE_OK_JOINT, os.path.join(g, "loadext_log.txt"), [(g, True)])]
         self.log(f"  Load Extraction retry: {len(missing) - len(still)} of {len(missing)} group(s) completed"
                   + (f"; still without the success line: {', '.join(os.path.basename(g) for g in still[:8])}" if still else ""))
         return len(missing)
@@ -11872,6 +11907,7 @@ class WebFlawRunTab:
         for attempt in range(1, n_attempts + 1):
             if attempt > 1:
                 time.sleep(_LE_RETRY_WAIT_SECONDS)
+            t_attempt = time.time()
             with open(log_path, 'w' if attempt == 1 else 'a') as log_file:
                 if attempt > 1:
                     log_file.write(f"\n===== RETRY {attempt - 1} ({time.strftime('%H:%M:%S')}) =====\n")
@@ -11879,16 +11915,17 @@ class WebFlawRunTab:
                 subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, stdout=log_file, stderr=subprocess.STDOUT,
                                creationflags=_NO_WINDOW)
             self._wait_for_exe_to_finish(exe_name)
-            if _log_has_phrase(log_path, _LE_OK_WEBFLAW):
+            # exe'nin kendi 'load-ext_log-All-....txt' dosyası: Web Flaw klasöründe (rekürsif) ya da exe'nin kendi klasöründe olabilir
+            if _le_success(_LE_OK_WEBFLAW, log_path, [(le_dir, True), (exe_dir, False)], since=t_attempt):
                 if attempt > 1:
                     self.log(f"  Load Extraction succeeded on attempt {attempt}.")
                 break
             if attempt < n_attempts:
-                self.log(f"  WARNING: '{_LE_OK_WEBFLAW}' is NOT in loadext_log.txt (the exe closed without finishing, "
+                self.log(f"  WARNING: '{_LE_OK_WEBFLAW}' is NOT in the load-ext_log file (the exe closed without finishing, "
                           f"e.g. memory could not be set) - waiting {_LE_RETRY_WAIT_SECONDS / 60:g} min, then running the bat again "
                           f"({attempt}/{n_attempts - 1})")
             else:
-                self.log(f"  WARNING: '{_LE_OK_WEBFLAW}' still not in loadext_log.txt after {n_attempts} attempt(s) - giving up, "
+                self.log(f"  WARNING: '{_LE_OK_WEBFLAW}' still not in the load-ext_log file after {n_attempts} attempt(s) - giving up, "
                           f"checking for All_Loads.h5 anyway")
         self.log(f"  Load Extraction finished (took {time.time() - t_le:.1f}s)")
 

@@ -4080,6 +4080,8 @@ def _read_bdf_without_includes(bdf_obj, bdf_path, **read_kwargs):
     return bdf_obj, n_inc, t_copy
 
 
+_LE_MAX_RETRIES = 5                  # başarı satırı yoksa ilk çalıştırmadan sonra en fazla bu kadar TEKRAR (toplam 1 + 5 deneme)
+_LE_RETRY_WAIT_SECONDS = 15 * 60     # exe başarı satırı yazmadan kapandıktan sonra, bat'ı yeniden başlatmadan önce beklenen süre
 _LE_OK_JOINT = "Joint loads extraction process completed successfully"
 _LE_OK_WEBFLAW = "Element based loads extraction process completed successfully"
 
@@ -7818,8 +7820,9 @@ class PostProcessingTab:
 
     # _run_tfx_pool: gruplar havuzda çalışır (bkz. yukarıdaki açıklama). Dönüş: (başlatılan grup sayısı, toplam).
     def _run_tfx_pool(self, group_folders, exe_path, exe_dir, exe_name, maneuver_bdf, thermal_bdf,
-                      pickle_path, max_memory, max_parallel, t_start, attempts=3, start_attempt=1):
+                      pickle_path, max_memory, max_parallel, t_start, attempts=None, start_attempt=1):
         n = len(group_folders)
+        attempts = attempts or (1 + _LE_MAX_RETRIES)
         self.log(f"  Pool mode: up to {max_parallel} group(s) at the same time, a new one starts as soon as "
                   f"one finishes (starts at least {self._LE_START_STAGGER}s apart)")
         group_sets = getattr(self, '_le_group_sets', {})
@@ -7888,6 +7891,13 @@ class PostProcessingTab:
                         'failed_start': True}
             t_job = time.time()
             for attempt in range(start_attempt, attempts + 1):
+                if attempt > 1:
+                    # Exe başarı satırı yazmadan kapandı (ör. bellek ayarlanamadı): yeniden başlatmadan önce bekle. Bekleme sırasında bu grubun
+                    # havuz yeri DOLU kalır (yeni grup başlamaz), böylece diğer exe'lerin belleği bırakması için süre tanınır.
+                    if attempt == start_attempt:
+                        msgs.put(f"    [retry {attempt - 1}/{attempts - 1}] {job['name']}: '{_LE_OK_JOINT}' is NOT in loadext_log.txt "
+                                 f"- waiting {_LE_RETRY_WAIT_SECONDS / 60:g} min, then running the bat again")
+                    time.sleep(_LE_RETRY_WAIT_SECONDS)
                 got = _launch(job, attempt)
                 if isinstance(got, dict):
                     return got
@@ -7905,7 +7915,8 @@ class PostProcessingTab:
                     break
                 if attempt < attempts:
                     msgs.put(f"    [retry {attempt}/{attempts - 1}] {job['name']}: '{_LE_OK_JOINT}' is NOT in loadext_log.txt "
-                             f"(exe closed without finishing, e.g. memory could not be set) - running the bat again")
+                             f"(exe closed without finishing, e.g. memory could not be set) - waiting "
+                             f"{_LE_RETRY_WAIT_SECONDS / 60:g} min, then running the bat again")
                 else:
                     res['warnings'].append(f"'{_LE_OK_JOINT}' not found in loadext_log.txt after {attempt} attempt(s) - giving up on this group")
             res['seconds'] = time.time() - t_job
@@ -7952,12 +7963,13 @@ class PostProcessingTab:
 
     # _le_retry_missing_groups: 'Max Parallel Runs' BOŞ (fire-and-forget) modunda gruplar izlenmeden başlatılır; hepsi bittikten sonra
     # loadext_log.txt'sinde başarı satırı olmayan grupları 2 kez daha çalıştırır (havuz modu bunu zaten kendi içinde yapar).
-    def _le_retry_missing_groups(self, max_extra=2):
+    def _le_retry_missing_groups(self, max_extra=None):
         try:
             if int(float(self.le_max_parallel.get() or 0)) > 0:
                 return 0
         except (ValueError, TypeError):
             pass
+        max_extra = max_extra or _LE_MAX_RETRIES
         groups = self._find_le_groups_folders()
         missing = [g for g in groups if self._find_tfx_workbook_path(g)
                    and not _log_has_phrase(os.path.join(g, "loadext_log.txt"), _LE_OK_JOINT)]
@@ -7966,7 +7978,7 @@ class PostProcessingTab:
             return 0
         exe_path = self.le_exe_path.get().strip()
         self.log(f"\n  {len(missing)} of {len(groups)} Load Extraction group(s) have no '{_LE_OK_JOINT}' line in loadext_log.txt "
-                  f"- running their bat again (up to {max_extra} more time(s)): "
+                  f"- running their bat again after a {_LE_RETRY_WAIT_SECONDS / 60:g} min wait (up to {max_extra} more time(s)): "
                   f"{', '.join(os.path.basename(g) for g in missing[:8])}{' ...' if len(missing) > 8 else ''}")
         self._run_tfx_pool(missing, exe_path, os.path.dirname(exe_path) or None, os.path.basename(exe_path),
                            self.le_maneuver_bdf_path.get().strip(), self.le_thermal_bdf_path.get().strip(),
@@ -11854,9 +11866,12 @@ class WebFlawRunTab:
         self.log(f"  Batch file written: {bat_path}")
         t_le = time.time()
         # Exe bazen (ör. belleği ayarlayamadığı için) başarı satırını yazmadan kapanır: loadext_log.txt'nin sonunda
-        # "Element based loads extraction process completed successfully" yoksa bat'ı 2 kez daha dene; yine olmazsa bırak.
-        n_attempts = 3
+        # "Element based loads extraction process completed successfully" yoksa (exe kapandıktan sonra _LE_RETRY_WAIT_SECONDS bekleyip)
+        # bat'ı _LE_MAX_RETRIES kez daha dene; yine olmazsa bırak.
+        n_attempts = 1 + _LE_MAX_RETRIES
         for attempt in range(1, n_attempts + 1):
+            if attempt > 1:
+                time.sleep(_LE_RETRY_WAIT_SECONDS)
             with open(log_path, 'w' if attempt == 1 else 'a') as log_file:
                 if attempt > 1:
                     log_file.write(f"\n===== RETRY {attempt - 1} ({time.strftime('%H:%M:%S')}) =====\n")
@@ -11870,7 +11885,8 @@ class WebFlawRunTab:
                 break
             if attempt < n_attempts:
                 self.log(f"  WARNING: '{_LE_OK_WEBFLAW}' is NOT in loadext_log.txt (the exe closed without finishing, "
-                          f"e.g. memory could not be set) - running the bat again ({attempt}/{n_attempts - 1})")
+                          f"e.g. memory could not be set) - waiting {_LE_RETRY_WAIT_SECONDS / 60:g} min, then running the bat again "
+                          f"({attempt}/{n_attempts - 1})")
             else:
                 self.log(f"  WARNING: '{_LE_OK_WEBFLAW}' still not in loadext_log.txt after {n_attempts} attempt(s) - giving up, "
                           f"checking for All_Loads.h5 anyway")

@@ -4119,6 +4119,56 @@ def _find_exe_logs(folder, recursive=True, since=None):
     return out
 
 
+def _clean_le_outputs(folder, extra_log_dirs=(), since=None):
+    """Yeniden başlatmadan önce grup klasöründeki TÜM .h5 dosyalarını ve Load Extraction log .txt'lerini (loadext_log.txt +
+    adında 'load-ext_log' geçenler) siler (rekürsif). extra_log_dirs'teki klasörlerde (örn. exe'nin kendi klasörü) yalnızca
+    son denemede (since'ten sonra) değişmiş log'lar silinir, .h5'e dokunulmaz. Dönüş: (silinen_h5, silinen_log, silinemeyenler)."""
+    n_h5 = n_log = 0
+    bad = []
+
+    def _rm(path):
+        for k in range(3):                       # kısa süreli kilit (antivirüs/Nastran kapanışı) için birkaç deneme
+            try:
+                os.remove(path)
+                return True
+            except FileNotFoundError:
+                return True
+            except OSError:
+                if k < 2:
+                    time.sleep(2)
+        bad.append(path)
+        return False
+    if folder and os.path.isdir(folder):
+        for dp, _dn, fs in os.walk(folder):
+            for fn in fs:
+                low = fn.lower()
+                is_h5 = low.endswith('.h5')
+                is_log = low.endswith(('.txt', '.log')) and 'loadextlog' in re.sub(r'[-_\s]', '', low)
+                if (is_h5 or is_log) and _rm(os.path.join(dp, fn)):
+                    n_h5 += is_h5
+                    n_log += is_log
+    for d in extra_log_dirs:
+        for path in _find_exe_logs(d, recursive=False, since=since):
+            if _rm(path):
+                n_log += 1
+    return n_h5, n_log, bad
+
+
+def _le_failure_tail(paths, n=3):
+    """Başarısız denemenin log'larından son birkaç dolu satır (silinmeden önce ana log'a yazmak için)."""
+    out = []
+    for path in paths:
+        try:
+            with open(path, 'rb') as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 8192))
+                lines = [l.strip() for l in f.read().decode('utf-8', errors='replace').splitlines() if l.strip()]
+        except OSError:
+            continue
+        out.extend(f"{os.path.basename(path)}: {l[:200]}" for l in lines[-n:])
+    return out
+
+
 def _le_success(phrase, stdout_log, search_dirs, since=None):
     """Load Extraction başarı satırı var mı? Önce aracın yönlendirdiği loadext_log.txt (stdout), sonra exe'nin kendi
     'load-ext_log*.txt' dosyaları (search_dirs: [(klasör, rekürsif_mi)]) aranır."""
@@ -7901,10 +7951,7 @@ class PostProcessingTab:
                     if wait > 0:
                         time.sleep(wait)
                 try:
-                    log_file = open(job['log'], 'w' if attempt == 1 else 'a')
-                    if attempt > 1:
-                        log_file.write(f"\n===== RETRY {attempt - 1} ({time.strftime('%H:%M:%S')}) =====\n")
-                        log_file.flush()
+                    log_file = open(job['log'], 'w')
                     proc = subprocess.Popen(["cmd", "/c", job['bat']], cwd=job['dest'], stdout=log_file,
                                             stderr=subprocess.STDOUT,
                                             creationflags=_NO_WINDOW)
@@ -7932,6 +7979,10 @@ class PostProcessingTab:
                         msgs.put(f"    [retry {attempt - 1}/{attempts - 1}] {job['name']}: '{_LE_OK_JOINT}' is NOT in the load-ext_log file "
                                  f"- waiting {_LE_RETRY_WAIT_SECONDS / 60:g} min, then running the bat again")
                     time.sleep(_LE_RETRY_WAIT_SECONDS)
+                    # Yeniden başlatmadan önce o klasördeki yarım kalmış .h5'leri ve eski log'ları sil (temiz başlangıç).
+                    n_h5, n_lg, bad = _clean_le_outputs(job['dest'])
+                    msgs.put(f"    [clean] {job['name']}: deleted {n_h5} .h5 file(s) and {n_lg} log file(s) before restarting"
+                             + (f" - {len(bad)} could NOT be deleted: {', '.join(os.path.basename(b) for b in bad[:3])}" if bad else ""))
                 t_attempt = time.time()
                 got = _launch(job, attempt)
                 if isinstance(got, dict):
@@ -7949,6 +8000,8 @@ class PostProcessingTab:
                         msgs.put(f"    [retry OK] {job['name']}: succeeded on attempt {attempt}")
                     break
                 if attempt < attempts:
+                    for ln in _le_failure_tail([job['log']] + _find_exe_logs(job['dest'], True, t_attempt), 3):   # log silinmeden önce hata özeti
+                        msgs.put(f"      (failed attempt {attempt}) {ln}")
                     msgs.put(f"    [retry {attempt}/{attempts - 1}] {job['name']}: '{_LE_OK_JOINT}' is NOT in the load-ext_log file "
                              f"(exe closed without finishing, e.g. memory could not be set) - waiting "
                              f"{_LE_RETRY_WAIT_SECONDS / 60:g} min, then running the bat again")
@@ -11907,11 +11960,12 @@ class WebFlawRunTab:
         for attempt in range(1, n_attempts + 1):
             if attempt > 1:
                 time.sleep(_LE_RETRY_WAIT_SECONDS)
+                # Yeniden başlatmadan önce Load Extraction klasöründeki .h5'leri ve log'ları sil (exe klasöründe yalnız son denemenin log'ları)
+                n_h5, n_lg, bad = _clean_le_outputs(le_dir, extra_log_dirs=[exe_dir] if exe_dir else [], since=t_attempt)
+                self.log(f"  Deleted {n_h5} .h5 file(s) and {n_lg} log file(s) before restarting"
+                          + (f" ({len(bad)} could NOT be deleted: {', '.join(os.path.basename(b) for b in bad[:3])})" if bad else ""))
             t_attempt = time.time()
-            with open(log_path, 'w' if attempt == 1 else 'a') as log_file:
-                if attempt > 1:
-                    log_file.write(f"\n===== RETRY {attempt - 1} ({time.strftime('%H:%M:%S')}) =====\n")
-                    log_file.flush()
+            with open(log_path, 'w') as log_file:
                 subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, stdout=log_file, stderr=subprocess.STDOUT,
                                creationflags=_NO_WINDOW)
             self._wait_for_exe_to_finish(exe_name)
@@ -11921,6 +11975,8 @@ class WebFlawRunTab:
                     self.log(f"  Load Extraction succeeded on attempt {attempt}.")
                 break
             if attempt < n_attempts:
+                for ln in _le_failure_tail([log_path] + _find_exe_logs(le_dir, True, t_attempt) + _find_exe_logs(exe_dir, False, t_attempt), 3):
+                    self.log(f"    (failed attempt {attempt}) {ln}")       # log silinmeden önce hata özeti
                 self.log(f"  WARNING: '{_LE_OK_WEBFLAW}' is NOT in the load-ext_log file (the exe closed without finishing, "
                           f"e.g. memory could not be set) - waiting {_LE_RETRY_WAIT_SECONDS / 60:g} min, then running the bat again "
                           f"({attempt}/{n_attempts - 1})")

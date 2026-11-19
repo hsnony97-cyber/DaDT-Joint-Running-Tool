@@ -4080,6 +4080,21 @@ def _read_bdf_without_includes(bdf_obj, bdf_path, **read_kwargs):
     return bdf_obj, n_inc, t_copy
 
 
+_LE_OK_JOINT = "Joint loads extraction process completed successfully"
+_LE_OK_WEBFLAW = "Element based loads extraction process completed successfully"
+
+
+def _log_has_phrase(path, phrase, tail_bytes=262144):
+    """Log dosyasının SON bölümünde (başarı satırından sonra süre dökümü gelebilir) phrase var mı (büyük/küçük harf fark etmez)."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - tail_bytes))
+            return phrase.lower() in f.read().decode('utf-8', errors='replace').lower()
+    except OSError:
+        return False
+
+
 def _stage_le_exe(exe_path, dest_folder):
     """Load Extraction exe'sinin o gruba ÖZEL kopyasını grup klasörüne koyar (aynı boyutta zaten varsa tekrar kopyalamaz).
     Dönüş: kopyanın yolu."""
@@ -7803,7 +7818,7 @@ class PostProcessingTab:
 
     # _run_tfx_pool: gruplar havuzda çalışır (bkz. yukarıdaki açıklama). Dönüş: (başlatılan grup sayısı, toplam).
     def _run_tfx_pool(self, group_folders, exe_path, exe_dir, exe_name, maneuver_bdf, thermal_bdf,
-                      pickle_path, max_memory, max_parallel, t_start):
+                      pickle_path, max_memory, max_parallel, t_start, attempts=3, start_attempt=1):
         n = len(group_folders)
         self.log(f"  Pool mode: up to {max_parallel} group(s) at the same time, a new one starts as soon as "
                   f"one finishes (starts at least {self._LE_START_STAGGER}s apart)")
@@ -7841,20 +7856,18 @@ class PostProcessingTab:
         last_start = [None]
         started = []
 
-        def _work(job):
-            try:
-                _stage_le_exe(exe_path, job['dest'])               # bu grubun kendi exe kopyası (kilitten ÖNCE: kopyalar paralel yapılabilir)
-            except OSError as e:
-                return {'name': job['name'], 'rc': None, 'seconds': 0.0, 'tree_checked': True,
-                        'warnings': [f"could not copy {exe_name} into the group folder: {e}"], 'n_expected': 0, 'n_found': 0,
-                        'failed_start': True}
+        def _launch(job, attempt):
+            """Bu grubun bat'ını başlatır (deneme 1: log'u sıfırla; sonraki denemeler: log'a ekle). Dönüş: (proc, log_file) ya da hata sözlüğü."""
             with start_lock:                                       # başlatmalar arası en az _LE_START_STAGGER sn
                 if last_start[0] is not None:
                     wait = self._LE_START_STAGGER - (time.time() - last_start[0])
                     if wait > 0:
                         time.sleep(wait)
                 try:
-                    log_file = open(job['log'], 'w')
+                    log_file = open(job['log'], 'w' if attempt == 1 else 'a')
+                    if attempt > 1:
+                        log_file.write(f"\n===== RETRY {attempt - 1} ({time.strftime('%H:%M:%S')}) =====\n")
+                        log_file.flush()
                     proc = subprocess.Popen(["cmd", "/c", job['bat']], cwd=job['dest'], stdout=log_file,
                                             stderr=subprocess.STDOUT,
                                             creationflags=_NO_WINDOW)
@@ -7862,12 +7875,42 @@ class PostProcessingTab:
                     return {'name': job['name'], 'rc': None, 'seconds': 0.0, 'tree_checked': True,
                             'warnings': [f"could not start: {e}"], 'n_expected': 0, 'n_found': 0, 'failed_start': True}
                 last_start[0] = time.time()
-                started.append(job['name'])
-            msgs.put(f"    [start] {job['name']}  ({len(started)}/{len(jobs)} started)")
+                if attempt == start_attempt:
+                    started.append(job['name'])
+            return proc, log_file
+
+        def _work(job):
             try:
-                return self._le_wait_group(job['name'], job['dest'], proc, job['expected'])
-            finally:
-                log_file.close()
+                _stage_le_exe(exe_path, job['dest'])               # bu grubun kendi exe kopyası (kilitten ÖNCE: kopyalar paralel yapılabilir)
+            except OSError as e:
+                return {'name': job['name'], 'rc': None, 'seconds': 0.0, 'tree_checked': True,
+                        'warnings': [f"could not copy {exe_name} into the group folder: {e}"], 'n_expected': 0, 'n_found': 0,
+                        'failed_start': True}
+            t_job = time.time()
+            for attempt in range(start_attempt, attempts + 1):
+                got = _launch(job, attempt)
+                if isinstance(got, dict):
+                    return got
+                proc, log_file = got
+                if attempt == start_attempt:
+                    msgs.put(f"    [start] {job['name']}  ({len(started)}/{len(jobs)} started)")
+                try:
+                    res = self._le_wait_group(job['name'], job['dest'], proc, job['expected'])
+                finally:
+                    log_file.close()
+                # Başarı ifadesi log'un sonunda yoksa exe kendini (ör. bellek ayarlanamadığı için) başarısız kapatmıştır: bat'ı yeniden çalıştır.
+                if _log_has_phrase(job['log'], _LE_OK_JOINT):
+                    if attempt > 1:
+                        msgs.put(f"    [retry OK] {job['name']}: succeeded on attempt {attempt}")
+                    break
+                if attempt < attempts:
+                    msgs.put(f"    [retry {attempt}/{attempts - 1}] {job['name']}: '{_LE_OK_JOINT}' is NOT in loadext_log.txt "
+                             f"(exe closed without finishing, e.g. memory could not be set) - running the bat again")
+                else:
+                    res['warnings'].append(f"'{_LE_OK_JOINT}' not found in loadext_log.txt after {attempt} attempt(s) - giving up on this group")
+            res['seconds'] = time.time() - t_job
+            res['attempts'] = attempt
+            return res
 
         def _flush():
             while True:
@@ -7887,6 +7930,8 @@ class PostProcessingTab:
                     res = fut.result()
                     results.append(res)
                     status = "finished" if not res['warnings'] else "finished WITH WARNINGS"
+                    if res.get('attempts', 1) > 1:
+                        status += f" (attempt {res['attempts']})"
                     if res.get('failed_start'):
                         status = "NOT STARTED"
                     self.log(f"    [{len(results)}/{len(jobs)}] {res['name']}: {status} (took {res['seconds']:.0f}s"
@@ -7904,6 +7949,33 @@ class PostProcessingTab:
         self.log(f"\n  LOAD EXTRACTION: {len(results)}/{len(jobs)} group(s) finished, {n_warn} with warnings "
                   f"(took {time.time() - t_start:.1f}s)")
         return n_started, n
+
+    # _le_retry_missing_groups: 'Max Parallel Runs' BOŞ (fire-and-forget) modunda gruplar izlenmeden başlatılır; hepsi bittikten sonra
+    # loadext_log.txt'sinde başarı satırı olmayan grupları 2 kez daha çalıştırır (havuz modu bunu zaten kendi içinde yapar).
+    def _le_retry_missing_groups(self, max_extra=2):
+        try:
+            if int(float(self.le_max_parallel.get() or 0)) > 0:
+                return 0
+        except (ValueError, TypeError):
+            pass
+        groups = self._find_le_groups_folders()
+        missing = [g for g in groups if self._find_tfx_workbook_path(g)
+                   and not _log_has_phrase(os.path.join(g, "loadext_log.txt"), _LE_OK_JOINT)]
+        if not missing:
+            self.log(f"  All {len(groups)} Load Extraction log(s) end with '{_LE_OK_JOINT}'.")
+            return 0
+        exe_path = self.le_exe_path.get().strip()
+        self.log(f"\n  {len(missing)} of {len(groups)} Load Extraction group(s) have no '{_LE_OK_JOINT}' line in loadext_log.txt "
+                  f"- running their bat again (up to {max_extra} more time(s)): "
+                  f"{', '.join(os.path.basename(g) for g in missing[:8])}{' ...' if len(missing) > 8 else ''}")
+        self._run_tfx_pool(missing, exe_path, os.path.dirname(exe_path) or None, os.path.basename(exe_path),
+                           self.le_maneuver_bdf_path.get().strip(), self.le_thermal_bdf_path.get().strip(),
+                           self.le_pickle_path.get().strip(), self.le_max_memory.get().strip(),
+                           max(1, min(len(missing), 5)), time.time(), attempts=max_extra + 1, start_attempt=2)
+        still = [g for g in missing if not _log_has_phrase(os.path.join(g, "loadext_log.txt"), _LE_OK_JOINT)]
+        self.log(f"  Load Extraction retry: {len(missing) - len(still)} of {len(missing)} group(s) completed"
+                  + (f"; still without the success line: {', '.join(os.path.basename(g) for g in still[:8])}" if still else ""))
+        return len(missing)
 
     # ==================== RUN (FULL PIPELINE) ====================
     # start_run: "RUN" butonunun komutu. Her iki aşamanın (OP2->H5 ve Load
@@ -9719,7 +9791,8 @@ class FullRunTab:
             # tasklist ile bekle, çünkü Joint Run'ın H5 taraması onların
             # Joint_Loads_*.h5 çıktısına bağımlı.
             self._wait_for_exe_to_finish(os.path.basename(self.le_exe_path.get().strip()))
-            # Load Extraction bitti: her LoadExtraction_NN klasörüne kopyalanan exe'leri sil (kaynak exe'ye dokunulmaz).
+            # Başarı satırı olmayan gruplar (fire-and-forget modunda) yeniden çalıştırılır; sonra kopyalanan exe'ler silinir.
+            t4._le_retry_missing_groups()
             n_le_exe = _delete_copied_le_exes(le_results_dir, self.le_exe_path.get().strip())
             self.log(f"  Deleted {n_le_exe} copied Load Extraction exe(s) from the LoadExtraction_NN folders")
             self.root.after(0, lambda: self.progress_var.set(70))
@@ -11113,7 +11186,8 @@ class IterativeFullRunTab:
                 # taraması bunların çıktısına bağımlı olduğundan, hepsinin
                 # gerçekten bitmesini bekle.
                 self._wait_for_exe_to_finish(os.path.basename(self.le_exe_path.get().strip()))
-                # Load Extraction bitti: her LoadExtraction_NN klasörüne kopyalanan exe'leri sil (kaynak exe'ye dokunulmaz).
+                # Başarı satırı olmayan gruplar (fire-and-forget modunda) yeniden çalıştırılır; sonra kopyalanan exe'ler silinir.
+                t4._le_retry_missing_groups()
                 n_le_exe = _delete_copied_le_exes(le_results_dir, self.le_exe_path.get().strip())
                 self.log(f"  Deleted {n_le_exe} copied Load Extraction exe(s) from the LoadExtraction_NN folders")
 
@@ -11779,10 +11853,27 @@ class WebFlawRunTab:
         log_path = os.path.join(le_dir, "loadext_log.txt")
         self.log(f"  Batch file written: {bat_path}")
         t_le = time.time()
-        with open(log_path, 'w') as log_file:
-            subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, stdout=log_file, stderr=subprocess.STDOUT,
-                           creationflags=_NO_WINDOW)
-        self._wait_for_exe_to_finish(exe_name)
+        # Exe bazen (ör. belleği ayarlayamadığı için) başarı satırını yazmadan kapanır: loadext_log.txt'nin sonunda
+        # "Element based loads extraction process completed successfully" yoksa bat'ı 2 kez daha dene; yine olmazsa bırak.
+        n_attempts = 3
+        for attempt in range(1, n_attempts + 1):
+            with open(log_path, 'w' if attempt == 1 else 'a') as log_file:
+                if attempt > 1:
+                    log_file.write(f"\n===== RETRY {attempt - 1} ({time.strftime('%H:%M:%S')}) =====\n")
+                    log_file.flush()
+                subprocess.run(["cmd", "/c", bat_path], cwd=exe_dir, stdout=log_file, stderr=subprocess.STDOUT,
+                               creationflags=_NO_WINDOW)
+            self._wait_for_exe_to_finish(exe_name)
+            if _log_has_phrase(log_path, _LE_OK_WEBFLAW):
+                if attempt > 1:
+                    self.log(f"  Load Extraction succeeded on attempt {attempt}.")
+                break
+            if attempt < n_attempts:
+                self.log(f"  WARNING: '{_LE_OK_WEBFLAW}' is NOT in loadext_log.txt (the exe closed without finishing, "
+                          f"e.g. memory could not be set) - running the bat again ({attempt}/{n_attempts - 1})")
+            else:
+                self.log(f"  WARNING: '{_LE_OK_WEBFLAW}' still not in loadext_log.txt after {n_attempts} attempt(s) - giving up, "
+                          f"checking for All_Loads.h5 anyway")
         self.log(f"  Load Extraction finished (took {time.time() - t_le:.1f}s)")
 
         found = self._find_file(le_dir, 'all_loads.h5')
@@ -12526,7 +12617,8 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
                 # taraması bunların çıktısına bağımlı olduğundan, hepsinin
                 # gerçekten bitmesini bekle.
                 self._wait_for_exe_to_finish(os.path.basename(self.le_exe_path.get().strip()))
-                # Load Extraction bitti: her LoadExtraction_NN klasörüne kopyalanan exe'leri sil (kaynak exe'ye dokunulmaz).
+                # Başarı satırı olmayan gruplar (fire-and-forget modunda) yeniden çalıştırılır; sonra kopyalanan exe'ler silinir.
+                t4._le_retry_missing_groups()
                 n_le_exe = _delete_copied_le_exes(le_results_dir, self.le_exe_path.get().strip())
                 self.log(f"  Deleted {n_le_exe} copied Load Extraction exe(s) from the LoadExtraction_NN folders")
 

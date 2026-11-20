@@ -7792,14 +7792,15 @@ class PostProcessingTab:
     _LE_POLL_SECONDS = 10        # çocuk process'leri kontrol aralığı (sn)
     _LE_OUTPUT_GRACE = 180       # bat bittikten sonra çıktıların diske yazılması için tanınan süre (sn)
     _LE_STABLE_POLL = 5          # dosya boyutu sabitlik kontrol aralığı (sn)
-    # TAKILMA BEKÇİSİ: bir grubun süreçleri (bat + exe + çocukları) _LE_STALL_WINDOW_SECONDS boyunca (1) CPU harcamıyor (toplam CPU süresi
-    # artışı < _LE_STALL_CPU_SECONDS), (2) belleği sabit (değişim < _LE_STALL_MEM_BYTES) VE (3) o klasörde log/.h5 dosyası değişmiyorsa
-    # "takıldı" sayılır: grubun TÜM süreçleri sonlandırılır ve grup, başarı satırı olmayan gruplar gibi (bekle, .h5+log sil, yeniden başlat) tekrarlanır.
+    # TAKILMA BEKÇİSİ: bir grubun süreçleri (bat + exe + çocukları) _LE_STALL_WINDOW_SECONDS boyunca (1) belleği sabit (toplam değişim
+    # < _LE_STALL_MEM_BYTES), (2) o klasörde log/.h5 dosyası değişmiyor VE (3) ortalama CPU kullanımı _LE_STALL_MAX_CORES çekirdekten az
+    # ise (çok çekirdek kullanan gerçek bir hesap değilse) "takıldı" sayılır. (CPU şartı kasıtlı gevşek: takılan bir grubun ana süreci
+    # boşta dönerek ~1 çekirdek harcayabilir; kilitli havuzda çalışanlar %0'dır.) grubun TÜM süreçleri sonlandırılır ve grup, başarı satırı olmayan gruplar gibi (bekle, .h5+log sil, yeniden başlat) tekrarlanır.
     _LE_STALL_WINDOW_SECONDS = 30 * 60   # 0 = bekçi kapalı
     _LE_STALL_POLL_SECONDS = 60          # süreç istatistiklerinin örnekleme aralığı (sn)
     _LE_EXIT_POLL_SECONDS = 2            # bat'ın bitip bitmediğine bakma aralığı (sn)
-    _LE_STALL_CPU_SECONDS = 20           # pencere içinde bundan az CPU süresi = boşta
-    _LE_STALL_MEM_BYTES = 64 * 1024 * 1024   # pencere içinde bundan az bellek değişimi = sabit
+    _LE_STALL_MAX_CORES = 1.5            # pencere boyunca ortalama CPU kullanımı bundan az (çekirdek) ise "hesap yapmıyor" sayılır
+    _LE_STALL_MEM_BYTES = 32 * 1024 * 1024   # pencere içinde bundan az toplam bellek değişimi = sabit
 
     # _process_table: {pid: parent_pid} (tüm süreçler) ya da okunamazsa None.
     # Windows: PowerShell CIM; olmazsa wmic. Ek paket gerekmez.
@@ -7922,11 +7923,13 @@ class PostProcessingTab:
         pids.discard(me)
         return pids, info
 
-    # _le_group_stats: {'cpu': toplam CPU saniyesi, 'mem': toplam çalışma kümesi (bayt), 'pids': süreç sayısı} ya da None (okunamadı/süreç yok).
+    # _le_group_stats: {'cpu': toplam CPU saniyesi, 'mem': toplam çalışma kümesi (bayt), 'pids': süreç sayısı}; süreç tablosu okunamazsa None.
     def _le_group_stats(self, dest_folder, root_pid):
         pids, info = self._le_group_pids(dest_folder, root_pid)
-        if not pids:
+        if pids is None:                                           # süreç tablosu okunamadı
             return None
+        if not pids:                                               # okundu ama grubun süreci yok
+            return {'cpu': 0.0, 'mem': 0, 'pids': 0}
         cpu = mem = 0
         for pid in pids:
             e = info.get(pid) or {}
@@ -7959,13 +7962,15 @@ class PostProcessingTab:
 
     # _le_is_stalled: örnekler [(zaman, cpu_sn, bellek_bayt)] son _LE_STALL_WINDOW_SECONDS boyunca CPU ve bellek değişmiyorsa VE grup
     # klasöründe aynı süre log/.h5 değişmediyse {'mem':..., 'idle_min':...} döner, değilse None.
-    def _le_is_stalled(self, samples, now, dest_folder, t_start):
-        window = self._LE_STALL_WINDOW_SECONDS
+    def _le_is_stalled(self, samples, now, dest_folder, t_start, window=None):
+        window = window or self._LE_STALL_WINDOW_SECONDS
         recent = [x for x in samples if x[0] >= now - window - self._LE_STALL_POLL_SECONDS]
         if len(recent) < 2 or recent[-1][0] - recent[0][0] < window - self._LE_STALL_POLL_SECONDS * 1.01:
             return None
         cpu, mem = [x[1] for x in recent], [x[2] for x in recent]
-        if max(cpu) - min(cpu) >= self._LE_STALL_CPU_SECONDS or max(mem) - min(mem) >= self._LE_STALL_MEM_BYTES:
+        span = max(recent[-1][0] - recent[0][0], 1e-6)
+        cores = (max(cpu) - min(cpu)) / span                       # pencere boyunca ortalama çekirdek kullanımı
+        if cores >= self._LE_STALL_MAX_CORES or max(mem) - min(mem) >= self._LE_STALL_MEM_BYTES:
             return None
         last = t_start
         for dp, _dn, fs in os.walk(dest_folder):
@@ -7978,10 +7983,10 @@ class PostProcessingTab:
                         pass
         if now - last < window:
             return None
-        return {'mem': recent[-1][2], 'idle_min': (now - last) / 60}
+        return {'mem': recent[-1][2], 'idle_min': (now - last) / 60, 'cores': cores}
 
     # _le_wait_group: başlatılmış bir grubun bitişini 3 kontrolle bekler (+ takılma bekçisi); sonuç sözlüğü döner.
-    def _le_wait_group(self, name, dest_folder, proc, expected_sets, notify=None):
+    def _le_wait_group(self, name, dest_folder, proc, expected_sets, notify=None, watch=None):
         t0 = time.time()
         warnings = []
         poll = getattr(proc, 'poll', None)
@@ -7989,6 +7994,7 @@ class PostProcessingTab:
             rc = proc.wait()                                       # (1) bat süreci
         else:
             samples, next_sample, stalled = [], t0 + self._LE_STALL_POLL_SECONDS, None
+            n_unreadable, warned_unreadable, last_watch = 0, False, 0.0
             while True:
                 rc = poll()
                 if rc is not None:
@@ -7998,15 +8004,35 @@ class PostProcessingTab:
                     continue
                 next_sample = time.time() + self._LE_STALL_POLL_SECONDS
                 st = self._le_group_stats(dest_folder, proc.pid)
-                if not st:
+                if st is None:                                     # süreç tablosu okunamadı (PowerShell/CIM)
+                    n_unreadable += 1
+                    if n_unreadable >= 3 and not warned_unreadable:
+                        warned_unreadable = True
+                        txt = "WARNING: the stall watchdog cannot read the process table (PowerShell/CIM) - stall detection is OFF for this group"
+                        if watch:
+                            watch(txt)
+                        if notify:
+                            notify(f"    [watchdog] {name}: {txt}")
+                    continue
+                n_unreadable = 0
+                if not st.get('pids'):                             # grubun süreci yok (bitiyor/henüz başlamadı)
                     continue
                 now = time.time()
                 samples.append((now, st['cpu'], st['mem']))
                 samples = [x for x in samples if now - x[0] <= self._LE_STALL_WINDOW_SECONDS * 1.5]
                 stalled = self._le_is_stalled(samples, now, dest_folder, t0)
+                if not stalled and watch and now - last_watch >= self._LE_STALL_WINDOW_SECONDS / 3:
+                    # "Sessiz" kalan grubu günlüğe yaz (takılma eşiğinin üçte biri aşıldıysa): bekçinin çalıştığı görülsün.
+                    q = self._le_is_stalled(samples, now, dest_folder, t0, window=self._LE_STALL_WINDOW_SECONDS / 3)
+                    if q:
+                        last_watch = now
+                        watch(f"watching: no log/.h5 change for >= {self._LE_STALL_WINDOW_SECONDS / 180:g} min and memory constant "
+                              f"({q['mem'] / 1048576:,.0f} MB, {st['pids']} process(es), avg CPU {q['cores']:.2f} core(s)) - will be killed as "
+                              f"stalled at {self._LE_STALL_WINDOW_SECONDS / 60:g} min if nothing changes")
                 if stalled:
-                    msg = (f"{name}: STALLED - no CPU, memory or log/H5 change for {self._LE_STALL_WINDOW_SECONDS / 60:g} min "
-                           f"(memory {stalled['mem'] / 1048576:,.0f} MB, {st['pids']} process(es)) - killing ALL of its processes")
+                    msg = (f"{name}: STALLED - memory constant and no log/H5 change for {self._LE_STALL_WINDOW_SECONDS / 60:g} min "
+                           f"(memory {stalled['mem'] / 1048576:,.0f} MB, {st['pids']} process(es), avg CPU {stalled['cores']:.2f} core(s)) "
+                           f"- killing ALL of its processes")
                     if notify:
                         notify(f"    [stalled] {msg}")
                     free = self._le_kill_group(dest_folder, proc.pid)
@@ -8182,7 +8208,7 @@ class PostProcessingTab:
                 if attempt == start_attempt:
                     msgs.put(f"    [start] {job['name']}  ({len(started)}/{len(jobs)} started)")
                 try:
-                    res = self._le_wait_group(job['name'], job['dest'], proc, job['expected'], notify=msgs.put)
+                    res = self._le_wait_group(job['name'], job['dest'], proc, job['expected'], notify=msgs.put, watch=lambda t, _n=name: _event(_n, t))
                 finally:
                     log_file.close()
                 # Başarı ifadesi log'un sonunda yoksa exe kendini (ör. bellek ayarlanamadığı için) başarısız kapatmıştır: bat'ı yeniden çalıştır.
@@ -8195,7 +8221,7 @@ class PostProcessingTab:
                     break
                 # --- başarısız deneme: NEDEN? ---
                 if res.get('stalled'):
-                    reason = (f"STALLED - no CPU, memory or log/.h5 change for {self._LE_STALL_WINDOW_SECONDS / 60:g} min "
+                    reason = (f"STALLED - memory constant and no log/.h5 change for {self._LE_STALL_WINDOW_SECONDS / 60:g} min "
                               f"(memory {res.get('stall_mem', 0) / 1048576:,.0f} MB, {res.get('stall_pids', '?')} process(es)); all processes of this "
                               f"folder were killed" + ("" if res.get('killed_clean', True) else " (WARNING: some may still be alive)"))
                     short = "stalled (processes killed)"

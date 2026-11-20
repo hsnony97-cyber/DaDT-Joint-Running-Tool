@@ -4250,6 +4250,21 @@ def _move_with_retry(src, dst, log=lambda m: None, timeout=900, poll=10):
             time.sleep(poll)
 
 
+def _remove_with_retry(path, tries=5, wait=2.0):
+    """os.remove that retries a few times (Windows may hold the file briefly
+    after an exe exits). Raises the last error if it never succeeds."""
+    for k in range(tries):
+        try:
+            os.remove(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if k == tries - 1:
+                raise
+            time.sleep(wait)
+
+
 def _id_lines(ids, indent="        ", per=10, cap=5000):
     """ID listesini satırlara böler (offsets_log.txt için); cap'ten fazlası '... and N more' ile kısaltılır."""
     ids = list(ids)
@@ -8481,6 +8496,10 @@ class JointRunTab:
         self.max_parallel_runs = tk.StringVar(value="4")  # aynı anda kaç Set'in paralel işleneceği
         self.scale_factor = tk.StringVar(value="1")       # Limit Stress Check'e yazılan yük değerlerine uygulanan çarpan
         self.h5_files = []                                 # List butonuyla bulunan H5 dosyaları (önizleme)
+        # True ise Set klasörüne kopyalanan her Joint_Loads_<Set>.h5'in KAYNAK nüshası
+        # (LoadExtraction_NN içindeki) kopya doğrulandıktan sonra silinir (disk yeri).
+        # Sadece Full Run hatları açar; bağımsız Joint Run sekmesinde kapalıdır.
+        self.delete_source_h5_after_copy = False
 
         self.is_running = False
 
@@ -8854,8 +8873,21 @@ class JointRunTab:
             os.makedirs(dest_folder, exist_ok=True)
 
             # 1. H5 dosyasını kendi Set klasörüne kopyala.
-            shutil.copy2(h5_path, os.path.join(dest_folder, os.path.basename(h5_path)))
+            dest_h5 = os.path.join(dest_folder, os.path.basename(h5_path))
+            shutil.copy2(h5_path, dest_h5)
             self.log(f"    H5 copied to: {dest_folder}")
+            # Full Run hatlarında: kopya tam ise Load Extraction klasöründeki
+            # orijinal Joint_Loads_<Set>.h5'i hemen sil (çok yer kaplıyor).
+            if self.delete_source_h5_after_copy:
+                try:
+                    if os.path.getsize(dest_h5) != os.path.getsize(h5_path):
+                        raise OSError("copy size differs from the original - original kept")
+                    sz_gb = os.path.getsize(h5_path) / 1024 ** 3
+                    _remove_with_retry(h5_path)
+                    self.log(f"    Deleted source {os.path.basename(h5_path)} from "
+                              f"{os.path.dirname(h5_path)} ({sz_gb:.2f} GB freed)")
+                except Exception as e:
+                    self.log(f"    WARNING: could not delete source H5 {h5_path}: {e}")
 
             # 2. Şablon Excel'i Set'in adıyla (örn. "Spar1_IB.xlsx") kopyala.
             joint_xl_path = os.path.join(dest_folder, set_name + example_ext)
@@ -10176,6 +10208,7 @@ class FullRunTab:
             t5.scale_factor.set(self.jr_scale_factor.get())
 
             self.root.after(0, lambda: self.progress_var.set(75))
+            t5.delete_source_h5_after_copy = True   # LE'deki Joint_Loads_*.h5'ler Set klasörüne kopyalanınca silinir
             t5._run_pipeline()
             self.root.after(0, lambda: self.progress_var.set(100))
 
@@ -11567,6 +11600,7 @@ class IterativeFullRunTab:
                 t5.max_parallel_runs.set(self.jr_max_parallel_runs.get())
                 t5.scale_factor.set(self.jr_scale_factor.get())
 
+                t5.delete_source_h5_after_copy = True   # LE'deki Joint_Loads_*.h5'ler Set klasörüne kopyalanınca silinir
                 t5._run_pipeline()
 
                 # ---- STAGE D: BOYUTLANDIRMA ÖZETİ ----
@@ -13007,6 +13041,7 @@ class ImprovedIterativeFullRunTab(IterativeFullRunTab):
                 t5.max_parallel_runs.set(self.jr_max_parallel_runs.get())
                 t5.scale_factor.set(self.jr_scale_factor.get())
 
+                t5.delete_source_h5_after_copy = True   # LE'deki Joint_Loads_*.h5'ler Set klasörüne kopyalanınca silinir
                 t5._run_pipeline()
 
                 # ---- STAGE C2: WEB FLAW RUN ----
